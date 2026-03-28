@@ -51,6 +51,17 @@ class DecisionEvent(BaseModel):
     details: dict = Field(default_factory=dict)
 
 
+class GuardianSummaryEvent(BaseModel):
+    """Rolling summary of guardian evaluation stats."""
+    type: str = "guardian_summary"
+    timestamp: float = Field(default_factory=time.time)
+    total_checked: int = 0
+    total_blocked: int = 0
+    total_allowed: int = 0
+    by_rule: dict = Field(default_factory=dict)  # {rule_name: count}
+    by_severity: dict = Field(default_factory=dict)  # {threat_level: count}
+
+
 class StatusEvent(BaseModel):
     """Status updates for the monitoring session."""
     type: str = "status"

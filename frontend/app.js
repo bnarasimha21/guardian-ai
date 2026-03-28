@@ -38,6 +38,9 @@ function handleEvent(event) {
         case 'decision':
             renderDecisionCard(event);
             break;
+        case 'guardian_summary':
+            updateSummaryCard(event);
+            break;
         case 'status':
             updateStatus(event);
             break;
@@ -273,6 +276,14 @@ function renderDecisionCard(event) {
     const card = document.createElement('div');
     card.className = `event-card decision-card ${isBlocked ? 'blocked' : 'allowed'}`;
     card.dataset.source = event.details?._source || '';
+    card.dataset.action = event.action || '';
+    card.dataset.threat = event.threat_level || 'none';
+
+    // Hide if filtered
+    const decFilter = document.getElementById('decisionFilter')?.value || '__all';
+    if (!matchesDecisionFilter(card, decFilter)) {
+        card.style.display = 'none';
+    }
 
     // Hide if filtered by app
     if (selectedApp !== '__all' && card.dataset.source && card.dataset.source !== selectedApp) {
@@ -375,14 +386,6 @@ function renderDecisionCard(event) {
 
     list.appendChild(card);
     scrollToBottom(list);
-
-    if (isBlocked) {
-        blockedCount++;
-        updateCounter('blockedCounter', blockedCount);
-    } else {
-        allowedCount++;
-        updateCounter('allowedCounter', allowedCount);
-    }
 
     addTimelineNode(isBlocked);
 }
@@ -499,10 +502,12 @@ function onAppSelect() {
         card.style.display = (appMatch && catMatch) ? '' : 'none';
     });
 
-    // Filter decision cards by app only
+    // Filter decision cards by app + decision filter
+    const decFilter = document.getElementById('decisionFilter')?.value || '__all';
     document.querySelectorAll('#decisionList .event-card').forEach(card => {
         const src = card.dataset.source || '';
-        card.style.display = (selectedApp === '__all' || !src || src === selectedApp) ? '' : 'none';
+        const appMatch = selectedApp === '__all' || !src || src === selectedApp;
+        card.style.display = (appMatch && matchesDecisionFilter(card, decFilter)) ? '' : 'none';
     });
 }
 
@@ -679,6 +684,74 @@ async function removeApp(name) {
 
 // Periodically refresh target statuses
 setInterval(loadTargets, 10000);
+
+// ---- Guardian Summary Card ----
+
+function updateSummaryCard(event) {
+    hideEmpty('decisionEmpty');
+    const list = document.getElementById('decisionList');
+
+    let card = document.getElementById('summaryCard');
+    if (!card) {
+        card = document.createElement('div');
+        card.id = 'summaryCard';
+        card.className = 'event-card summary-card';
+        list.insertBefore(card, list.firstChild);
+    }
+
+    const checked = event.total_checked || 0;
+    const blocked = event.total_blocked || 0;
+    const allowed = event.total_allowed || 0;
+    const byRule = event.by_rule || {};
+    const bySeverity = event.by_severity || {};
+
+    const ruleChips = Object.entries(byRule).map(([rule, count]) =>
+        `<span class="summary-chip summary-chip-blocked">${escapeHtml(rule)}: ${count}</span>`
+    ).join('');
+
+    const sevChips = Object.entries(bySeverity).map(([sev, count]) =>
+        `<span class="summary-chip severity-${sev}">${sev.toUpperCase()}: ${count}</span>`
+    ).join('');
+
+    const statusClass = blocked > 0 ? 'summary-warning' : 'summary-clean';
+    const statusIcon = blocked > 0
+        ? '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
+        : '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>';
+
+    card.innerHTML = `
+        <div class="summary-header ${statusClass}">
+            ${statusIcon}
+            <span class="summary-title">${checked} events scanned</span>
+        </div>
+        <div class="summary-stats">
+            <span class="summary-stat summary-allowed">${allowed} safe</span>
+            <span class="summary-stat summary-blocked-count">${blocked} blocked</span>
+        </div>
+        ${sevChips || ruleChips ? `<div class="summary-chips">${sevChips}${ruleChips}</div>` : ''}
+    `;
+
+    // Update header counters
+    updateCounter('blockedCounter', blocked);
+    updateCounter('allowedCounter', allowed);
+}
+
+// ---- Decision filter ----
+
+function filterDecisions() {
+    const filter = document.getElementById('decisionFilter').value;
+    document.querySelectorAll('#decisionList .event-card').forEach(card => {
+        const srcMatch = selectedApp === '__all' || !card.dataset.source || card.dataset.source === selectedApp;
+        card.style.display = (srcMatch && matchesDecisionFilter(card, filter)) ? '' : 'none';
+    });
+}
+
+function matchesDecisionFilter(card, filter) {
+    if (filter === '__all') return true;
+    if (filter === 'blocked') return card.dataset.action === 'blocked';
+    if (filter === 'allowed') return card.dataset.action === 'allowed';
+    // critical, high, medium
+    return card.dataset.threat === filter;
+}
 
 // ---- Blocked card expand/collapse ----
 

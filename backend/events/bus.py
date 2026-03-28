@@ -4,11 +4,11 @@ import asyncio
 import logging
 from typing import Union
 
-from .models import AgentActivityEvent, DecisionEvent, StatusEvent
+from .models import AgentActivityEvent, DecisionEvent, GuardianSummaryEvent, StatusEvent
 
 logger = logging.getLogger(__name__)
 
-Event = Union[AgentActivityEvent, DecisionEvent, StatusEvent]
+Event = Union[AgentActivityEvent, DecisionEvent, GuardianSummaryEvent, StatusEvent]
 
 
 class EventBus:

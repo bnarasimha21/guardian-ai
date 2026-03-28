@@ -3,14 +3,13 @@ from __future__ import annotations
 import logging
 
 from backend.events.bus import EventBus
-from backend.events.models import DecisionAction, DecisionEvent, ThreatLevel
+from backend.events.models import DecisionAction, DecisionEvent, GuardianSummaryEvent, ThreatLevel
 
 from .models import ThreatMatch
 from .rules import ALL_RULES, ThreatRule
 
 logger = logging.getLogger(__name__)
 
-# OWASP LLM Top 10 labels for UI display
 OWASP_LABELS = {
     "LLM01": "Prompt Injection",
     "LLM02": "Insecure Output Handling",
@@ -23,14 +22,18 @@ OWASP_LABELS = {
 class Guardian:
     """Evaluates raw agent events against all threat rules.
 
-    Reports ALL matching rules per event (not just the first).
-    Only emits ALLOWED decisions periodically (not for every clean event).
+    Reports ALL matching rules per event. Emits a rolling summary
+    instead of individual ALLOWED cards.
     """
 
     def __init__(self, event_bus: EventBus, rules: list[ThreatRule] | None = None) -> None:
         self.event_bus = event_bus
         self.rules = rules or ALL_RULES
-        self._allowed_count = 0
+        self._total_checked = 0
+        self._total_blocked = 0
+        self._total_allowed = 0
+        self._by_rule: dict[str, int] = {}
+        self._by_severity: dict[str, int] = {}
 
     async def evaluate(self, event: dict) -> list[ThreatMatch]:
         """Run ALL rules against an event. Returns list of all matches."""
@@ -42,9 +45,14 @@ class Guardian:
             matches = rule.check(event)
             all_matches.extend(matches)
 
+        self._total_checked += 1
+
         if all_matches:
-            # Emit a decision for each match
+            self._total_blocked += 1
             for match in all_matches:
+                self._by_rule[match.rule_name] = self._by_rule.get(match.rule_name, 0) + 1
+                self._by_severity[match.threat_level.value] = self._by_severity.get(match.threat_level.value, 0) + 1
+
                 owasp_label = OWASP_LABELS.get(match.owasp_id, "")
                 await self.event_bus.emit(
                     DecisionEvent(
@@ -67,21 +75,19 @@ class Guardian:
                     event_type,
                     match.reason,
                 )
-            self._allowed_count = 0
         else:
-            self._allowed_count += 1
-            # Only emit ALLOWED every 5th clean event to reduce noise
-            if self._allowed_count <= 3 or self._allowed_count % 5 == 0:
-                await self.event_bus.emit(
-                    DecisionEvent(
-                        event_type=event_type,
-                        agent=data.get("agent", ""),
-                        task_id=data.get("task_id", ""),
-                        action=DecisionAction.ALLOWED,
-                        threat_level=ThreatLevel.NONE,
-                        details=_safe_details(data),
-                    )
-                )
+            self._total_allowed += 1
+
+        # Emit rolling summary after every evaluation
+        await self.event_bus.emit(
+            GuardianSummaryEvent(
+                total_checked=self._total_checked,
+                total_blocked=self._total_blocked,
+                total_allowed=self._total_allowed,
+                by_rule=dict(self._by_rule),
+                by_severity=dict(self._by_severity),
+            )
+        )
 
         return all_matches
 
