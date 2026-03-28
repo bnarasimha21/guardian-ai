@@ -1,4 +1,0 @@
-agent_environment: development
-agent_name: guardian-ai
-description: GuardianAI - Real-time agent defense monitor
-entrypoint_file: main.py
