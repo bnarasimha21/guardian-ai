@@ -30,7 +30,7 @@ class Guardian:
         self.event_bus = event_bus
         self.rules = rules or ALL_RULES
         self._total_checked = 0
-        self._total_blocked = 0
+        self._total_flagged = 0
         self._total_allowed = 0
         self._by_rule: dict[str, int] = {}
         self._by_severity: dict[str, int] = {}
@@ -50,15 +50,15 @@ class Guardian:
         self._total_checked += 1
         source = data.get("_source", "")
         if source and source not in self._per_app:
-            self._per_app[source] = {"checked": 0, "blocked": 0, "allowed": 0, "by_rule": {}, "by_severity": {}}
+            self._per_app[source] = {"checked": 0, "flagged": 0, "allowed": 0, "by_rule": {}, "by_severity": {}}
         app_stats = self._per_app.get(source)
         if app_stats:
             app_stats["checked"] += 1
 
         if all_matches:
-            self._total_blocked += 1
+            self._total_flagged += 1
             if app_stats:
-                app_stats["blocked"] += 1
+                app_stats["flagged"] += 1
             for match in all_matches:
                 self._by_rule[match.rule_name] = self._by_rule.get(match.rule_name, 0) + 1
                 self._by_severity[match.threat_level.value] = self._by_severity.get(match.threat_level.value, 0) + 1
@@ -72,7 +72,7 @@ class Guardian:
                         event_type=event_type,
                         agent=data.get("agent", ""),
                         task_id=data.get("task_id", ""),
-                        action=DecisionAction.BLOCKED,
+                        action=DecisionAction.FLAGGED,
                         rule_name=match.rule_name,
                         reason=match.reason,
                         threat_level=match.threat_level,
@@ -82,7 +82,7 @@ class Guardian:
                     )
                 )
                 logger.warning(
-                    "BLOCKED [%s/%s] event=%s reason=%s",
+                    "FLAGGED [%s/%s] event=%s reason=%s",
                     match.rule_name,
                     match.owasp_id,
                     event_type,
@@ -97,7 +97,7 @@ class Guardian:
         await self.event_bus.emit(
             GuardianSummaryEvent(
                 total_checked=self._total_checked,
-                total_blocked=self._total_blocked,
+                total_flagged=self._total_flagged,
                 total_allowed=self._total_allowed,
                 by_rule=dict(self._by_rule),
                 by_severity=dict(self._by_severity),

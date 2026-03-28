@@ -176,7 +176,7 @@ body {
     min-width: 64px;
 }
 
-.blocked-counter {
+.flagged-counter {
     background: var(--red-bg);
     border: 1px solid var(--red-border);
 }
@@ -193,7 +193,7 @@ body {
     line-height: 1.2;
 }
 
-.blocked-counter .counter-num { color: var(--red); }
+.flagged-counter .counter-num { color: var(--red); }
 .allowed-counter .counter-num { color: var(--green); }
 
 .counter-label {
@@ -570,7 +570,7 @@ body {
     animation: node-appear 0.4s ease-out;
 }
 
-.timeline-node.blocked {
+.timeline-node.flagged {
     background: var(--red-bg);
     border-color: var(--red);
     box-shadow: 0 0 10px var(--red-glow);
@@ -875,16 +875,16 @@ body {
     border-left: 3px solid var(--text-muted);
 }
 
-.decision-card.blocked {
+.decision-card.flagged {
     border-left-color: var(--red);
-    animation: card-slide-in 0.5s ease-out, blocked-flash 0.6s ease-out;
+    animation: card-slide-in 0.5s ease-out, flagged-flash 0.6s ease-out;
 }
 
 .decision-card.allowed {
     border-left-color: var(--green);
 }
 
-@keyframes blocked-flash {
+@keyframes flagged-flash {
     0% { box-shadow: 0 0 20px var(--red-glow); }
     100% { box-shadow: none; }
 }
@@ -906,7 +906,7 @@ body {
     font-size: 14px;
 }
 
-.decision-icon.blocked-icon {
+.decision-icon.flagged-icon {
     background: var(--red-bg);
     border: 1px solid var(--red-border);
 }
@@ -923,7 +923,7 @@ body {
     letter-spacing: 1px;
 }
 
-.decision-action.blocked-text { color: var(--red); }
+.decision-action.flagged-text { color: var(--red); }
 .decision-action.allowed-text { color: var(--green); }
 
 .decision-tool {
@@ -994,7 +994,7 @@ body {
 }
 
 .summary-allowed { color: var(--green); }
-.summary-blocked-count { color: var(--red); }
+.summary-flagged-count { color: var(--red); }
 
 .summary-chips {
     display: flex;
@@ -1012,7 +1012,7 @@ body {
     letter-spacing: 0.3px;
 }
 
-.summary-chip-blocked {
+.summary-chip-flagged {
     background: var(--red-bg);
     color: var(--red);
     border: 1px solid var(--red-border);

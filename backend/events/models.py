@@ -17,7 +17,7 @@ class ThreatLevel(str, Enum):
 
 class DecisionAction(str, Enum):
     ALLOWED = "allowed"
-    BLOCKED = "blocked"
+    FLAGGED = "flagged"
 
 
 # -- Events sent from Guardian to frontend --
@@ -56,7 +56,7 @@ class GuardianSummaryEvent(BaseModel):
     type: str = "guardian_summary"
     timestamp: float = Field(default_factory=time.time)
     total_checked: int = 0
-    total_blocked: int = 0
+    total_flagged: int = 0
     total_allowed: int = 0
     by_rule: dict = Field(default_factory=dict)  # {rule_name: count}
     by_severity: dict = Field(default_factory=dict)  # {threat_level: count}

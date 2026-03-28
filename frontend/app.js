@@ -3,7 +3,7 @@
 // ============================================
 
 let ws = null;
-let blockedCount = 0;
+let flaggedCount = 0;
 let allowedCount = 0;
 let nodeIndex = 0;
 
@@ -289,9 +289,9 @@ function renderDecisionCard(event) {
     hideEmpty('decisionEmpty');
     const list = document.getElementById('decisionList');
 
-    const isBlocked = event.action === 'blocked';
+    const isBlocked = event.action === 'flagged';
     const card = document.createElement('div');
-    card.className = `event-card decision-card ${isBlocked ? 'blocked' : 'allowed'}`;
+    card.className = `event-card decision-card ${isBlocked ? 'flagged' : 'allowed'}`;
     card.dataset.source = event.details?._source || '';
     card.dataset.action = event.action || '';
     card.dataset.threat = event.threat_level || 'none';
@@ -311,8 +311,8 @@ function renderDecisionCard(event) {
         ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
         : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';
 
-    const iconClass = isBlocked ? 'blocked-icon' : 'allowed-icon';
-    const actionClass = isBlocked ? 'blocked-text' : 'allowed-text';
+    const iconClass = isBlocked ? 'flagged-icon' : 'allowed-icon';
+    const actionClass = isBlocked ? 'flagged-text' : 'allowed-text';
 
     // Threat level badge
     let threatHtml = '';
@@ -356,7 +356,7 @@ function renderDecisionCard(event) {
         }
     }
 
-    // Build expandable detail panel for blocked cards
+    // Build expandable detail panel for flagged cards
     let expandHtml = '';
     if (isBlocked) {
         const owaspInfo = getOwaspInfo(event.owasp_id);
@@ -441,7 +441,7 @@ function updateStatus(event) {
 function addTimelineNode(isBlocked) {
     const timeline = document.getElementById('timeline');
     const node = document.createElement('div');
-    node.className = `timeline-node ${isBlocked ? 'blocked' : 'allowed'}`;
+    node.className = `timeline-node ${isBlocked ? 'flagged' : 'allowed'}`;
 
     nodeIndex++;
     const timelineHeight = timeline.offsetHeight;
@@ -731,32 +731,32 @@ function renderSummary() {
     }
 
     // Use per-app stats if an app is selected, otherwise global
-    let checked, blocked, allowed, byRule, bySeverity;
+    let checked, flagged, allowed, byRule, bySeverity;
     if (selectedApp !== '__all' && event.per_app && event.per_app[selectedApp]) {
         const appStats = event.per_app[selectedApp];
         checked = appStats.checked || 0;
-        blocked = appStats.blocked || 0;
+        flagged = appStats.flagged || 0;
         allowed = appStats.allowed || 0;
         byRule = appStats.by_rule || {};
         bySeverity = appStats.by_severity || {};
     } else {
         checked = event.total_checked || 0;
-        blocked = event.total_blocked || 0;
+        flagged = event.total_flagged || 0;
         allowed = event.total_allowed || 0;
         byRule = event.by_rule || {};
         bySeverity = event.by_severity || {};
     }
 
     const ruleChips = Object.entries(byRule).map(([rule, count]) =>
-        `<span class="summary-chip summary-chip-blocked">${escapeHtml(rule)}: ${count}</span>`
+        `<span class="summary-chip summary-chip-flagged">${escapeHtml(rule)}: ${count}</span>`
     ).join('');
 
     const sevChips = Object.entries(bySeverity).map(([sev, count]) =>
         `<span class="summary-chip severity-${sev}">${sev.toUpperCase()}: ${count}</span>`
     ).join('');
 
-    const statusClass = blocked > 0 ? 'summary-warning' : 'summary-clean';
-    const statusIcon = blocked > 0
+    const statusClass = flagged > 0 ? 'summary-warning' : 'summary-clean';
+    const statusIcon = flagged > 0
         ? '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
         : '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>';
 
@@ -769,13 +769,13 @@ function renderSummary() {
         </div>
         <div class="summary-stats">
             <span class="summary-stat summary-allowed">${allowed} safe</span>
-            <span class="summary-stat summary-blocked-count">${blocked} blocked</span>
+            <span class="summary-stat summary-flagged-count">${flagged} flagged</span>
         </div>
         ${sevChips || ruleChips ? `<div class="summary-chips">${sevChips}${ruleChips}</div>` : ''}
     `;
 
     // Update header counters
-    updateCounter('blockedCounter', blocked);
+    updateCounter('flaggedCounter', flagged);
     updateCounter('allowedCounter', allowed);
 }
 
@@ -791,7 +791,7 @@ function filterDecisions() {
 
 function matchesDecisionFilter(card, filter) {
     if (filter === '__all') return true;
-    if (filter === 'blocked') return card.dataset.action === 'blocked';
+    if (filter === 'flagged') return card.dataset.action === 'flagged';
     if (filter === 'allowed') return card.dataset.action === 'allowed';
     // critical, high, medium
     return card.dataset.threat === filter;

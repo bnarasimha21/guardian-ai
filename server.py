@@ -99,7 +99,7 @@ def _make_event_handler(session_id: str):
             matches = await guardian.evaluate(enriched)
             for match in matches:
                 asyncio.create_task(log_event(
-                    "threat_blocked",
+                    "threat_flagged",
                     session_id=session_id,
                     app_name=app_name,
                     rule_name=match.rule_name,
@@ -107,7 +107,7 @@ def _make_event_handler(session_id: str):
                     threat_level=match.threat_level.value,
                     reason=match.reason,
                     total_events_checked=guardian._total_checked,
-                    total_blocked=guardian._total_blocked,
+                    total_blocked=guardian._total_flagged,
                 ))
 
     return on_agent_event
