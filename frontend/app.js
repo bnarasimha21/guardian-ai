@@ -7,11 +7,14 @@ let blockedCount = 0;
 let allowedCount = 0;
 let nodeIndex = 0;
 
+// ---- Base path (works behind reverse proxy) ----
+const BASE_PATH = location.pathname.replace(/\/$/, '');
+
 // ---- WebSocket Connection ----
 
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/ws/events`);
+    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events`);
 
     ws.onopen = () => console.log('[Guardian] Connected to event stream');
 
@@ -518,7 +521,7 @@ function onAppSelect() {
 
 async function loadTargets() {
     try {
-        const resp = await fetch('/api/targets');
+        const resp = await fetch(`${BASE_PATH}/api/targets`);
         const data = await resp.json();
         const targets = data.targets || [];
         updateAppSelect(targets);
@@ -598,7 +601,7 @@ async function connectApp() {
     statusEl.className = 'connect-status';
 
     try {
-        const verifyResp = await fetch('/api/targets/verify', {
+        const verifyResp = await fetch(`${BASE_PATH}/api/targets/verify`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ws_url: wsUrl }),
@@ -622,7 +625,7 @@ async function connectApp() {
             <div class="verify-step active">Registering...</div>
         </div>`;
 
-        const resp = await fetch('/api/targets', {
+        const resp = await fetch(`${BASE_PATH}/api/targets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, ws_url: wsUrl }),
@@ -678,7 +681,7 @@ function renderVerifyError(data) {
 
 async function removeApp(name) {
     try {
-        await fetch(`/api/targets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        await fetch(`${BASE_PATH}/api/targets/${encodeURIComponent(name)}`, { method: 'DELETE' });
         loadTargets();
     } catch (e) {
         console.error('Failed to remove app:', e);
