@@ -1292,6 +1292,25 @@ body {
     overflow-y: auto;
     padding: 0;
     animation: modal-slide 0.3s ease;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-light) transparent;
+}
+
+.modal::-webkit-scrollbar {
+    width: 4px;
+}
+
+.modal::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.modal::-webkit-scrollbar-thumb {
+    background: var(--border-light);
+    border-radius: 2px;
+}
+
+.modal::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
 }
 
 @keyframes modal-slide {
