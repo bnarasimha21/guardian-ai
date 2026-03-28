@@ -80,7 +80,9 @@ async def on_agent_event(app_name: str, event: dict):
     )
 
     if event_type in ACTIONABLE_EVENTS:
-        await guardian.evaluate(event)
+        # Inject source into event data so Guardian decisions carry it
+        enriched = {**event, "data": {**data, "_source": app_name}}
+        await guardian.evaluate(enriched)
 
 
 async def on_connect(app_name: str):
