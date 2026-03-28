@@ -504,11 +504,14 @@ function onAppSelect() {
 
     // Filter decision cards by app + decision filter
     const decFilter = document.getElementById('decisionFilter')?.value || '__all';
-    document.querySelectorAll('#decisionList .event-card').forEach(card => {
+    document.querySelectorAll('#decisionList .event-card:not(.summary-card)').forEach(card => {
         const src = card.dataset.source || '';
         const appMatch = selectedApp === '__all' || !src || src === selectedApp;
         card.style.display = (appMatch && matchesDecisionFilter(card, decFilter)) ? '' : 'none';
     });
+
+    // Re-render summary with selected app's stats
+    renderSummary();
 }
 
 // ---- App Management ----
@@ -687,7 +690,18 @@ setInterval(loadTargets, 10000);
 
 // ---- Guardian Summary Card ----
 
+// Store latest summary for re-rendering on filter change
+let _lastSummary = null;
+
 function updateSummaryCard(event) {
+    _lastSummary = event;
+    renderSummary();
+}
+
+function renderSummary() {
+    if (!_lastSummary) return;
+    const event = _lastSummary;
+
     hideEmpty('decisionEmpty');
     const list = document.getElementById('decisionList');
 
@@ -699,11 +713,22 @@ function updateSummaryCard(event) {
         list.insertBefore(card, list.firstChild);
     }
 
-    const checked = event.total_checked || 0;
-    const blocked = event.total_blocked || 0;
-    const allowed = event.total_allowed || 0;
-    const byRule = event.by_rule || {};
-    const bySeverity = event.by_severity || {};
+    // Use per-app stats if an app is selected, otherwise global
+    let checked, blocked, allowed, byRule, bySeverity;
+    if (selectedApp !== '__all' && event.per_app && event.per_app[selectedApp]) {
+        const appStats = event.per_app[selectedApp];
+        checked = appStats.checked || 0;
+        blocked = appStats.blocked || 0;
+        allowed = appStats.allowed || 0;
+        byRule = appStats.by_rule || {};
+        bySeverity = appStats.by_severity || {};
+    } else {
+        checked = event.total_checked || 0;
+        blocked = event.total_blocked || 0;
+        allowed = event.total_allowed || 0;
+        byRule = event.by_rule || {};
+        bySeverity = event.by_severity || {};
+    }
 
     const ruleChips = Object.entries(byRule).map(([rule, count]) =>
         `<span class="summary-chip summary-chip-blocked">${escapeHtml(rule)}: ${count}</span>`
@@ -718,10 +743,12 @@ function updateSummaryCard(event) {
         ? '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
         : '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>';
 
+    const appLabel = selectedApp !== '__all' ? ` (${escapeHtml(selectedApp)})` : '';
+
     card.innerHTML = `
         <div class="summary-header ${statusClass}">
             ${statusIcon}
-            <span class="summary-title">${checked} events scanned</span>
+            <span class="summary-title">${checked} events scanned${appLabel}</span>
         </div>
         <div class="summary-stats">
             <span class="summary-stat summary-allowed">${allowed} safe</span>

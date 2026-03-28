@@ -34,6 +34,8 @@ class Guardian:
         self._total_allowed = 0
         self._by_rule: dict[str, int] = {}
         self._by_severity: dict[str, int] = {}
+        # Per-app stats
+        self._per_app: dict[str, dict] = {}  # {app_name: {checked, blocked, allowed, by_rule, by_severity}}
 
     async def evaluate(self, event: dict) -> list[ThreatMatch]:
         """Run ALL rules against an event. Returns list of all matches."""
@@ -46,12 +48,23 @@ class Guardian:
             all_matches.extend(matches)
 
         self._total_checked += 1
+        source = data.get("_source", "")
+        if source and source not in self._per_app:
+            self._per_app[source] = {"checked": 0, "blocked": 0, "allowed": 0, "by_rule": {}, "by_severity": {}}
+        app_stats = self._per_app.get(source)
+        if app_stats:
+            app_stats["checked"] += 1
 
         if all_matches:
             self._total_blocked += 1
+            if app_stats:
+                app_stats["blocked"] += 1
             for match in all_matches:
                 self._by_rule[match.rule_name] = self._by_rule.get(match.rule_name, 0) + 1
                 self._by_severity[match.threat_level.value] = self._by_severity.get(match.threat_level.value, 0) + 1
+                if app_stats:
+                    app_stats["by_rule"][match.rule_name] = app_stats["by_rule"].get(match.rule_name, 0) + 1
+                    app_stats["by_severity"][match.threat_level.value] = app_stats["by_severity"].get(match.threat_level.value, 0) + 1
 
                 owasp_label = OWASP_LABELS.get(match.owasp_id, "")
                 await self.event_bus.emit(
@@ -77,8 +90,10 @@ class Guardian:
                 )
         else:
             self._total_allowed += 1
+            if app_stats:
+                app_stats["allowed"] += 1
 
-        # Emit rolling summary after every evaluation
+        # Emit rolling summary with per-app breakdown
         await self.event_bus.emit(
             GuardianSummaryEvent(
                 total_checked=self._total_checked,
@@ -86,6 +101,7 @@ class Guardian:
                 total_allowed=self._total_allowed,
                 by_rule=dict(self._by_rule),
                 by_severity=dict(self._by_severity),
+                per_app=dict(self._per_app),
             )
         )
 
