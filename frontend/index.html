@@ -83,11 +83,21 @@
             </div>
             <div class="event-list" id="activityList">
                 <div class="empty-state" id="activityEmpty">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
-                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-                    </svg>
-                    <p>Listening for agent activity...</p>
-                    <p class="empty-hint">Connect an app and use it normally. Events appear here in real-time.</p>
+                    <div class="empty-icon-wrap">
+                        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                            <path d="M9 12l2 2 4-4"/>
+                        </svg>
+                    </div>
+                    <h3 class="empty-title">No apps connected yet</h3>
+                    <p class="empty-desc">Connect your first app to start monitoring agent activity in real-time.</p>
+                    <button class="empty-cta" onclick="openAddModal()">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                        </svg>
+                        Connect Your First App
+                    </button>
+                    <p class="empty-hint">Only takes 2 lines of code</p>
                 </div>
             </div>
         </section>
