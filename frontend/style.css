@@ -1,46 +1,50 @@
 /* ============================================
-   Self-Healing Agent - Guardian Defense UI
-   Dark theme with neon accents
+   GuardianAI - Security Defense Dashboard
+   Slate/Navy theme with emerald accent
    ============================================ */
 
 :root {
-    --bg-primary: #0a0e17;
-    --bg-secondary: #111827;
-    --bg-card: #1a2234;
-    --bg-card-hover: #1f2b42;
+    --bg-primary: #0f1419;
+    --bg-secondary: #161b22;
+    --bg-card: #1c2129;
+    --bg-card-hover: #22272e;
 
-    --text-primary: #e2e8f0;
-    --text-secondary: #94a3b8;
-    --text-muted: #64748b;
+    --text-primary: #ecf0f1;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
 
-    --red: #ef4444;
-    --red-glow: rgba(239, 68, 68, 0.3);
-    --red-bg: rgba(239, 68, 68, 0.08);
-    --red-border: rgba(239, 68, 68, 0.25);
+    --red: #f85149;
+    --red-glow: rgba(248, 81, 73, 0.25);
+    --red-bg: rgba(248, 81, 73, 0.08);
+    --red-border: rgba(248, 81, 73, 0.3);
 
-    --green: #22c55e;
-    --green-glow: rgba(34, 197, 94, 0.3);
-    --green-bg: rgba(34, 197, 94, 0.08);
-    --green-border: rgba(34, 197, 94, 0.25);
+    --green: #3fb950;
+    --green-glow: rgba(63, 185, 80, 0.25);
+    --green-bg: rgba(63, 185, 80, 0.08);
+    --green-border: rgba(63, 185, 80, 0.3);
 
-    --blue: #3b82f6;
-    --blue-glow: rgba(59, 130, 246, 0.3);
+    --blue: #58a6ff;
+    --blue-glow: rgba(88, 166, 255, 0.25);
 
-    --cyan: #06b6d4;
-    --cyan-glow: rgba(6, 182, 212, 0.2);
+    --cyan: #3fb950;
+    --cyan-glow: rgba(63, 185, 80, 0.15);
 
-    --orange: #f59e0b;
-    --orange-bg: rgba(245, 158, 11, 0.08);
-    --orange-border: rgba(245, 158, 11, 0.25);
+    --orange: #d29922;
+    --orange-bg: rgba(210, 153, 34, 0.08);
+    --orange-border: rgba(210, 153, 34, 0.3);
 
-    --purple: #a855f7;
-    --purple-bg: rgba(168, 85, 247, 0.08);
+    --purple: #bc8cff;
+    --purple-bg: rgba(188, 140, 255, 0.08);
 
-    --border: rgba(255, 255, 255, 0.06);
-    --border-light: rgba(255, 255, 255, 0.1);
+    --accent: #3fb950;
+    --accent-glow: rgba(63, 185, 80, 0.15);
+    --accent-secondary: #58a6ff;
 
-    --radius: 10px;
-    --radius-sm: 6px;
+    --border: rgba(240, 246, 252, 0.06);
+    --border-light: rgba(240, 246, 252, 0.1);
+
+    --radius: 8px;
+    --radius-sm: 5px;
     --font-mono: 'JetBrains Mono', monospace;
     --font-sans: 'Inter', -apple-system, sans-serif;
 }
@@ -90,9 +94,9 @@ body {
 }
 
 .shield-icon {
-    color: var(--cyan);
+    color: var(--accent);
     display: flex;
-    filter: drop-shadow(0 0 8px var(--cyan-glow));
+    filter: drop-shadow(0 0 6px var(--accent-glow));
 }
 
 .logo h1 {
@@ -102,7 +106,7 @@ body {
 }
 
 .logo .accent {
-    color: var(--cyan);
+    color: var(--accent);
 }
 
 .subtitle {
@@ -222,7 +226,7 @@ body {
 }
 
 .query-input-wrap:focus-within {
-    border-color: var(--cyan);
+    border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--cyan-glow);
 }
 
@@ -279,23 +283,22 @@ body {
     font-size: 13px;
     font-weight: 700;
     font-family: var(--font-mono);
-    color: var(--green);
+    color: var(--accent);
     padding: 8px 16px;
     background: var(--green-bg);
     border: 1px solid var(--green-border);
     border-radius: 20px;
     white-space: nowrap;
     letter-spacing: 0.5px;
-    box-shadow: 0 0 12px var(--green-glow);
 }
 
 .target-dot {
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-    animation: pulse-dot 1.5s ease-in-out infinite;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    animation: pulse-dot 2s ease-in-out infinite;
 }
 
 /* ---- Progress bar ---- */
@@ -310,16 +313,16 @@ body {
 .progress-fill {
     height: 100%;
     width: 0%;
-    background: linear-gradient(90deg, var(--cyan), var(--blue));
+    background: linear-gradient(90deg, var(--accent), var(--accent-secondary));
     transition: width 0.5s ease;
-    box-shadow: 0 0 10px var(--cyan-glow);
+    box-shadow: 0 0 8px var(--accent-glow);
 }
 
 .observing-fill {
     width: 100%;
-    background: linear-gradient(90deg, var(--cyan), var(--blue), var(--cyan));
+    background: linear-gradient(90deg, var(--accent), var(--accent-secondary), var(--accent));
     background-size: 200% 100%;
-    animation: shimmer 2s linear infinite;
+    animation: shimmer 3s linear infinite;
 }
 
 @keyframes shimmer {
@@ -365,14 +368,14 @@ body {
 }
 
 .activity-icon {
-    background: var(--cyan-glow);
-    color: var(--cyan);
+    background: rgba(88, 166, 255, 0.1);
+    color: var(--accent-secondary);
 }
 
 .activity-badge {
-    background: rgba(6, 182, 212, 0.08) !important;
-    color: var(--cyan) !important;
-    border-color: rgba(6, 182, 212, 0.25) !important;
+    background: rgba(88, 166, 255, 0.08) !important;
+    color: var(--accent-secondary) !important;
+    border-color: rgba(88, 166, 255, 0.25) !important;
 }
 
 .attack-icon {
@@ -453,19 +456,19 @@ body {
     width: 80px;
     height: 80px;
     border-radius: 50%;
-    background: rgba(6, 182, 212, 0.06);
-    border: 1px solid rgba(6, 182, 212, 0.15);
+    background: rgba(63, 185, 80, 0.06);
+    border: 1px solid rgba(63, 185, 80, 0.15);
     display: flex;
     align-items: center;
     justify-content: center;
-    color: var(--cyan);
+    color: var(--accent);
     margin-bottom: 12px;
     animation: empty-pulse 3s ease-in-out infinite;
 }
 
 @keyframes empty-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.1); }
-    50% { box-shadow: 0 0 0 12px rgba(6, 182, 212, 0); }
+    0%, 100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.1); }
+    50% { box-shadow: 0 0 0 12px rgba(63, 185, 80, 0); }
 }
 
 .empty-title {
@@ -489,8 +492,8 @@ body {
     gap: 10px;
     margin-top: 16px;
     padding: 12px 28px;
-    background: linear-gradient(135deg, var(--cyan) 0%, var(--blue) 100%);
-    color: white;
+    background: var(--accent);
+    color: var(--bg-primary);
     border: none;
     border-radius: 8px;
     font-size: 15px;
@@ -498,13 +501,14 @@ body {
     font-family: var(--font-sans);
     cursor: pointer;
     transition: all 0.25s;
-    box-shadow: 0 4px 16px var(--cyan-glow);
+    box-shadow: 0 4px 16px var(--accent-glow);
     letter-spacing: 0.2px;
 }
 
 .empty-cta:hover {
     transform: translateY(-2px);
-    box-shadow: 0 8px 28px rgba(6, 182, 212, 0.35);
+    box-shadow: 0 8px 28px rgba(63, 185, 80, 0.3);
+    filter: brightness(1.1);
 }
 
 .empty-cta:active {
@@ -953,8 +957,8 @@ body {
 
 /* Summary card */
 .summary-card {
-    border-left: 3px solid var(--cyan) !important;
-    background: rgba(6, 182, 212, 0.04) !important;
+    border-left: 3px solid var(--accent) !important;
+    background: rgba(63, 185, 80, 0.04) !important;
     padding: 14px !important;
     position: sticky;
     top: 0;
@@ -1168,24 +1172,7 @@ body {
     opacity: 0.3;
 }
 
-/* ---- Scan line effect ---- */
-body::after {
-    content: '';
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    pointer-events: none;
-    background: repeating-linear-gradient(
-        0deg,
-        transparent,
-        transparent 2px,
-        rgba(0, 0, 0, 0.03) 2px,
-        rgba(0, 0, 0, 0.03) 4px
-    );
-    z-index: 100;
-}
+/* Removed scan-line effect for cleaner look */
 
 /* ---- Responsive ---- */
 @media (max-width: 768px) {
@@ -1233,7 +1220,7 @@ body::after {
 }
 
 .activity-filter:focus {
-    border-color: var(--cyan);
+    border-color: var(--accent);
 }
 
 .app-selector select {
@@ -1250,7 +1237,7 @@ body::after {
 }
 
 .app-selector select:focus {
-    border-color: var(--cyan);
+    border-color: var(--accent);
 }
 
 .add-app-btn {
@@ -1258,8 +1245,8 @@ body::after {
     align-items: center;
     gap: 6px;
     padding: 7px 14px;
-    background: linear-gradient(135deg, var(--cyan) 0%, var(--blue) 100%);
-    color: white;
+    background: var(--accent);
+    color: var(--bg-primary);
     border: none;
     border-radius: var(--radius-sm);
     font-size: 12px;
@@ -1271,7 +1258,8 @@ body::after {
 
 .add-app-btn:hover {
     transform: translateY(-1px);
-    box-shadow: 0 2px 12px var(--cyan-glow);
+    box-shadow: 0 2px 12px var(--accent-glow);
+    filter: brightness(1.1);
 }
 
 /* ---- Modal ---- */
@@ -1351,7 +1339,7 @@ body::after {
     width: 28px;
     height: 28px;
     border-radius: 50%;
-    background: var(--cyan);
+    background: var(--accent);
     color: var(--bg-primary);
     display: flex;
     align-items: center;
@@ -1404,8 +1392,8 @@ body::after {
 }
 
 .stack-tab.active {
-    background: var(--cyan);
-    border-color: var(--cyan);
+    background: var(--accent);
+    border-color: var(--accent);
     color: var(--bg-primary);
 }
 
@@ -1462,7 +1450,7 @@ body::after {
 }
 
 .form-group input:focus {
-    border-color: var(--cyan);
+    border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--cyan-glow);
 }
 
@@ -1471,8 +1459,8 @@ body::after {
     align-items: center;
     gap: 8px;
     padding: 9px 18px;
-    background: linear-gradient(135deg, var(--green) 0%, #16a34a 100%);
-    color: white;
+    background: var(--accent);
+    color: var(--bg-primary);
     border: none;
     border-radius: var(--radius-sm);
     font-size: 13px;
@@ -1483,7 +1471,8 @@ body::after {
 }
 
 .connect-btn:hover {
-    box-shadow: 0 2px 12px var(--green-glow);
+    box-shadow: 0 2px 12px var(--accent-glow);
+    filter: brightness(1.1);
 }
 
 .connect-btn:disabled {
@@ -1525,7 +1514,7 @@ body::after {
 }
 
 .verify-step.active::before {
-    border-color: var(--cyan);
+    border-color: var(--accent);
     background: var(--cyan);
     animation: pulse-dot 1s infinite;
 }
