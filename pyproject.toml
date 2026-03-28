@@ -1,7 +1,7 @@
 [project]
-name = "self-healing-agent"
+name = "guardian-ai"
 version = "0.1.0"
-description = "Self-healing agent under live attack - Guardian AI defense demo"
+description = "GuardianAI - Real-time agent defense monitor"
 requires-python = ">=3.10"
 dependencies = [
     "gradient-adk",
