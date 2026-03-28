@@ -1,0 +1,4 @@
+agent_environment: development
+agent_name: self-healing-agent
+description: Self-healing agent with guardian defense layer
+entrypoint_file: main.py

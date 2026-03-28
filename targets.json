@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Architect AI",
+    "ws_url": "wss://narasimha-badrinath.com/architect-ai/ws-observe"
+  },
+  {
+    "name": "My Travel Planner",
+    "ws_url": "wss://narasimha-badrinath.com/multiagent-travelplanner/ws-observe"
+  },
+  {
+    "name": "Dead Startups",
+    "ws_url": "wss://narasimha-badrinath.com/deadstartups/ws-observe"
+  }
+]

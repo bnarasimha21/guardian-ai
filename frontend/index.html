@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GuardianAI | Real-Time Agent Defense Monitor</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <div class="shield-icon">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                </div>
+                <h1>Guardian<span class="accent">AI</span></h1>
+            </div>
+            <span class="subtitle">Real-Time Agent Defense Monitor</span>
+        </div>
+        <div class="header-right">
+            <div class="status-badge running" id="statusBadge">
+                <span class="status-dot"></span>
+                <span class="status-text">OBSERVING</span>
+            </div>
+            <!-- App selector -->
+            <div class="app-selector">
+                <select id="appSelect" onchange="onAppSelect()">
+                    <option value="__all">All Apps</option>
+                </select>
+            </div>
+            <button class="add-app-btn" onclick="openAddModal()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Connect App
+            </button>
+            <div class="counter-group">
+                <div class="counter blocked-counter" id="blockedCounter">
+                    <span class="counter-num">0</span>
+                    <span class="counter-label">BLOCKED</span>
+                </div>
+                <div class="counter allowed-counter" id="allowedCounter">
+                    <span class="counter-num">0</span>
+                    <span class="counter-label">ALLOWED</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Progress bar -->
+    <div class="progress-bar">
+        <div class="progress-fill observing-fill" id="progressFill"></div>
+    </div>
+
+    <!-- Main split view -->
+    <main class="split-view">
+        <!-- Left panel: Agent Activity -->
+        <section class="panel activity-panel">
+            <div class="panel-header">
+                <div class="panel-icon activity-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    </svg>
+                </div>
+                <h2>Agent Activity</h2>
+                <select class="activity-filter" id="activityFilter" onchange="filterActivity()">
+                    <option value="__all">All Events</option>
+                    <option value="query">Queries</option>
+                    <option value="agent">Agent Actions</option>
+                    <option value="output">Outputs</option>
+                    <option value="score">Evaluations</option>
+                    <option value="status">Status Updates</option>
+                    <option value="data">Data/Metadata</option>
+                    <option value="complete">Completions</option>
+                    <option value="error">Errors</option>
+                </select>
+                <span class="panel-badge activity-badge">LIVE FEED</span>
+            </div>
+            <div class="event-list" id="activityList">
+                <div class="empty-state" id="activityEmpty">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    </svg>
+                    <p>Listening for agent activity...</p>
+                    <p class="empty-hint">Connect an app and use it normally. Events appear here in real-time.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Timeline connector -->
+        <div class="timeline" id="timeline">
+            <div class="timeline-line"></div>
+        </div>
+
+        <!-- Right panel: Guardian Decisions -->
+        <section class="panel guardian-panel">
+            <div class="panel-header">
+                <div class="panel-icon guardian-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                </div>
+                <h2>Guardian Decisions</h2>
+                <span class="panel-badge guardian-badge">DEFENSE</span>
+            </div>
+            <div class="event-list" id="decisionList">
+                <div class="empty-state" id="decisionEmpty">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
+                        <path d="M9 12l2 2 4-4"/>
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    <p>Guardian standing by...</p>
+                    <p class="empty-hint">Evaluating every agent action in real-time</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Add App Modal -->
+    <div class="modal-overlay" id="addModal" style="display:none" onclick="closeAddModal(event)">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>Connect a New App</h3>
+                <button class="modal-close" onclick="closeAddModal()">&times;</button>
+            </div>
+
+            <!-- Step 1: Choose your stack -->
+            <div class="modal-step">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <h4>Choose your stack</h4>
+                    <div class="stack-tabs">
+                        <button class="stack-tab active" onclick="switchStack('python')">Python (FastAPI)</button>
+                        <button class="stack-tab" onclick="switchStack('node')">Node.js (Express)</button>
+                    </div>
+
+                    <div id="stack-python" class="stack-content">
+                        <p class="step-note">Add to requirements.txt:</p>
+                        <div class="code-block">guardian-tap @ git+https://github.com/bnarasimha21/guardian-tap-python.git@main</div>
+                    </div>
+
+                    <div id="stack-node" class="stack-content" style="display:none">
+                        <p class="step-note">Install via npm:</p>
+                        <div class="code-block">npm install github:bnarasimha21/guardian-tap-typescript</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 2: Add two lines -->
+            <div class="modal-step">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <h4>Add two lines to your server file</h4>
+
+                    <div id="code-python" class="stack-content">
+                        <div class="code-block"><span class="code-kw">from</span> guardian_tap <span class="code-kw">import</span> attach_observer
+attach_observer(app)</div>
+                        <p class="step-note">Works with FastAPI apps using WebSocket or SSE.</p>
+                    </div>
+
+                    <div id="code-node" class="stack-content" style="display:none">
+                        <div class="code-block"><span class="code-kw">import</span> { attachObserver } <span class="code-kw">from</span> <span class="code-str">'guardian-tap'</span>;
+attachObserver(app);</div>
+                        <p class="step-note">Works with Express apps. No other changes needed, app.listen() works as before.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 3: Deploy & Register -->
+            <div class="modal-step">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <h4>Deploy your app, then register it here</h4>
+                    <div class="modal-form">
+                        <div class="form-group">
+                            <label>App Name</label>
+                            <input type="text" id="appName" placeholder="e.g. My Travel Planner" autocomplete="off">
+                        </div>
+                        <div class="form-group">
+                            <label>App URL</label>
+                            <input type="text" id="appUrl" placeholder="e.g. https://myapp.com or https://example.com/my-app" autocomplete="off">
+                            <p class="step-note">We'll automatically connect to /ws-observe on this URL</p>
+                        </div>
+                        <button class="connect-btn" id="connectBtn" onclick="connectApp()">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
+                                <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
+                            </svg>
+                            Connect
+                        </button>
+                        <div class="connect-status" id="connectStatus"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Connected apps list -->
+            <div class="modal-apps">
+                <h4>Connected Apps</h4>
+                <div id="appsList" class="apps-list">
+                    <p class="empty-hint">No apps connected yet</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <span>Powered by DigitalOcean Gradient AI Platform</span>
+        <span class="footer-sep">|</span>
+        <span>guardian-tap integration</span>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

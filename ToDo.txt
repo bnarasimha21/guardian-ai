@@ -1,0 +1,2 @@
+How to make gruardian-tap robust to work with different apps of fastapi, like how we faced problem just now
+
