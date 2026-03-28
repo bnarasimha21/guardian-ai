@@ -2,6 +2,8 @@
 
 Real-time agent defense monitor. Passively observes AI agent tool calls across multiple apps and evaluates them against OWASP LLM Top 10 security rules.
 
+## Screenshots
+
 ![GuardianAI Dashboard](screenshot.png)
 
 ## What it does
