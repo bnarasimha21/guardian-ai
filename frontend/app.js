@@ -7,14 +7,28 @@ let blockedCount = 0;
 let allowedCount = 0;
 let nodeIndex = 0;
 
-// ---- Base path (works behind reverse proxy) ----
+// ---- Base path + session ----
 const BASE_PATH = location.pathname.replace(/\/$/, '');
+
+function getSessionId() {
+    let sid = localStorage.getItem('guardian_session_id');
+    if (!sid) {
+        sid = 'gs_' + crypto.randomUUID();
+        localStorage.setItem('guardian_session_id', sid);
+    }
+    return sid;
+}
+const SESSION_ID = getSessionId();
+
+function apiHeaders() {
+    return { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID };
+}
 
 // ---- WebSocket Connection ----
 
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events`);
+    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events?session=${SESSION_ID}`);
 
     ws.onopen = () => console.log('[Guardian] Connected to event stream');
 
@@ -521,7 +535,7 @@ function onAppSelect() {
 
 async function loadTargets() {
     try {
-        const resp = await fetch(`${BASE_PATH}/api/targets`);
+        const resp = await fetch(`${BASE_PATH}/api/targets`, { headers: apiHeaders() });
         const data = await resp.json();
         const targets = data.targets || [];
         updateAppSelect(targets);
@@ -603,7 +617,7 @@ async function connectApp() {
     try {
         const verifyResp = await fetch(`${BASE_PATH}/api/targets/verify`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: apiHeaders(),
             body: JSON.stringify({ ws_url: wsUrl }),
         });
         const verifyData = await verifyResp.json();
@@ -627,7 +641,7 @@ async function connectApp() {
 
         const resp = await fetch(`${BASE_PATH}/api/targets`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: apiHeaders(),
             body: JSON.stringify({ name, ws_url: wsUrl }),
         });
         const data = await resp.json();
@@ -681,7 +695,7 @@ function renderVerifyError(data) {
 
 async function removeApp(name) {
     try {
-        await fetch(`${BASE_PATH}/api/targets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        await fetch(`${BASE_PATH}/api/targets/${encodeURIComponent(name)}`, { method: 'DELETE', headers: apiHeaders() });
         loadTargets();
     } catch (e) {
         console.error('Failed to remove app:', e);

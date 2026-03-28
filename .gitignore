@@ -10,3 +10,4 @@ build/
 .gradient/.gradientignore
 node_modules/
 targets.json
+sessions/
