@@ -14,6 +14,7 @@ from backend.events.models import AgentActivityEvent, StatusEvent
 from backend.guardian.middleware import Guardian
 from backend.targets import session_store
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
+from backend.usage_logger import log_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -95,7 +96,19 @@ def _make_event_handler(session_id: str):
 
         if event_type in ACTIONABLE_EVENTS:
             enriched = {**event, "data": {**data, "_source": app_name}}
-            await guardian.evaluate(enriched)
+            matches = await guardian.evaluate(enriched)
+            for match in matches:
+                asyncio.create_task(log_event(
+                    "threat_blocked",
+                    session_id=session_id,
+                    app_name=app_name,
+                    rule_name=match.rule_name,
+                    owasp_id=match.owasp_id,
+                    threat_level=match.threat_level.value,
+                    reason=match.reason,
+                    total_events_checked=guardian._total_checked,
+                    total_blocked=guardian._total_blocked,
+                ))
 
     return on_agent_event
 
@@ -114,10 +127,12 @@ def _start_observer(session_id: str, name: str, ws_url: str) -> None:
     async def on_connect(app_name: str):
         session_store.set_status(session_id, app_name, "connected")
         await bus.emit(StatusEvent(status="target_connected", message=f"{app_name} connected"))
+        asyncio.create_task(log_event("app_connected", session_id=session_id, app_name=app_name))
 
     async def on_disconnect(app_name: str):
         session_store.set_status(session_id, app_name, "disconnected")
         await bus.emit(StatusEvent(status="target_disconnected", message=f"{app_name} disconnected"))
+        asyncio.create_task(log_event("app_disconnected", session_id=session_id, app_name=app_name))
 
     async def _observe():
         session_store.set_status(session_id, name, "connecting")
@@ -261,6 +276,13 @@ async def websocket_events(websocket: WebSocket):
 
     # Start observers for this session if not already running
     _start_all_observers(sid)
+
+    # Log session start
+    user_agent = dict(websocket.headers).get("user-agent", "")
+    ip_address = websocket.client.host if websocket.client else ""
+    asyncio.create_task(log_event(
+        "session_started", session_id=sid, user_agent=user_agent, ip_address=ip_address,
+    ))
 
     queue = bus.subscribe()
     try:
