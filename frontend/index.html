@@ -128,12 +128,13 @@
             </div>
             <div class="event-list" id="decisionList">
                 <div class="empty-state" id="decisionEmpty">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
-                        <path d="M9 12l2 2 4-4"/>
-                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                    </svg>
-                    <p>Guardian standing by...</p>
-                    <p class="empty-hint">Evaluating every agent action in real-time</p>
+                    <div class="empty-icon-wrap">
+                        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                        </svg>
+                    </div>
+                    <h3 class="empty-title">Guardian standing by</h3>
+                    <p class="empty-desc">Security decisions will appear here as your connected apps are used. Every agent action is evaluated against OWASP LLM Top 10 rules.</p>
                 </div>
             </div>
         </section>
