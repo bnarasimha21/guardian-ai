@@ -15,9 +15,14 @@ class ThreatLevel(str, Enum):
     CRITICAL = "critical"
 
 
+# Severity order, lowest first. Used to compare a match against the block threshold.
+SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
+
+
 class DecisionAction(str, Enum):
     ALLOWED = "allowed"
     FLAGGED = "flagged"
+    BLOCKED = "blocked"
 
 
 # -- Events sent from Guardian to frontend --

@@ -289,7 +289,7 @@ function renderDecisionCard(event) {
     hideEmpty('decisionEmpty');
     const list = document.getElementById('decisionList');
 
-    const isBlocked = event.action === 'flagged';
+    const isBlocked = event.action === 'flagged' || event.action === 'blocked';
     const card = document.createElement('div');
     card.className = `event-card decision-card ${isBlocked ? 'flagged' : 'allowed'}`;
     card.dataset.source = event.details?._source || '';
@@ -791,7 +791,7 @@ function filterDecisions() {
 
 function matchesDecisionFilter(card, filter) {
     if (filter === '__all') return true;
-    if (filter === 'flagged') return card.dataset.action === 'flagged';
+    if (filter === 'flagged') return card.dataset.action === 'flagged' || card.dataset.action === 'blocked';
     if (filter === 'allowed') return card.dataset.action === 'allowed';
     // critical, high, medium
     return card.dataset.threat === filter;

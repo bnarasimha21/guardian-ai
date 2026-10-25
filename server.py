@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from backend.config import settings
 from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, StatusEvent
-from backend.guardian.middleware import Guardian
+from backend.guardian.middleware import Guardian, is_blocking
 from backend.targets import session_store
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
 from backend.usage_logger import log_event
@@ -196,6 +196,44 @@ async def list_targets(x_session_id: str | None = Header(None)):
         for t in session_store.list_all(sid)
     ]
     return {"targets": targets}
+
+
+class CheckRequest(BaseModel):
+    content: str | None = None
+    event: dict | None = None
+    source: str = "api-check"
+
+
+@app.post("/api/check")
+async def check_content(req: CheckRequest, x_session_id: str | None = Header(None)):
+    """Enforcing check. Returns 200 {"blocked": false} when clean, or 403 with
+    {"blocked": true, ...} when a rule at or above BLOCK_THRESHOLD matches.
+
+    The passive tap cannot stop traffic, so apps that want blocking call this
+    before acting on content (a tool call, an LLM output, a URL to fetch).
+    Pass either `content` (plain text) or `event` ({"type": ..., "data": {...}}).
+    """
+    if req.event is None and req.content is None:
+        return JSONResponse({"error": "Provide 'content' or 'event'"}, status_code=400)
+    sid = x_session_id or "default"
+    guardian = _get_session(sid)["guardian"]
+    if req.event is not None:
+        event = {"type": req.event.get("type", "tool_call"), "data": dict(req.event.get("data") or {})}
+    else:
+        event = {"type": "tool_call", "data": {"content": req.content}}
+    event["data"]["_source"] = req.source
+    matches = await guardian.evaluate(event, enforce=True, block_threshold=settings.block_threshold)
+    blocking = [m for m in matches if is_blocking(m, settings.block_threshold)]
+    body = {
+        "blocked": bool(blocking),
+        "threshold": settings.block_threshold,
+        "matches": [
+            {"rule": m.rule_name, "owasp_id": m.owasp_id, "threat_level": m.threat_level.value,
+             "reason": m.reason, "blocking": m in blocking}
+            for m in matches
+        ],
+    }
+    return JSONResponse(body, status_code=403 if blocking else 200)
 
 
 @app.post("/api/targets/verify")

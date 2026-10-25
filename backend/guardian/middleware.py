@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from backend.events.bus import EventBus
-from backend.events.models import DecisionAction, DecisionEvent, GuardianSummaryEvent, ThreatLevel
+from backend.events.models import SEVERITY_ORDER, DecisionAction, DecisionEvent, GuardianSummaryEvent, ThreatLevel
 
 from .models import ThreatMatch
 from .rules import ALL_RULES, ThreatRule
@@ -24,6 +24,10 @@ class Guardian:
 
     Reports ALL matching rules per event. Emits a rolling summary
     instead of individual ALLOWED cards.
+
+    Events seen through the passive tap are only FLAGGED: the tap cannot stop
+    the target app. Content submitted through evaluate(..., enforce=True) (the
+    /api/check endpoint) is BLOCKED when a match reaches the block threshold.
     """
 
     def __init__(self, event_bus: EventBus, rules: list[ThreatRule] | None = None) -> None:
@@ -37,8 +41,12 @@ class Guardian:
         # Per-app stats
         self._per_app: dict[str, dict] = {}  # {app_name: {checked, blocked, allowed, by_rule, by_severity}}
 
-    async def evaluate(self, event: dict) -> list[ThreatMatch]:
-        """Run ALL rules against an event. Returns list of all matches."""
+    async def evaluate(self, event: dict, enforce: bool = False, block_threshold: str = "high") -> list[ThreatMatch]:
+        """Run ALL rules against an event. Returns list of all matches.
+
+        With enforce=True, matches at or above block_threshold are emitted as
+        BLOCKED decisions (the caller is expected to refuse the content).
+        """
         event_type = event.get("type", "unknown")
         data = event.get("data", {})
 
@@ -72,7 +80,7 @@ class Guardian:
                         event_type=event_type,
                         agent=data.get("agent", ""),
                         task_id=data.get("task_id", ""),
-                        action=DecisionAction.FLAGGED,
+                        action=DecisionAction.BLOCKED if enforce and is_blocking(match, block_threshold) else DecisionAction.FLAGGED,
                         rule_name=match.rule_name,
                         reason=match.reason,
                         threat_level=match.threat_level,
@@ -106,6 +114,13 @@ class Guardian:
         )
 
         return all_matches
+
+
+def is_blocking(match: ThreatMatch, threshold: str) -> bool:
+    """True if the match severity is at or above the threshold."""
+    if threshold not in SEVERITY_ORDER:
+        threshold = "high"
+    return SEVERITY_ORDER.index(match.threat_level.value) >= SEVERITY_ORDER.index(threshold)
 
 
 def _safe_details(data: dict) -> dict:
