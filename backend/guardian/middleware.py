@@ -10,6 +10,11 @@ from .rules import ALL_RULES, ThreatRule
 
 logger = logging.getLogger(__name__)
 
+# Distinct `source` values tracked in per_app; further sources aggregate under "other"
+# so the emitted summary cannot grow without bound.
+MAX_TRACKED_SOURCES = 100
+OTHER_SOURCE = "other"
+
 OWASP_LABELS = {
     "LLM01": "Prompt Injection",
     "LLM02": "Insecure Output Handling",
@@ -58,6 +63,10 @@ class Guardian:
 
         self._total_checked += 1
         source = data.get("_source", "")
+        if source and not isinstance(source, str):
+            source = str(source)
+        if source and source not in self._per_app and len(self._per_app) >= MAX_TRACKED_SOURCES:
+            source = OTHER_SOURCE
         if source and source not in self._per_app:
             self._per_app[source] = {"checked": 0, "flagged": 0, "allowed": 0, "by_rule": {}, "by_severity": {}}
         app_stats = self._per_app.get(source)

@@ -24,9 +24,10 @@ app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor")
 # Per-session state: event bus, guardian, observer tasks
 _sessions: dict[str, dict] = {}
 
-# Cap on distinct sessions /api/check may create from X-Session-Id (unauthenticated
-# endpoint: without a cap, a client could grow memory by sending endless new ids).
-MAX_CHECK_SESSIONS = 1000
+# Cap on live sessions (ids come from unauthenticated X-Session-Id / ?session= values:
+# without a cap, a client could grow memory by sending endless new ids). At the cap the
+# least recently used session is evicted, preferring one with no subscribers or observers.
+MAX_SESSIONS = 1000
 
 SKIP_EVENTS = {
     "decomposition_start", "synthesis_start", "wave_start", "subtask_start",
@@ -34,9 +35,35 @@ SKIP_EVENTS = {
 }
 
 
+def _evict_session() -> None:
+    """Drop one session to make room: the least recently used idle one, else the LRU."""
+    victim = None
+    for sid, sess in _sessions.items():  # dict order is least to most recently used
+        idle = sess["bus"].subscriber_count == 0 and not any(
+            not t.done() for t in sess["observers"].values()
+        )
+        if idle:
+            victim = sid
+            break
+    if victim is None:
+        victim = next(iter(_sessions))
+    for task in _sessions[victim]["observers"].values():
+        task.cancel()
+    del _sessions[victim]
+    logger.info("Evicted session %s (cap %d)", victim[:8], MAX_SESSIONS)
+
+
 def _get_session(session_id: str) -> dict:
-    """Get or create per-session state (event bus, guardian, observer tasks)."""
-    if session_id not in _sessions:
+    """Get or create per-session state (event bus, guardian, observer tasks).
+
+    Every access marks the session most recently used; creating one at the cap
+    evicts the least recently used session instead of refusing.
+    """
+    if session_id in _sessions:
+        _sessions[session_id] = _sessions.pop(session_id)  # move to the MRU end
+    else:
+        while len(_sessions) >= MAX_SESSIONS:
+            _evict_session()
         bus = EventBus()
         _sessions[session_id] = {
             "bus": bus,
@@ -227,8 +254,6 @@ async def check_content(req: CheckRequest, x_session_id: str | None = Header(Non
         if ev_data is not None and not isinstance(ev_data, dict):
             return JSONResponse({"error": "event.data must be an object"}, status_code=400)
     sid = x_session_id or "default"
-    if sid not in _sessions and len(_sessions) >= MAX_CHECK_SESSIONS:
-        return JSONResponse({"error": "Too many sessions"}, status_code=429)
     guardian = _get_session(sid)["guardian"]
     if req.event is not None:
         event = {"type": ev_type, "data": dict(ev_data or {})}
