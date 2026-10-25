@@ -32,7 +32,7 @@ GuardianAI connects to your AI agent applications via WebSocket and monitors eve
 GuardianAI has two paths, and only one of them can stop anything.
 
 - **Observe (flag only)**: events arriving over the `/ws-observe` tap are evaluated and shown on the dashboard as `FLAGGED`. The tap is a passive copy of the traffic, so it cannot stop the target app.
-- **Check (block)**: `POST /api/check` runs the same rules and refuses the content. It returns HTTP 200 `{"blocked": false, ...}` when clean and HTTP 403 `{"blocked": true, ...}` when a match is at or above `BLOCK_THRESHOLD` (default `high`). Blocked results show on the dashboard as `BLOCKED`. Your app must call it before acting on the content and honor the response.
+- **Check (block)**: `POST /api/check` runs the same rules and refuses the content. It returns HTTP 200 `{"blocked": false, ...}` when clean and HTTP 403 `{"blocked": true, ...}` when a match is at or above `BLOCK_THRESHOLD` (default `high`, case-insensitive; an invalid value falls back to `high` with a logged warning, and the response echoes the threshold actually applied). `/api/check` is unauthenticated demo behaviour: it creates a session per `X-Session-Id` and returns 429 once 1000 sessions exist. Blocked results show on the dashboard as `BLOCKED`. Your app must call it before acting on the content and honor the response.
 
 ```bash
 curl -s -X POST localhost:8000/api/check \

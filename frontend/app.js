@@ -731,18 +731,20 @@ function renderSummary() {
     }
 
     // Use per-app stats if an app is selected, otherwise global
-    let checked, flagged, allowed, byRule, bySeverity;
+    let checked, flagged, allowed, blocked, byRule, bySeverity;
     if (selectedApp !== '__all' && event.per_app && event.per_app[selectedApp]) {
         const appStats = event.per_app[selectedApp];
         checked = appStats.checked || 0;
         flagged = appStats.flagged || 0;
         allowed = appStats.allowed || 0;
+        blocked = appStats.blocked || 0;
         byRule = appStats.by_rule || {};
         bySeverity = appStats.by_severity || {};
     } else {
         checked = event.total_checked || 0;
         flagged = event.total_flagged || 0;
         allowed = event.total_allowed || 0;
+        blocked = event.total_blocked || 0;
         byRule = event.by_rule || {};
         bySeverity = event.by_severity || {};
     }
@@ -770,6 +772,7 @@ function renderSummary() {
         <div class="summary-stats">
             <span class="summary-stat summary-allowed">${allowed} safe</span>
             <span class="summary-stat summary-flagged-count">${flagged} flagged</span>
+            ${blocked > 0 ? `<span class="summary-stat summary-flagged-count">${blocked} blocked</span>` : ''}
         </div>
         ${sevChips || ruleChips ? `<div class="summary-chips">${sevChips}${ruleChips}</div>` : ''}
     `;

@@ -36,6 +36,7 @@ class Guardian:
         self._total_checked = 0
         self._total_flagged = 0
         self._total_allowed = 0
+        self._total_blocked = 0
         self._by_rule: dict[str, int] = {}
         self._by_severity: dict[str, int] = {}
         # Per-app stats
@@ -62,6 +63,12 @@ class Guardian:
         app_stats = self._per_app.get(source)
         if app_stats:
             app_stats["checked"] += 1
+
+        blocked_event = enforce and any(is_blocking(m, block_threshold) for m in all_matches)
+        if blocked_event:
+            self._total_blocked += 1
+            if app_stats:
+                app_stats["blocked"] = app_stats.get("blocked", 0) + 1
 
         if all_matches:
             self._total_flagged += 1
@@ -107,6 +114,7 @@ class Guardian:
                 total_checked=self._total_checked,
                 total_flagged=self._total_flagged,
                 total_allowed=self._total_allowed,
+                total_blocked=self._total_blocked,
                 by_rule=dict(self._by_rule),
                 by_severity=dict(self._by_severity),
                 per_app=dict(self._per_app),
@@ -118,7 +126,8 @@ class Guardian:
 
 def is_blocking(match: ThreatMatch, threshold: str) -> bool:
     """True if the match severity is at or above the threshold."""
-    if threshold not in SEVERITY_ORDER:
+    threshold = str(threshold).strip().lower()
+    if threshold not in SEVERITY_ORDER or threshold == "none":
         threshold = "high"
     return SEVERITY_ORDER.index(match.threat_level.value) >= SEVERITY_ORDER.index(threshold)
 

@@ -24,6 +24,10 @@ app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor")
 # Per-session state: event bus, guardian, observer tasks
 _sessions: dict[str, dict] = {}
 
+# Cap on distinct sessions /api/check may create from X-Session-Id (unauthenticated
+# endpoint: without a cap, a client could grow memory by sending endless new ids).
+MAX_CHECK_SESSIONS = 1000
+
 SKIP_EVENTS = {
     "decomposition_start", "synthesis_start", "wave_start", "subtask_start",
     "token", "ping", "pong", "heartbeat",
@@ -215,10 +219,19 @@ async def check_content(req: CheckRequest, x_session_id: str | None = Header(Non
     """
     if req.event is None and req.content is None:
         return JSONResponse({"error": "Provide 'content' or 'event'"}, status_code=400)
+    if req.event is not None:
+        ev_type = req.event.get("type", "tool_call")
+        ev_data = req.event.get("data")
+        if not isinstance(ev_type, str):
+            return JSONResponse({"error": "event.type must be a string"}, status_code=400)
+        if ev_data is not None and not isinstance(ev_data, dict):
+            return JSONResponse({"error": "event.data must be an object"}, status_code=400)
     sid = x_session_id or "default"
+    if sid not in _sessions and len(_sessions) >= MAX_CHECK_SESSIONS:
+        return JSONResponse({"error": "Too many sessions"}, status_code=429)
     guardian = _get_session(sid)["guardian"]
     if req.event is not None:
-        event = {"type": req.event.get("type", "tool_call"), "data": dict(req.event.get("data") or {})}
+        event = {"type": ev_type, "data": dict(ev_data or {})}
     else:
         event = {"type": "tool_call", "data": {"content": req.content}}
     event["data"]["_source"] = req.source

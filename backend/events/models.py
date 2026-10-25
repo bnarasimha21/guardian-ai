@@ -63,6 +63,7 @@ class GuardianSummaryEvent(BaseModel):
     total_checked: int = 0
     total_flagged: int = 0
     total_allowed: int = 0
+    total_blocked: int = 0
     by_rule: dict = Field(default_factory=dict)  # {rule_name: count}
     by_severity: dict = Field(default_factory=dict)  # {threat_level: count}
     per_app: dict = Field(default_factory=dict)  # {app_name: {checked, blocked, allowed, by_rule, by_severity}}
