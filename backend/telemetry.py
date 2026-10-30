@@ -46,7 +46,7 @@ from typing import Any, AsyncIterator, Iterator, Mapping
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
-from opentelemetry.trace import Link, NonRecordingSpan, Span, SpanContext, SpanKind
+from opentelemetry.trace import Link, NonRecordingSpan, Span, SpanContext, SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,13 @@ def _extract(carrier: Mapping[str, Any] | None) -> otel_context.Context | None:
     flat = {str(k).lower(): v for k, v in carrier.items() if isinstance(v, str)}
     if "traceparent" not in flat:
         return None
+    getlist = getattr(carrier, "getlist", None)  # HTTP headers can repeat
+    if callable(getlist):
+        if len(getlist("traceparent")) > 1:
+            return None  # W3C: more than one traceparent is invalid
+        states = [v for v in getlist("tracestate") if v.strip()]
+        if states:
+            flat["tracestate"] = ",".join(states)  # W3C: repeated tracestate headers combine
     try:
         ctx = _W3C.extract(flat)
     except (ValueError, TypeError):
@@ -223,7 +230,10 @@ class Telemetry:
         return _clean({
             GEN_AI_TOOL_NAME: tool_name or call.name,
             GEN_AI_TOOL_CALL_ID: call.call_id,
-            GEN_AI_AGENT_NAME: call.agent_name or agent_name,
+            # The authenticated principal, when there is one; the self-reported
+            # name only otherwise (it is a label, not an identity).
+            GEN_AI_AGENT_NAME: agent_name or call.agent_name,
+            "guardian.agent.claimed_name": call.agent_name if agent_name and call.agent_name != agent_name else "",
             GEN_AI_AGENT_ID: call.agent_id,
             "guardian.tool.server": call.server,
         })
@@ -245,9 +255,10 @@ class Telemetry:
         else:
             name = f"{EXECUTE_TOOL} {call.name}"
             attrs[GEN_AI_OPERATION_NAME] = EXECUTE_TOOL
-        with self.tracer.start_as_current_span(name, context=parent, kind=SpanKind.INTERNAL,
-                                               attributes=attrs) as span:
-            yield CheckSpan(self, span)
+        with self.tracer.start_as_current_span(name, context=parent, kind=SpanKind.INTERNAL, attributes=attrs,
+                                               record_exception=False, set_status_on_exception=False) as span:
+            with _error_type_only(span):
+                yield CheckSpan(self, span)
 
     # ---- approvals -----------------------------------------------------------
 
@@ -324,22 +335,26 @@ class Telemetry:
             GEN_AI_AGENT_NAME: agent_name,
         })
         with self.tracer.start_as_current_span(f"{EXECUTE_TOOL} {name}", context=parent, kind=SpanKind.INTERNAL,
-                                               attributes=attrs) as span:
+                                               attributes=attrs, record_exception=False,
+                                               set_status_on_exception=False) as span:
             token = _active_gateway_span.set(span)
             try:
-                yield GatewaySpan(span)
+                with _error_type_only(span):
+                    yield GatewaySpan(span)
             finally:
                 _active_gateway_span.reset(token)
 
-    def decision(self, decision: Any, call: Any, *, approval_id: str = "") -> None:
-        """A decision the gateway recorded. Inside a tools/call it becomes an
-        event on that span; otherwise (tool definitions screened while listing
-        tools) it gets a span of its own."""
+    def decision(self, decision: Any, call: Any, *, approval_id: str = "", definition: bool = False) -> None:
+        """A decision the gateway recorded. A decision on the call being made
+        becomes an event on its tools/call span. A tool definition screened
+        while listing tools gets a span of its own (a child of the current
+        tools/call span when a call triggered the refresh), so it is never
+        mistaken for a decision on that call."""
         attrs = _effect_attrs(decision)
         attrs["guardian.phase"] = decision.phase
         if approval_id:
             attrs["guardian.approval.id"] = approval_id
-        span = _active_gateway_span.get()
+        span = None if definition else _active_gateway_span.get()
         if span is not None and span.is_recording():
             span.add_event("guardian.decision", attributes=attrs)
             if decision.phase == "call":
@@ -349,6 +364,23 @@ class Telemetry:
         own = self.tracer.start_span(f"guardian.tool_definition {call.name}", kind=SpanKind.INTERNAL,
                                      attributes=attrs)
         own.end()
+
+
+@contextmanager
+def _error_type_only(span: Span) -> Iterator[None]:
+    """Mark the span as failed on an exception, recording only its type.
+
+    The SDK default records the exception message and stack, and those can
+    carry tool arguments, which spans otherwise never hold (see
+    GUARDIAN_OTEL_CAPTURE_ARGUMENTS).
+    """
+    try:
+        yield
+    except BaseException as exc:
+        kind = type(exc).__qualname__
+        span.set_attribute("error.type", kind)
+        span.set_status(Status(StatusCode.ERROR, kind))
+        raise
 
 
 def _package_version() -> str:

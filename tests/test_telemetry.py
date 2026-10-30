@@ -421,3 +421,64 @@ def test_create_table_sql_has_no_anonymous_read():
     assert "FOR SELECT TO anon" not in code
     assert 'DROP POLICY IF EXISTS "Allow anonymous reads"' in code
     assert "FOR INSERT TO anon" in code
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: header repetition, principal naming, error detail, definitions
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_tracestate_headers_combine_and_two_traceparents_are_ignored(client, spans):
+    headers = [("traceparent", TRACEPARENT), ("tracestate", "vendor1=a"), ("tracestate", "vendor2=b")]
+    client.post("/api/check", json=SSRF, headers=headers)
+    state = spans.one("execute_tool http.fetch").context.trace_state
+    assert dict(state.items()) == {"vendor1": "a", "vendor2": "b"}
+
+    spans.exporter.clear()
+    other = f"00-{'a' * 32}-{'b' * 16}-01"
+    client.post("/api/check", json=SSRF, headers=[("traceparent", TRACEPARENT), ("traceparent", other)])
+    span = spans.one("execute_tool http.fetch")
+    assert span.parent is None  # invalid context: a new trace, not either claimed parent
+    assert _hex(span.context.trace_id, 32) not in (TRACE_ID, "a" * 32)
+
+
+def test_principal_is_the_agent_name_and_the_claim_is_kept_apart(client, spans, monkeypatch):
+    key = "k" * 24
+    monkeypatch.setattr(server.settings, "guardian_api_keys", f"billing={key}")
+    resp = client.post("/api/check", json={**SSRF, "agent": {"id": "a-7", "name": "ops"}},
+                       headers={"Authorization": f"Bearer {key}"})
+    assert resp.status_code == 403
+    a = spans.one("execute_tool http.fetch").attributes
+    assert a["gen_ai.agent.name"] == "billing"
+    assert a["guardian.agent.claimed_name"] == "ops"
+
+
+def test_exception_message_is_not_recorded_on_the_span(spans):
+    from types import SimpleNamespace
+
+    call = SimpleNamespace(name="http.fetch", call_id="c1", agent_name="", agent_id="", server="")
+    with pytest.raises(RuntimeError):
+        with spans.telemetry.check_span(call):
+            raise RuntimeError("secret-zz-77 in an argument")
+    span = spans.one("execute_tool http.fetch")
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.status_code.name == "ERROR"
+    assert not span.events
+    assert "secret-zz-77" not in _all_attribute_text([span]) + str(span.status.description)
+
+
+@pytest.mark.anyio
+async def test_definition_decision_during_a_call_gets_its_own_span(spans):
+    from types import SimpleNamespace
+
+    decision = SimpleNamespace(effect="deny", decision_id="d1", enforced=True, rule_id="tool_poisoning",
+                               mode="enforce", owasp_llm="LLM01", owasp_agentic="ASI04",
+                               matched_detectors=["tool_poisoning"], phase="definition")
+    tool = SimpleNamespace(name="sketchy.lookup", call_id="", agent_name="", agent_id="", server="sketchy")
+    async with spans.telemetry.gateway_call("files.read_file", SimpleNamespace(meta=None, request_id=1)):
+        spans.telemetry.decision(decision, tool, definition=True)
+    call_span = spans.one("execute_tool files.read_file")
+    own = spans.one("guardian.tool_definition sketchy.lookup")
+    assert not call_span.events  # the call itself was not denied
+    assert own.parent.span_id == call_span.context.span_id
+    assert own.attributes["guardian.decision"] == "deny"

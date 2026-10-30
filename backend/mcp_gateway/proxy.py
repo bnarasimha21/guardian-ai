@@ -357,7 +357,8 @@ class Gateway:
             }
             self.audit.write("decision", payload)
         if self.telemetry is not None:
-            self.telemetry.decision(decision, call, approval_id=approval_id)
+            self.telemetry.decision(decision, call, approval_id=approval_id,
+                                    definition=bool(details and "definition_sha256" in details))
 
     async def _audit_approval(self, approval: PendingApproval, change: str) -> None:
         if self.audit is not None and approval.session == self.session:
