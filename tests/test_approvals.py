@@ -254,3 +254,41 @@ def test_approver_lists_app_session(client, policy_file, monkeypatch):
     own = client.get("/api/approvals?session=app:other", headers={"Authorization": f"Bearer {APP_KEY}"})
     assert [a["approval_id"] for a in own.json()["approvals"]] == [aid]
     assert client.get("/api/approvals?session=app:billing", headers={"X-Session-Id": "x"}).json()["approvals"] == []
+
+
+def test_nan_and_lone_surrogate_arguments_do_not_break_the_queue(client, policy_file):
+    """Python's JSON parser accepts NaN and lone surrogates; the queue, the
+    dashboard feed and the retry must all still work."""
+    policy_file(POLICY)
+    h = {"X-Session-Id": "odd-args", "content-type": "application/json"}
+    raw = ('{"tool": {"name": "cloud.deploy"}, "arguments": '
+           '{"replicas": NaN, "max": Infinity, "label": "a\\ud800b", "\\udc00key": 1}}')
+    with client.websocket_connect("/ws/events?session=odd-args") as ws:
+        resp = client.post("/api/check", content=raw, headers=h)
+        assert resp.status_code == 202, resp.text
+        aid = resp.json()["approval_id"]
+        pending, _ = _until(ws, lambda e: e.get("type") == "approval" and e["change"] == "pending")
+        assert pending["arguments"]["replicas"] == "nan" and pending["arguments"]["max"] == "inf"
+        assert pending["arguments"]["label"] == "a�b"
+    got = client.get(f"/api/approvals/{aid}", headers=h)
+    assert got.status_code == 200, got.text
+    assert client.get("/api/approvals", headers=h).status_code == 200
+    assert client.post(f"/api/approvals/{aid}", json={"approve": True}, headers=h).status_code == 200
+    # The identical raw call hashes the same and uses the grant.
+    again = client.post("/api/check", content=raw, headers=h)
+    assert again.status_code == 200 and again.json()["approval_id"] == aid
+    # A different lone surrogate is a different call.
+    other = client.post("/api/check", content=raw.replace("\\ud800", "\\ud801"), headers=h)
+    assert other.status_code == 202 and other.json()["approval_id"] != aid
+
+
+def test_held_calls_cannot_grow_memory_through_long_names(client, policy_file):
+    policy_file(POLICY)
+    h = {"X-Session-Id": "long-names"}
+    huge_agent = {**DEPLOY, "agent": {"id": "a" * 5000}}
+    assert client.post("/api/check", json=huge_agent, headers=h).status_code in (400, 422)
+    long_key = {"tool": DEPLOY["tool"], "arguments": {"k" * 5000: 1}}
+    resp = client.post("/api/check", json=long_key, headers=h)
+    assert resp.status_code == 202
+    preview = client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()["arguments"]
+    assert all(len(path) <= 503 for path in preview)

@@ -34,7 +34,7 @@ _TOOL_NAME = re.compile(r"^[A-Za-z0-9_.:/\-]{1,200}$")
 
 class ToolRef(BaseModel):
     name: str
-    server: Optional[str] = None
+    server: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator("name")
     @classmethod
@@ -45,13 +45,13 @@ class ToolRef(BaseModel):
 
 
 class AgentRef(BaseModel):
-    id: str = ""
-    name: str = ""
+    id: str = Field(default="", max_length=200)
+    name: str = Field(default="", max_length=200)
 
 
 class TraceContext(BaseModel):
-    traceparent: Optional[str] = None
-    tracestate: Optional[str] = None
+    traceparent: Optional[str] = Field(default=None, max_length=256)
+    tracestate: Optional[str] = Field(default=None, max_length=1024)
     # True when the caller already has its own execute_tool span for this call:
     # GuardianAI then records a child "guardian.check" span instead of a second
     # execute_tool span.
@@ -68,7 +68,7 @@ class CheckRequest(BaseModel):
     # Legacy shapes
     content: Optional[str] = None
     event: Optional[dict] = None
-    source: str = "api-check"
+    source: str = Field(default="api-check", max_length=200)
 
     @field_validator("agent", mode="before")
     @classmethod

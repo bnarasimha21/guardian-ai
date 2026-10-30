@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
+import re
 import secrets
 import time
 from abc import ABC, abstractmethod
@@ -37,6 +39,7 @@ MAX_PENDING_PER_SESSION = 100
 RETAIN_SECONDS = 3600
 MAX_PREVIEW_PATHS = 200
 MAX_PREVIEW_CHARS = 500
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class ApprovalError(Exception):
@@ -57,7 +60,19 @@ def arguments_sha256(tool: str, server: str | None, arguments: Any) -> str:
         {"tool": tool, "server": server, "arguments": arguments},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    # surrogatepass: a lone surrogate in an argument is still hashed (to its
+    # own distinct bytes) instead of raising.
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _display(value: Any) -> Any:
+    """``value`` as something JSON can carry: NaN and infinities become text,
+    lone surrogates become U+FFFD. The preview is for people, not the hash."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, str):
+        return _SURROGATE.sub("\ufffd", value)
+    return value
 
 
 def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
@@ -77,7 +92,10 @@ def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
                 v = v[:MAX_PREVIEW_CHARS] + "..."
             elif not isinstance(v, (str, int, float, bool, type(None))):
                 v = str(v)[:MAX_PREVIEW_CHARS]
-            out[path or "$"] = v
+            key = path or "$"
+            if len(key) > MAX_PREVIEW_CHARS:
+                key = key[:MAX_PREVIEW_CHARS] + "..."
+            out[_display(key)] = _display(v)
     return out
 
 

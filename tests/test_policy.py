@@ -387,6 +387,44 @@ def test_ws_for_app_session_needs_token(client, monkeypatch):
         assert any(e["type"] == "decision" and e["action"] == "blocked" for e in seen)
 
 
+
+def test_dashboard_token_is_not_written_to_server_logs(monkeypatch):
+    """The real app under uvicorn, access log on: the key in /ws/events?token=
+    must not reach any log record."""
+    import logging
+
+    import httpx
+    import uvicorn
+    from websockets.sync.client import connect
+
+    from tests.conftest import ThreadedServer
+
+    monkeypatch.setattr(server.settings, "guardian_api_keys", f"billing={KEY_A}")
+    records: list[str] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    keep = Keep()
+    srv = ThreadedServer(server.app)
+    srv.server.config = uvicorn.Config(server.app, host="127.0.0.1", port=srv.port, log_level="info",
+                                       access_log=True, lifespan="on")
+    try:
+        with srv:
+            for name in ("uvicorn.access", "uvicorn.error"):
+                logging.getLogger(name).addHandler(keep)
+            with connect(f"ws://127.0.0.1:{srv.port}/ws/events?session=app:billing&token={KEY_A}", close_timeout=0.2) as ws:
+                ws.send("ping")
+            httpx.get(f"{srv.base_url}/api/policy?token={KEY_A}")
+    finally:
+        for name in ("uvicorn.access", "uvicorn.error"):
+            logging.getLogger(name).removeHandler(keep)
+    joined = "\n".join(records)
+    assert "token=[REDACTED]" in joined  # the request lines were logged...
+    assert KEY_A not in joined  # ...without the key
+
+
 # -- acceptance: legacy callers --------------------------------------------------
 
 

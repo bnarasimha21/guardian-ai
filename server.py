@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -32,10 +33,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 
+_TOKEN_IN_URL = re.compile(r"(?i)([?&]token=)[^&\s\"']*")
+
+
+class _ScrubTokens(logging.Filter):
+    """Mask ``token=`` query values in log lines.
+
+    Browsers cannot set headers on a WebSocket, so the dashboard passes its key
+    as ``/ws/events?token=...``, and uvicorn logs the request line with it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "token=" in message.lower():
+            record.msg = _TOKEN_IN_URL.sub(r"\1[REDACTED]", message)
+            record.args = ()
+        return True
+
+
+_SCRUB = _ScrubTokens()
+
+
+def _install_log_scrub() -> None:
+    """Idempotent. Called at import and again at startup, after uvicorn has
+    configured its loggers."""
+    for name in ("uvicorn.access", "uvicorn.error"):
+        log = logging.getLogger(name)
+        if _SCRUB not in log.filters:
+            log.addFilter(_SCRUB)
+
+
+_install_log_scrub()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail at startup, not on the first request, if the policy file or the key
     # configuration is broken, or a GUARDIAN_MODEL_DETECTORS entry cannot load.
+    _install_log_scrub()
     default_rules()
     _policy_store()
     _api_keys()
@@ -773,13 +808,24 @@ async def websocket_events(websocket: WebSocket):
     ))
 
     queue = bus.subscribe()
-    try:
+
+    async def pump() -> None:
         while True:
             event = await queue.get()
             await websocket.send_json(event.model_dump())
-    except WebSocketDisconnect:
-        bus.unsubscribe(queue)
-    except Exception:
+
+    # Send from a task and listen here, so a closed tab (or a server shutdown)
+    # ends the handler at once instead of on the next event that fails to send.
+    sender = asyncio.create_task(pump())
+    try:
+        while not sender.done():
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        sender.cancel()
         bus.unsubscribe(queue)
 
 
