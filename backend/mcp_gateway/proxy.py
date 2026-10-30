@@ -35,6 +35,8 @@ and to an optional JSONL audit log.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import secrets
@@ -194,6 +196,63 @@ def _summary(decision: Decision, **extra: Any) -> dict:
 
 def _reasons(decision: Decision, limit: int = 3) -> str:
     return "; ".join(decision.reasons[:limit])
+
+
+# Text fields of a resource_link block. All of them can reach the model.
+_LINK_FIELDS = ("name", "title", "description", "uri")
+
+
+def _blob_text(blob: str) -> str | None:
+    """A base64 blob's content as text, or None when it is not UTF-8 text."""
+    try:
+        return base64.b64decode(blob, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
+    """Every piece of text in a tool result's content, with where it came from.
+
+    Returns ``[(content index, kind)]`` and the matching texts. Kinds: "text",
+    "resource" (embedded text resource), "blob" (embedded blob that decodes to
+    UTF-8 text) and "link:<field>" (a resource_link's name, title, description
+    or uri). Images, audio and binary blobs carry no text to scan.
+    """
+    where: list[tuple[int, str]] = []
+    texts: list[str] = []
+    for i, block in enumerate(content):
+        if isinstance(block, types.TextContent):
+            where.append((i, "text"))
+            texts.append(block.text)
+        elif isinstance(block, types.EmbeddedResource):
+            res = block.resource
+            if isinstance(res, types.TextResourceContents):
+                where.append((i, "resource"))
+                texts.append(res.text)
+            elif isinstance(res, types.BlobResourceContents):
+                decoded = _blob_text(res.blob)
+                if decoded is not None:
+                    where.append((i, "blob"))
+                    texts.append(decoded)
+        elif isinstance(block, types.ResourceLink):
+            for name in _LINK_FIELDS:
+                value = getattr(block, name, None)
+                if isinstance(value, str) and value:
+                    where.append((i, f"link:{name}"))
+                    texts.append(value)
+    return where, texts
+
+
+def _replace_text(block: Any, kind: str, new_text: str) -> Any:
+    """``block`` with the text that ``kind`` names replaced by ``new_text``."""
+    if kind == "text":
+        return block.model_copy(update={"text": new_text})
+    if kind == "resource":
+        return block.model_copy(update={"resource": block.resource.model_copy(update={"text": new_text})})
+    if kind == "blob":
+        blob = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
+        return block.model_copy(update={"resource": block.resource.model_copy(update={"blob": blob})})
+    return block.model_copy(update={kind.split(":", 1)[1]: new_text})
 
 
 class Gateway:
@@ -646,15 +705,7 @@ class Gateway:
 
     async def _screen_result(self, loaded, call: ToolCall, decision: Decision, result: types.CallToolResult,
                              outcome: GatewayResult) -> types.CallToolResult:
-        texts: list[tuple[int, str]] = []  # (content index, "text" | "resource")
-        payload_content: list[str] = []
-        for i, block in enumerate(result.content):
-            if isinstance(block, types.TextContent):
-                texts.append((i, "text"))
-                payload_content.append(block.text)
-            elif isinstance(block, types.EmbeddedResource) and isinstance(block.resource, types.TextResourceContents):
-                texts.append((i, "resource"))
-                payload_content.append(block.resource.text)
+        texts, payload_content = _result_texts(result.content)
         payload: dict[str, Any] = {"content": payload_content}
         if result.structured_content is not None:
             payload["structured"] = result.structured_content
@@ -678,13 +729,9 @@ class Gateway:
         if verdict.effect == "redact" and isinstance(verdict.redacted, dict):
             red = verdict.redacted
             content = list(result.content)
-            for (idx, kind), new_text in zip(texts, red.get("content", [])):
-                block = content[idx]
-                if kind == "text":
-                    content[idx] = block.model_copy(update={"text": new_text})
-                else:
-                    content[idx] = block.model_copy(update={"resource": block.resource.model_copy(
-                        update={"text": new_text})})
+            for (idx, kind), old_text, new_text in zip(texts, payload_content, red.get("content", [])):
+                if new_text != old_text:
+                    content[idx] = _replace_text(content[idx], kind, new_text)
             update: dict[str, Any] = {"content": content}
             if "structured" in red:
                 update["structured_content"] = red["structured"]

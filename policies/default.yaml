@@ -146,12 +146,12 @@ rules:
     effect: allow
 
   # Result phase (MCP gateway): what a tool returned, before the agent sees it.
-  - id: redact-secrets-in-results
+  - id: deny-unscanned-results
     phase: result
-    description: Secrets in tool output are redacted before the agent sees them
+    description: Tool output too large to inspect fully is withheld (fail closed)
     match:
-      detectors: {rules: [sensitive_data_leak], min_severity: high}
-    effect: redact
+      detectors: {rules: [scan_limit_exceeded]}
+    effect: deny
 
   - id: deny-injection-in-results
     phase: result
@@ -159,6 +159,15 @@ rules:
     match:
       detectors: {rules: [prompt_injection], min_severity: high}
     effect: deny
+
+  # Rules are first match, so the deny comes before the redact: output that
+  # carries both an injection and a secret is withheld, not masked and passed on.
+  - id: redact-secrets-in-results
+    phase: result
+    description: Secrets in tool output are redacted before the agent sees them
+    match:
+      detectors: {rules: [sensitive_data_leak], min_severity: high}
+    effect: redact
 
   - id: warn-on-suspicious-results
     phase: result

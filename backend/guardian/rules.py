@@ -261,6 +261,22 @@ def P(pattern: str, reason: str, level: ThreatLevel, *, flags: int = re.IGNORECA
     return Pattern(re.compile(pattern, flags), reason, level, untrusted_only, joined)
 
 
+
+def _after_first(keyword: str, body: str, separators: str) -> str:
+    """Regex prefix for "``keyword``, then more text in the same segment".
+
+    ``keyword[^\n]*X`` is quadratic: on a failed search the engine rescans the
+    rest of the line from every occurrence of the keyword ("nc nc nc ...").
+    This prefix starts only at a segment start (text start or just after one
+    of ``separators``) and commits to the first keyword in the segment. The
+    lookahead is atomic in Python's ``re``, so the engine cannot backtrack to
+    a later keyword, and the first one leaves the longest tail, so a match
+    exists exactly when the plain pattern would match. Linear time.
+    """
+    sep = re.escape(separators)
+    return rf"(?:^|(?<=[{sep}]))(?=({body}*?{keyword}))\1"
+
+
 class _Collector:
     """Merges hits for one rule into a single deduplicated ThreatMatch."""
 
@@ -495,11 +511,11 @@ class DataExfiltrationRule(ThreatRule):
     description = "Data exfiltration attempt via external endpoint"
 
     UPLOAD_PATTERNS = [
-        P(r"\bcurl\b[^\n|;]*?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)(?=[\s=@'\"]|$)",
+        P(_after_first(r"\bcurl\b", r"[^\n|;]", "\n|;") + r"[^\n|;]*?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)(?=[\s=@'\"]|$)",
           "curl uploading data", H),
-        P(r"\bwget\b[^\n|;]*?--post-(?:data|file)\b", "wget posting data", H),
-        P(r"!\[[^\]]*\]\(\s*https?://[^)\s]*\?[^)\s]*=[^)\s]*\)", "markdown image with query string (zero-click exfil channel)", H),
-        P(r"<img\b[^>]*\bsrc\s*=\s*['\"]?https?://[^'\" >]*\?[^'\" >]*=", "HTML image with query string (zero-click exfil channel)", H),
+        P(_after_first(r"\bwget\b", r"[^\n|;]", "\n|;") + r"[^\n|;]*?--post-(?:data|file)\b", "wget posting data", H),
+        P(r"!\[[^\[\]]*\]\(\s*https?://[^)\s]*\?[^)\s]*=[^)\s]*\)", "markdown image with query string (zero-click exfil channel)", H),
+        P(r"<img\b[^<>]*\bsrc\s*=\s*['\"]?https?://[^'\" >]*\?[^'\" >]*=", "HTML image with query string (zero-click exfil channel)", H),
     ]
 
     def scan(self, scan: ScanInput) -> list[ThreatMatch]:
@@ -563,11 +579,11 @@ class DangerousCodeRule(RegexRule):
           "destructive file deletion", H),
         P(r"/dev/(?:tcp|udp)/", "reverse shell via /dev/tcp", C),
         P(r"\bmkfifo\b", "named pipe (reverse shell)", H),
-        P(r"\bnc\b[^\n]*\s-[a-z]*e\s", "netcat with -e (reverse shell)", C),
+        P(_after_first(r"\bnc\b", r"[^\n]", "\n") + r"[^\n]*\s-[a-z]*e\s", "netcat with -e (reverse shell)", C),
         P(r"\bchmod\s+(?:-R\s+)?777\b", "world-writable permissions", H),
         P(r"\bsudo\s+(?:-\S+\s+)*(?:rm|chmod|chown|dd|mkfs\S*|bash|sh|zsh|su|passwd|user(?:add|mod|del)|visudo|tee|cat\s+/etc/shadow)\b",
           "privilege escalation", H),
-        P(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", "download piped to shell", C),
+        P(_after_first(r"\b(?:curl|wget)\b", r"[^\n|]", "\n|") + r"[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", "download piped to shell", C),
         P(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh)\b", "piping to shell", H),
         P(r"\bos\.system\(", "Python os.system()", H),
         P(r"\bsubprocess\.(?:run|call|Popen|check_output)\(", "Python subprocess", H),
@@ -576,7 +592,7 @@ class DangerousCodeRule(RegexRule):
         P(r"__import__\(", "dynamic import", H),
         P(r"/etc/(?:passwd|shadow|sudoers)\b", "system file access", H),
         # ".env" as a file (cat .env, ./app/.env), not process.env or os.environ.
-        P(r"(?<![\w$])(?:\.?/?[\w\-./]*/)?\.env(?:\.[a-z]+)?(?![\w.(])", "environment file access", H),
+        P(r"(?<![\w$])\.env(?:\.[a-z]+)?(?![\w.(])", "environment file access", H),
         P(r"(?:\.\./){2,}|(?:\.\.\\){2,}", "path traversal", H),
         P(r"\bbase64\s+(?:-d|--decode)\b", "base64 decode (obfuscation)", H),
     ]
@@ -603,7 +619,7 @@ class InjectionRule(RegexRule):
         P(r"['\"]\s*(?:--\s|--$|/\*)", "SQL injection (comment terminator)", M),
         P(r"<\s*script\b[^>]*>", "XSS (script tag)", H),
         P(r"\bjavascript\s*:", "XSS (javascript: URI)", H),
-        P(r"<[^>]+\bon(?:load|error|click|mouseover|focus)\s*=", "XSS (event handler)", H),
+        P(r"<[^<>]+\bon(?:load|error|click|mouseover|focus)\s*=", "XSS (event handler)", H),
         P(r";\s*(?:cat|ls|whoami|id|uname|nc|curl|wget)\b", "command injection", H),
         P(r"\$\(\s*(?:curl|wget|cat|whoami|id|uname|nc|bash|sh|base64|env|printenv)\b", "command substitution", H),
         P(r"`\s*(?:curl|wget|cat|whoami|id|uname|nc|bash|sh)\b[^`]*`", "command substitution (backticks)", H),

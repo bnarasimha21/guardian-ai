@@ -197,6 +197,18 @@ def evaluate(
     if phase == "result" and effect == "redact":
         names = deciding or [m.rule_name for m in matches]
         redacted = detectors.redact(result, names)
+        # Redaction rewrites the text as written. A secret that was only seen
+        # in a normalised or decoded spelling (split by zero-width characters,
+        # fullwidth, base64) survives it, so check, and withhold the result
+        # rather than pass on a "redacted" copy that still carries the secret.
+        left = [m for m in detectors.detect(redacted, all_untrusted=True) if m.rule_name in names]
+        if left:
+            effect = "deny"
+            redacted = None
+            reasons.append(
+                "Redaction could not remove every match (the text is obfuscated, for example split by "
+                "invisible characters or base64-encoded), so the result is withheld"
+            )
 
     return Decision(
         decision_id=uuid.uuid4().hex,

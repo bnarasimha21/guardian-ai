@@ -525,7 +525,7 @@
   "policy": {
     "block_threshold": "high",
     "file": "policies/default.yaml",
-    "sha256": "c5c871fe4c74fcdac1b39902d40b6629a41486c29ceac2ec1dc01e094ad8c271"
+    "sha256": "4b33c24af620fec6a420922e071be20c3d752f51c7c59ef5af56088775d47d7b"
   },
   "records": [
     {
