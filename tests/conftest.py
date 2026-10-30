@@ -32,6 +32,13 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(targets_mod.session_store, "_sessions", {})
     monkeypatch.setattr(usage_logger, "SUPABASE_URL", "")
     monkeypatch.setattr(usage_logger, "SUPABASE_KEY", "")
+    # Ignore whatever a developer's .env sets: tests start from the shipped
+    # default policy with no API keys.
+    monkeypatch.setattr(server.settings, "guardian_policy_file", "")
+    monkeypatch.setattr(server.settings, "guardian_api_keys", "")
+    monkeypatch.setattr(server.settings, "guardian_approver_keys", "")
+    monkeypatch.setattr(server.settings, "block_threshold", "high")
+    monkeypatch.setattr(server.settings, "allow_private_targets", False)
     for sess in list(server._sessions.values()):
         for task in sess["observers"].values():
             task.cancel()
@@ -194,3 +201,19 @@ def wait_for(predicate, timeout: float = 10.0, interval: float = 0.05):
             return value
         time.sleep(interval)
     raise AssertionError("condition not met in time")
+
+
+@pytest.fixture
+def policy_file(tmp_path, monkeypatch):
+    """Factory: write a policy YAML to a temp file and point the server at it.
+
+    Call it again to rewrite the same file (for hot-reload tests).
+    """
+    path = tmp_path / "policy.yaml"
+
+    def write(text: str) -> Path:
+        path.write_text(text)
+        monkeypatch.setattr(server.settings, "guardian_policy_file", str(path))
+        return path
+
+    return write

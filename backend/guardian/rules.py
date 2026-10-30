@@ -1,340 +1,563 @@
-"""Guardian threat detection rules.
+"""Guardian threat detectors.
 
-Generic rules that work with ANY agent system. Rules inspect event data
-by shape (text content, URLs, patterns) not by specific event type names.
+Detectors are generic: they inspect values by shape (text, URLs, numbers), not
+by event type. Every detector sees each string value together with its JSON
+path, so a match says which argument triggered it, and a detector can treat
+some paths as untrusted (content the agent fetched, as opposed to content the
+agent wrote).
+
+Walking is iterative with no depth cap. A node limit and a character limit
+bound the work; a payload over either limit produces a ``scan_limit_exceeded``
+match instead of being silently half-scanned (fail closed).
+
 OWASP mappings (LLM Top 10 2025 and Agentic Top 10 2026) live in taxonomy.py.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from abc import ABC, abstractmethod
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Iterator
+from urllib.parse import urlsplit
 
-from backend.events.models import ThreatLevel
+from backend.events.models import SEVERITY_ORDER, ThreatLevel
+from backend.netguard import classify_host_literal, parse_ip_literal
+
 from .models import ThreatMatch
+
+MAX_NODES = 10_000
+MAX_TOTAL_CHARS = 1_000_000
+JOINED_PATH = "$joined"
+
+
+# ---------------------------------------------------------------------------
+# Walking payloads
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScanField:
+    """One string value and where it came from."""
+
+    path: str          # dotted path with list indexes, e.g. "results.0.page"
+    key: str           # last dict key on the path, lowercased ("" for list items)
+    value: str
+    untrusted: bool = False
+
+
+@dataclass
+class ScanInput:
+    fields: list[ScanField] = field(default_factory=list)
+    numbers: dict[str, float] = field(default_factory=dict)
+    limit_exceeded: str | None = None
+
+
+def path_segments(path: str) -> list[str]:
+    return [s for s in path.split(".") if s != ""] if path else []
+
+
+def path_matches(path: str, patterns: Iterable[str]) -> bool:
+    """True if ``path`` is at or below any pattern.
+
+    A pattern without dots or wildcards names a key anywhere on the path
+    ("page" matches "page", "results.0.page" and "page.text"). Other patterns
+    are fnmatch globs over the dotted path and match the path or any prefix
+    of it, so "results.*.html" covers "results.3.html.body".
+    """
+    segments = path_segments(path)
+    lowered = [s.lower() for s in segments]
+    for pattern in patterns:
+        if not pattern:
+            continue
+        if "." not in pattern and not any(c in pattern for c in "*?["):
+            if pattern.lower() in lowered:
+                return True
+            continue
+        for i in range(1, len(segments) + 1):
+            if fnmatch.fnmatchcase(".".join(segments[:i]), pattern):
+                return True
+    return False
+
+
+def build_scan_input(
+    data: Any,
+    *,
+    untrusted_paths: Iterable[str] = (),
+    all_untrusted: bool = False,
+    max_nodes: int = MAX_NODES,
+    max_total_chars: int = MAX_TOTAL_CHARS,
+) -> ScanInput:
+    """Flatten ``data`` into (path, string) fields, iteratively, in document order."""
+    untrusted_paths = list(untrusted_paths)
+    out = ScanInput()
+    nodes = 0
+    chars = 0
+
+    def is_untrusted(path: str) -> bool:
+        return all_untrusted or (bool(untrusted_paths) and path_matches(path, untrusted_paths))
+
+    stack: list[tuple[str, str, Any]] = [("", "", data)]
+    while stack:
+        path, key, value = stack.pop()
+        nodes += 1
+        if nodes > max_nodes:
+            out.limit_exceeded = f"payload has more than {max_nodes} values"
+            break
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            out.numbers[path] = float(value)
+            continue
+        if isinstance(value, dict):
+            for k, v in reversed(list(value.items())):
+                k = str(k)
+                child = f"{path}.{k}" if path else k
+                stack.append((child, k.lower(), v))
+                # Keys are attacker-controlled text too; scan the ones that
+                # could carry a sentence.
+                if " " in k or len(k) > 64:
+                    stack.append((child, k.lower(), k))
+            continue
+        if isinstance(value, (list, tuple)):
+            for i in range(len(value) - 1, -1, -1):
+                child = f"{path}.{i}" if path else str(i)
+                stack.append((child, "", value[i]))
+            continue
+        text = value if isinstance(value, str) else str(value)
+        chars += len(text)
+        if chars > max_total_chars:
+            out.limit_exceeded = f"payload has more than {max_total_chars} characters of text"
+            break
+        out.fields.append(ScanField(path=path, key=key, value=text, untrusted=is_untrusted(path)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule base classes
+# ---------------------------------------------------------------------------
 
 
 class ThreatRule(ABC):
-    """Base class for threat detection rules."""
+    """A detector. ``scan`` returns at most one ThreatMatch per rule."""
 
     name: str
     description: str
 
     @abstractmethod
-    def check(self, event: dict) -> list[ThreatMatch]:
-        """Return all matches (not just the first). Empty list = clean."""
+    def scan(self, scan: ScanInput) -> list[ThreatMatch]:
         ...
 
+    def check(self, event: dict) -> list[ThreatMatch]:
+        """Convenience entry point: scan ``event["data"]``."""
+        return self.scan(build_scan_input(event.get("data", {})))
 
-def _extract_all_text(data: dict, max_depth: int = 3) -> str:
-    """Recursively extract all string values from a dict."""
-    if max_depth <= 0:
-        return ""
-    parts = []
-    for value in data.values():
-        if isinstance(value, str):
-            parts.append(value)
-        elif isinstance(value, dict):
-            parts.append(_extract_all_text(value, max_depth - 1))
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    parts.append(_extract_all_text(item, max_depth - 1))
-    return " ".join(parts)
+    def redact(self, text: str) -> str:
+        """Replace whatever this rule matches in ``text``. Default: no-op."""
+        return text
 
 
-class PromptInjectionRule(ThreatRule):
-    """Detects prompt injection patterns in any text content.
-    OWASP mapping: see taxonomy.py."""
+@dataclass
+class Pattern:
+    regex: re.Pattern
+    reason: str
+    level: ThreatLevel
+    untrusted_only: bool = False
+    joined: bool = False  # also run on all fields joined together
+
+
+def P(pattern: str, reason: str, level: ThreatLevel, *, flags: int = re.IGNORECASE,
+      untrusted_only: bool = False, joined: bool = False) -> Pattern:
+    return Pattern(re.compile(pattern, flags), reason, level, untrusted_only, joined)
+
+
+class _Collector:
+    """Merges hits for one rule into a single deduplicated ThreatMatch."""
+
+    def __init__(self, rule_name: str, prefix: str) -> None:
+        self.rule_name = rule_name
+        self.prefix = prefix
+        self.reasons: list[str] = []
+        self.evidence: list[str] = []
+        self.level: ThreatLevel | None = None
+        self.first_pattern: str | None = None
+
+    def add(self, reason: str, level: ThreatLevel, path: str, pattern: str | None = None) -> None:
+        full = f"{self.prefix}{reason}"
+        if full not in self.reasons:
+            self.reasons.append(full)
+        ev = path or "$"
+        if ev not in self.evidence:
+            self.evidence.append(ev)
+        if self.level is None or SEVERITY_ORDER.index(level.value) > SEVERITY_ORDER.index(self.level.value):
+            self.level = level
+        if self.first_pattern is None:
+            self.first_pattern = pattern
+
+    def result(self) -> list[ThreatMatch]:
+        if self.level is None:
+            return []
+        # Lead with the most severe reason so the one-line summary is the worst one.
+        return [ThreatMatch(
+            rule_name=self.rule_name,
+            reason=self.reasons[0],
+            threat_level=self.level,
+            matched_pattern=self.first_pattern,
+            reasons=list(self.reasons),
+            evidence=list(self.evidence),
+        )]
+
+
+class RegexRule(ThreatRule):
+    """A detector made of regex patterns, each with its own severity."""
+
+    PATTERNS: list[Pattern] = []
+    reason_prefix = ""
+
+    def scan(self, scan: ScanInput) -> list[ThreatMatch]:
+        col = _Collector(self.name, self.reason_prefix)
+        hit_reasons: set[str] = set()
+        # Severe patterns first so the headline reason is the worst one.
+        ordered = sorted(self.PATTERNS, key=lambda p: -SEVERITY_ORDER.index(p.level.value))
+        for f in scan.fields:
+            for p in ordered:
+                if p.untrusted_only and not f.untrusted:
+                    continue
+                if p.regex.search(f.value):
+                    col.add(p.reason, p.level, f.path, p.regex.pattern)
+                    hit_reasons.add(p.reason)
+        # Strong patterns also run across field boundaries, so splitting an
+        # instruction over two arguments does not hide it.
+        joined_patterns = [p for p in ordered if p.joined and p.reason not in hit_reasons]
+        if joined_patterns and len(scan.fields) > 1:
+            text = " ".join(f.value for f in scan.fields)
+            for p in joined_patterns:
+                if p.regex.search(text):
+                    col.add(p.reason, p.level, JOINED_PATH, p.regex.pattern)
+        return col.result()
+
+    def redact(self, text: str) -> str:
+        for p in self.PATTERNS:
+            text = p.regex.sub(f"[REDACTED:{self.name}]", text)
+        return text
+
+
+# ---------------------------------------------------------------------------
+# Detectors
+# ---------------------------------------------------------------------------
+
+C, H, M, L = ThreatLevel.CRITICAL, ThreatLevel.HIGH, ThreatLevel.MEDIUM, ThreatLevel.LOW
+
+
+class PromptInjectionRule(RegexRule):
+    """Instruction overrides, role hijacking, jailbreak phrasing.
+
+    Phrases that are only suspicious in content the agent did not write (for
+    example "you are now ...", which is also ordinary English) fire only on
+    untrusted paths, and at MEDIUM. Unambiguous overrides fire everywhere.
+    """
 
     name = "prompt_injection"
     description = "Prompt injection attempt detected"
+    reason_prefix = "Prompt injection: "
 
     PATTERNS = [
-        (r"ignore\s+(all\s+)?previous\s+instructions", "instruction override"),
-        (r"ignore\s+(all\s+)?above", "instruction override"),
-        (r"disregard\s+(all\s+)?prior", "instruction override"),
-        (r"you\s+are\s+now\s+", "role hijacking"),
-        (r"new\s+instructions?:", "instruction injection"),
-        (r"system\s*:\s*you", "system prompt injection"),
-        (r"<\s*system\s*>", "XML tag injection"),
-        (r"\]\s*\[\s*system", "bracket injection"),
-        (r"ADMIN\s*MODE", "privilege escalation via prompt"),
-        (r"jailbreak", "explicit jailbreak"),
-        (r"do\s+anything\s+now", "DAN pattern"),
-        (r"pretend\s+you\s+(are|have)\s+no\s+(restrictions|rules)", "guardrail bypass"),
-        (r"act\s+as\s+(?:an?\s+)?(?:unrestricted|uncensored)", "guardrail bypass"),
-        (r"developer\s+mode", "developer mode exploit"),
+        P(r"\bignore\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+|my\s+)?(?:previous|prior|preceding|earlier)\s+(?:instructions|directions|prompts?|rules|messages)",
+          "instruction override", C, joined=True),
+        P(r"\bignore\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?above\b", "instruction override", C, joined=True),
+        P(r"\bdisregard\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier)\b", "instruction override", C, joined=True),
+        P(r"\bforget\s+(?:all\s+)?(?:of\s+)?(?:your|the|previous)\s+(?:previous\s+|prior\s+)?instructions\b", "instruction override", C, joined=True),
+        P(r"\byou\s+are\s+now\s+(?:in\s+)?(?:DAN\b|an?\s+unrestricted|unrestricted|uncensored|jailbroken|developer\s+mode|no\s+longer\s+bound)",
+          "role hijacking", C, joined=True),
+        P(r"\bnew\s+instructions?\s*:", "instruction injection", H, joined=True),
+        P(r"(?:^|\n)\s*system\s*:\s*you\b", "system prompt injection", C),
+        P(r"<\s*/?\s*system\s*>", "XML tag injection", H),
+        P(r"\]\s*\[\s*system\b", "bracket injection", H),
+        P(r"\bADMIN\s+MODE\b", "privilege escalation via prompt", H, flags=0),
+        P(r"\bjailbreak(?:ed|ing)?\b", "explicit jailbreak", H),
+        P(r"\bdo\s+anything\s+now\b", "DAN pattern", C, joined=True),
+        P(r"\bpretend\s+(?:that\s+)?you\s+(?:are|have)\s+(?:no|without)\s+(?:restrictions|rules|limits|guidelines)",
+          "guardrail bypass", C, joined=True),
+        P(r"\bact\s+as\s+(?:an?\s+)?(?:unrestricted|uncensored|unfiltered)", "guardrail bypass", C, joined=True),
+        P(r"\b(?:enable|enter|activate|switch\s+to)\s+developer\s+mode\b", "developer mode exploit", C, joined=True),
+        P(r"\b(?:reveal|print|show|repeat|output|leak)\s+(?:me\s+)?(?:your|the)\s+(?:system\s+prompt|hidden\s+instructions|initial\s+instructions)",
+          "system prompt extraction", H, joined=True),
+        # Weak signals: only in content the agent fetched or was handed.
+        P(r"\byou\s+are\s+now\b", "role reassignment in untrusted content", M, untrusted_only=True),
+        P(r"\bdeveloper\s+mode\b", "developer mode mention in untrusted content", M, untrusted_only=True),
+        P(r"\b(?:assistant|AI|agent)\s*,?\s+(?:you\s+)?must\s+(?:now\s+)?(?:send|email|forward|post|upload|call)\b",
+          "imperative aimed at the agent in untrusted content", M, untrusted_only=True),
     ]
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Prompt injection: {desc}",
-                    threat_level=ThreatLevel.CRITICAL,
-                    matched_pattern=pattern,
-                ))
-        return matches
 
-
-class SensitiveDataLeakRule(ThreatRule):
-    """Detects API keys, secrets, or credentials in any event content.
-    OWASP mapping: see taxonomy.py."""
+class SensitiveDataLeakRule(RegexRule):
+    """API keys, tokens, private keys and credential assignments."""
 
     name = "sensitive_data_leak"
     description = "Sensitive data exposed in agent output"
+    reason_prefix = "Sensitive data leak: "
 
     PATTERNS = [
-        (r"sk-[a-zA-Z0-9]{20,}", "OpenAI API key (sk-*)"),
-        (r"(?:api[_-]?key|apikey)\s*[=:]\s*['\"]?[a-zA-Z0-9]{16,}", "API key assignment"),
-        (r"(?:password|passwd|pwd)\s*[=:]\s*['\"]?[^\s'\"]{6,}", "password in output"),
-        (r"(?:secret|token)\s*[=:]\s*['\"]?[a-zA-Z0-9]{16,}", "secret/token assignment"),
-        (r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----", "private key"),
-        (r"AKIA[0-9A-Z]{16}", "AWS access key"),
-        (r"ghp_[a-zA-Z0-9]{36}", "GitHub personal token"),
-        (r"gho_[a-zA-Z0-9]{36}", "GitHub OAuth token"),
-        (r"dop_v1_[a-zA-Z0-9]{64}", "DigitalOcean token"),
-        (r"xox[bpas]-[a-zA-Z0-9\-]{10,}", "Slack token"),
-        (r"eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.", "JWT token"),
-        (r"[a-f0-9]{32,64}", None),  # checked separately for context
+        P(r"\bsk-(?:proj-|ant-(?:api\d+-)?)?[A-Za-z0-9_\-]{20,}", "API key (sk-*)", H, flags=0),
+        P(r"(?:api[_-]?key|apikey)[\"']?\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{16,}", "API key assignment", H),
+        P(r"(?:password|passwd|pwd)[\"']?\s*[=:]\s*['\"]?[^\s'\"*<>{}]{6,}", "password in output", H),
+        P(r"(?:secret|token)[\"']?\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{16,}", "secret/token assignment", H),
+        P(r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+)?PRIVATE\s+KEY-----", "private key", H),
+        P(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "AWS access key", H, flags=0),
+        P(r"\bghp_[A-Za-z0-9]{36}\b", "GitHub personal token", H, flags=0),
+        P(r"\bgho_[A-Za-z0-9]{36}\b", "GitHub OAuth token", H, flags=0),
+        P(r"\bgithub_pat_[A-Za-z0-9_]{60,}\b", "GitHub fine-grained token", H, flags=0),
+        P(r"\bdop_v1_[a-f0-9]{64}\b", "DigitalOcean token", H, flags=0),
+        P(r"\bxox[bpas]-[A-Za-z0-9\-]{10,}", "Slack token", H, flags=0),
+        P(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "JWT token", H, flags=0),
     ]
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if desc is None:
-                continue  # skip generic hex for now, too many false positives
-            if re.search(pattern, text):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Sensitive data leak: {desc}",
-                    threat_level=ThreatLevel.HIGH,
-                    matched_pattern=pattern,
-                ))
-        return matches
+
+EXFIL_DOMAINS = {
+    "webhook.site": "webhook.site exfil endpoint",
+    "requestbin.com": "requestbin exfil endpoint",
+    "requestbin.net": "requestbin exfil endpoint",
+    "requestcatcher.com": "requestcatcher exfil endpoint",
+    "ngrok.io": "ngrok tunnel",
+    "ngrok.app": "ngrok tunnel",
+    "ngrok-free.app": "ngrok tunnel",
+    "ngrok.dev": "ngrok tunnel",
+    "burpcollaborator.net": "Burp Collaborator",
+    "oastify.com": "Burp Collaborator",
+    "interact.sh": "interactsh callback",
+    "oast.fun": "interactsh callback",
+    "oast.pro": "interactsh callback",
+    "oast.live": "interactsh callback",
+    "oast.site": "interactsh callback",
+    "oast.online": "interactsh callback",
+    "oast.me": "interactsh callback",
+    "pipedream.net": "pipedream webhook",
+    "hookbin.com": "hookbin exfil endpoint",
+    "beeceptor.com": "beeceptor endpoint",
+    "pastebin.com": "paste site",
+    "transfer.sh": "file drop",
+}
+
+URL_IN_TEXT = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{1,15})://[^\s\"'<>`]+")
+_BARE_EXFIL = re.compile(
+    r"(?i)(?<![\w.-])((?:[a-z0-9-]+\.)*(?:" + "|".join(re.escape(d) for d in EXFIL_DOMAINS) + r"))(?![\w-])"
+)
+URL_KEYS = {
+    "url", "uri", "href", "link", "endpoint", "host", "hostname", "target", "address",
+    "src", "callback", "callback_url", "webhook", "webhook_url", "base_url", "server",
+    "remote", "redirect", "redirect_uri", "redirect_url", "image", "image_url",
+}
+DANGEROUS_SCHEMES = {"file": "file:// URL", "gopher": "gopher:// URL", "dict": "dict:// URL",
+                     "ldap": "ldap:// URL", "jar": "jar: URL", "netdoc": "netdoc: URL"}
+
+
+@dataclass
+class FoundURL:
+    raw: str
+    scheme: str
+    host: str | None
+
+
+def _split_url(raw: str) -> FoundURL | None:
+    raw = raw.rstrip(".,;:!?)]}'\"")
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+    except ValueError:
+        # Bad port or bracket: take the text between // and the next / ? #
+        m = re.match(r"(?i)([a-z][a-z0-9+.\-]*)://(?:[^@/?#]*@)?(\[[^\]]*\]|[^/:?#]*)", raw)
+        if not m:
+            return None
+        return FoundURL(raw, m.group(1).lower(), m.group(2).strip("[]").lower() or None)
+    return FoundURL(raw, parts.scheme.lower(), (host or "").rstrip(".") or None)
+
+
+def iter_urls(f: ScanField) -> Iterator[FoundURL]:
+    """URLs in a field: scheme URLs anywhere, plus a bare host under a URL-like key."""
+    seen = False
+    for m in URL_IN_TEXT.finditer(f.value):
+        u = _split_url(m.group(0))
+        if u:
+            seen = True
+            yield u
+    if not seen and f.key in URL_KEYS:
+        value = f.value.strip()
+        if value and " " not in value and len(value) < 2048:
+            u = _split_url("http://" + value.lstrip("/"))
+            if u:
+                yield u
+
+
+def exfil_domain(host: str | None) -> str | None:
+    if not host:
+        return None
+    host = host.lower().rstrip(".")
+    for domain, reason in EXFIL_DOMAINS.items():
+        if host == domain or host.endswith("." + domain):
+            return reason
+    return None
 
 
 class DataExfiltrationRule(ThreatRule):
-    """Detects attempts to send data to suspicious external endpoints.
-    OWASP mapping: see taxonomy.py."""
+    """Known exfiltration and callback hosts, raw-IP URLs, data uploads."""
 
     name = "data_exfiltration"
     description = "Data exfiltration attempt via external endpoint"
 
-    PATTERNS = [
-        (r"webhook\.site", "webhook.site exfil endpoint"),
-        (r"requestbin", "requestbin exfil endpoint"),
-        (r"ngrok\.io", "ngrok tunnel"),
-        (r"burpcollaborator", "Burp Collaborator"),
-        (r"interact\.sh", "interactsh callback"),
-        (r"pipedream", "pipedream webhook"),
-        (r"hookbin", "hookbin exfil endpoint"),
-        (r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "raw IP address URL"),
-        (r"curl\s+.*https?://", "curl to external URL"),
-        (r"wget\s+", "wget download"),
-        (r"fetch\(\s*['\"]https?://", "fetch() to external URL"),
+    UPLOAD_PATTERNS = [
+        P(r"\bcurl\b[^\n|;]*?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)(?=[\s=@'\"]|$)",
+          "curl uploading data", H),
+        P(r"\bwget\b[^\n|;]*?--post-(?:data|file)\b", "wget posting data", H),
+        P(r"!\[[^\]]*\]\(\s*https?://[^)\s]*\?[^)\s]*=[^)\s]*\)", "markdown image with query string (zero-click exfil channel)", H),
+        P(r"<img\b[^>]*\bsrc\s*=\s*['\"]?https?://[^'\" >]*\?[^'\" >]*=", "HTML image with query string (zero-click exfil channel)", H),
     ]
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Data exfiltration risk: {desc}",
-                    threat_level=ThreatLevel.CRITICAL,
-                    matched_pattern=pattern,
-                ))
-        return matches
+    def scan(self, scan: ScanInput) -> list[ThreatMatch]:
+        col = _Collector(self.name, "Data exfiltration risk: ")
+        for f in scan.fields:
+            hosts_here: set[str] = set()
+            for u in iter_urls(f):
+                reason = exfil_domain(u.host)
+                if reason:
+                    col.add(reason, C, f.path, u.host)
+                    hosts_here.add((u.host or "").lower())
+                elif u.host and u.scheme in ("http", "https"):
+                    if parse_ip_literal(u.host) is not None and classify_host_literal(u.host) is None:
+                        col.add("raw IP address URL", H, f.path, u.host)
+            for m in _BARE_EXFIL.finditer(f.value):
+                if m.group(1).lower() not in hosts_here:
+                    col.add(exfil_domain(m.group(1)) or "exfil endpoint", C, f.path, m.group(1))
+            for p in self.UPLOAD_PATTERNS:
+                if p.regex.search(f.value):
+                    col.add(p.reason, p.level, f.path, p.regex.pattern)
+        return col.result()
 
 
 class SSRFRule(ThreatRule):
-    """Detects Server-Side Request Forgery patterns.
-    OWASP mapping: see taxonomy.py."""
+    """URLs that point at loopback, private, link-local or metadata addresses.
+
+    URLs are parsed (``urllib.parse``) and hosts classified with ``ipaddress``,
+    so ``[::1]``, ``2130706433``, ``0x7f000001``, ``127.1`` and
+    ``user@127.0.0.1`` are recognised. Hostnames are not resolved: DNS answers
+    belong to the component that actually connects, which must pin the address
+    it checked (see backend/netguard.py).
+    """
 
     name = "ssrf"
     description = "Server-Side Request Forgery attempt"
 
-    PATTERNS = [
-        (r"https?://localhost[:/]", "localhost access"),
-        (r"https?://127\.0\.0\.1[:/]", "loopback access"),
-        (r"https?://0\.0\.0\.0[:/]", "wildcard bind access"),
-        (r"https?://10\.\d{1,3}\.\d{1,3}\.\d{1,3}", "private network (10.x)"),
-        (r"https?://172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}", "private network (172.16-31.x)"),
-        (r"https?://192\.168\.\d{1,3}\.\d{1,3}", "private network (192.168.x)"),
-        (r"https?://169\.254\.\d{1,3}\.\d{1,3}", "cloud metadata endpoint (169.254.x)"),
-        (r"https?://metadata\.google", "GCP metadata"),
-    ]
-
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"SSRF attempt: {desc}",
-                    threat_level=ThreatLevel.HIGH,
-                    matched_pattern=pattern,
-                ))
-        return matches
+    def scan(self, scan: ScanInput) -> list[ThreatMatch]:
+        col = _Collector(self.name, "SSRF attempt: ")
+        for f in scan.fields:
+            for u in iter_urls(f):
+                if u.scheme in DANGEROUS_SCHEMES:
+                    col.add(DANGEROUS_SCHEMES[u.scheme], H, f.path, u.raw[:200])
+                    continue
+                if not u.host:
+                    continue
+                reason = classify_host_literal(u.host)
+                if reason:
+                    col.add(f"{reason} ({u.host})", H, f.path, u.raw[:200])
+        return col.result()
 
 
-class DangerousCodeRule(ThreatRule):
-    """Detects dangerous commands, code execution, and system access.
-    OWASP mapping: see taxonomy.py."""
+class DangerousCodeRule(RegexRule):
+    """Destructive commands, reverse shells, dynamic code execution."""
 
     name = "dangerous_code"
     description = "Dangerous command or code execution pattern"
+    reason_prefix = "Dangerous operation: "
 
     PATTERNS = [
-        (r"\brm\s+(-rf|-fr|--recursive)", "destructive file deletion"),
-        (r"/dev/tcp/", "reverse shell via /dev/tcp"),
-        (r"\bmkfifo\b", "named pipe (reverse shell)"),
-        (r"\bchmod\s+777", "world-writable permissions"),
-        (r"\bsudo\b", "privilege escalation"),
-        (r"\|\s*bash\b|\|\s*sh\b|\|\s*zsh\b", "piping to shell"),
-        (r"os\.system\(", "Python os.system()"),
-        (r"subprocess\.(run|call|Popen)\(", "Python subprocess"),
-        (r"\beval\(", "eval() execution"),
-        (r"\bexec\(", "exec() execution"),
-        (r"__import__\(", "dynamic import"),
-        (r"/etc/passwd|/etc/shadow", "system file access"),
-        (r"\.env\b", "environment file access"),
-        (r"\.\./\.\./", "path traversal"),
-        (r"base64\s+(-d|--decode)", "base64 decode (obfuscation)"),
+        P(r"\brm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*|--recursive|-r\s+-f|-f\s+-r)\b",
+          "destructive file deletion", H),
+        P(r"/dev/(?:tcp|udp)/", "reverse shell via /dev/tcp", C),
+        P(r"\bmkfifo\b", "named pipe (reverse shell)", H),
+        P(r"\bnc\b[^\n]*\s-[a-z]*e\s", "netcat with -e (reverse shell)", C),
+        P(r"\bchmod\s+(?:-R\s+)?777\b", "world-writable permissions", H),
+        P(r"\bsudo\s+(?:-\S+\s+)*(?:rm|chmod|chown|dd|mkfs\S*|bash|sh|zsh|su|passwd|user(?:add|mod|del)|visudo|tee|cat\s+/etc/shadow)\b",
+          "privilege escalation", H),
+        P(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", "download piped to shell", C),
+        P(r"\|\s*(?:sudo\s+)?(?:bash|sh|zsh)\b", "piping to shell", H),
+        P(r"\bos\.system\(", "Python os.system()", H),
+        P(r"\bsubprocess\.(?:run|call|Popen|check_output)\(", "Python subprocess", H),
+        P(r"(?<![\w.])eval\(", "eval() execution", H),
+        P(r"(?<![\w.])exec\(", "exec() execution", H),
+        P(r"__import__\(", "dynamic import", H),
+        P(r"/etc/(?:passwd|shadow|sudoers)\b", "system file access", H),
+        # ".env" as a file (cat .env, ./app/.env), not process.env or os.environ.
+        P(r"(?<![\w$])(?:\.?/?[\w\-./]*/)?\.env(?:\.[a-z]+)?(?![\w.(])", "environment file access", H),
+        P(r"(?:\.\./){2,}|(?:\.\.\\){2,}", "path traversal", H),
+        P(r"\bbase64\s+(?:-d|--decode)\b", "base64 decode (obfuscation)", H),
     ]
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Dangerous operation: {desc}",
-                    threat_level=ThreatLevel.HIGH,
-                    matched_pattern=pattern,
-                ))
-        return matches
 
+class InjectionRule(RegexRule):
+    """SQL injection, XSS and shell command injection payloads.
 
-class InjectionRule(ThreatRule):
-    """Detects SQL injection, XSS, and command injection patterns in outputs.
-    OWASP mapping: see taxonomy.py."""
+    Plain ``UPDATE ... SET``, ``INSERT INTO`` and ``DELETE FROM`` are ordinary
+    SQL, so only injection shapes (quote breakouts, tautologies, stacked
+    statements) are flagged.
+    """
 
     name = "injection"
     description = "Injection pattern detected in agent output"
+    reason_prefix = "Injection pattern: "
 
     PATTERNS = [
-        # SQL injection
-        (r"(?:UNION\s+SELECT|DROP\s+TABLE|DELETE\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET)\b", "SQL injection"),
-        (r"(?:OR|AND)\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+", "SQL injection (tautology)"),
-        (r";\s*(?:DROP|DELETE|ALTER|TRUNCATE)\s", "SQL injection (chained)"),
-        # XSS
-        (r"<script[^>]*>", "XSS (script tag)"),
-        (r"javascript\s*:", "XSS (javascript: URI)"),
-        (r"on(?:load|error|click|mouseover)\s*=", "XSS (event handler)"),
-        # Command injection
-        (r";\s*(?:cat|ls|whoami|id|uname)\b", "command injection"),
-        (r"\$\(.*\)", "command substitution"),
-        (r"`[^`]*`", None),  # skip backtick detection, too many false positives in code
+        P(r"\bUNION\s+(?:ALL\s+)?SELECT\b", "SQL injection (UNION SELECT)", H),
+        P(r"['\"]\s*;\s*(?:DROP|DELETE|ALTER|TRUNCATE|UPDATE|INSERT)\s", "SQL injection (chained)", H),
+        P(r";\s*(?:DROP\s+TABLE|TRUNCATE\s+TABLE|DROP\s+DATABASE)\b", "SQL injection (chained)", H),
+        P(r"['\"]\s*(?:OR|AND)\s+['\"]?(\w+)['\"]?\s*=\s*['\"]?\1\b", "SQL injection (tautology)", H),
+        P(r"\b(?:OR|AND)\s+1\s*=\s*1\b", "SQL injection (tautology)", H),
+        P(r"['\"]\s*(?:--\s|--$|/\*)", "SQL injection (comment terminator)", M),
+        P(r"<\s*script\b[^>]*>", "XSS (script tag)", H),
+        P(r"\bjavascript\s*:", "XSS (javascript: URI)", H),
+        P(r"<[^>]+\bon(?:load|error|click|mouseover|focus)\s*=", "XSS (event handler)", H),
+        P(r";\s*(?:cat|ls|whoami|id|uname|nc|curl|wget)\b", "command injection", H),
+        P(r"\$\(\s*(?:curl|wget|cat|whoami|id|uname|nc|bash|sh|base64|env|printenv)\b", "command substitution", H),
+        P(r"`\s*(?:curl|wget|cat|whoami|id|uname|nc|bash|sh)\b[^`]*`", "command substitution (backticks)", H),
     ]
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if desc is None:
-                continue
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Injection pattern: {desc}",
-                    threat_level=ThreatLevel.HIGH,
-                    matched_pattern=pattern,
-                ))
-        return matches
 
-
-class UnauthorizedScopeRule(ThreatRule):
-    """Detects when an agent drifts outside expected scope.
-    OWASP mapping: see taxonomy.py."""
+class UnauthorizedScopeRule(RegexRule):
+    """Infrastructure mutations an agent should not trigger on its own."""
 
     name = "excessive_agency"
     description = "Agent action exceeds expected scope"
+    reason_prefix = "Scope violation: "
 
     PATTERNS = [
-        (r"(?:execute|deploy|provision|create)\s+(?:the\s+)?(?:server|droplet|instance|cluster)", "real deployment attempt"),
-        (r"(?:ssh|scp)\s+\w+@", "remote server access"),
-        (r"doctl\s+", "DigitalOcean CLI execution"),
-        (r"terraform\s+(?:apply|destroy)", "infrastructure mutation"),
-        (r"kubectl\s+(?:apply|delete|exec)", "Kubernetes mutation"),
-        (r"docker\s+(?:run|exec|push)", "container execution"),
-        (r"aws\s+(?:s3|ec2|iam|lambda)\s+", "AWS CLI execution"),
-        (r"gcloud\s+", "GCP CLI execution"),
+        P(r"\b(?:execute|deploy|provision|create)\s+(?:the\s+|a\s+|new\s+)?(?:server|droplet|instance|cluster)s?\b", "real deployment attempt", M),
+        P(r"\b(?:ssh|scp)\s+(?:-\S+\s+)*[\w.\-]+@", "remote server access", M),
+        P(r"\bdoctl\s+\w+", "DigitalOcean CLI execution", M),
+        P(r"\bterraform\s+(?:apply|destroy)\b", "infrastructure mutation", M),
+        P(r"\bkubectl\s+(?:apply|delete|exec|scale|patch)\b", "Kubernetes mutation", M),
+        P(r"\bdocker\s+(?:run|exec|push)\b", "container execution", M),
+        P(r"\baws\s+(?:s3|ec2|iam|lambda)\s+\w+", "AWS CLI execution", M),
+        P(r"\bgcloud\s+\w+\s+\w+", "GCP CLI execution", M),
     ]
-
-    def check(self, event: dict) -> list[ThreatMatch]:
-        text = _extract_all_text(event.get("data", {}))
-        if not text:
-            return []
-        matches = []
-        for pattern, desc in self.PATTERNS:
-            if re.search(pattern, text, re.IGNORECASE):
-                matches.append(ThreatMatch(
-                    rule_name=self.name,
-                    reason=f"Scope violation: {desc}",
-                    threat_level=ThreatLevel.MEDIUM,
-                    matched_pattern=pattern,
-                ))
-        return matches
 
 
 class EvaluationManipulationRule(ThreatRule):
-    """Detects anomalous evaluation scores.
-    OWASP mapping: see taxonomy.py."""
+    """A very low top-level ``score``. An anomaly signal, not an OWASP category."""
 
     name = "eval_manipulation"
     description = "Anomalous evaluation score detected"
 
-    def check(self, event: dict) -> list[ThreatMatch]:
-        data = event.get("data", {})
-        score = data.get("score")
-
-        if not isinstance(score, (int, float)):
+    def scan(self, scan: ScanInput) -> list[ThreatMatch]:
+        score = scan.numbers.get("score")
+        if score is None or score > 2:
             return []
-
-        if score <= 2:
-            return [ThreatMatch(
-                rule_name=self.name,
-                reason=f"Critically low score ({score}/10), possible adversarial input",
-                threat_level=ThreatLevel.MEDIUM,
-                matched_pattern=f"score={score}",
-            )]
-
-        return []
+        shown = int(score) if score == int(score) else score
+        return [ThreatMatch(
+            rule_name=self.name,
+            reason=f"Critically low score ({shown}/10), possible adversarial input",
+            threat_level=ThreatLevel.LOW,
+            matched_pattern=f"score={shown}",
+            evidence=["score"],
+        )]
 
 
 # All rules in evaluation order (highest severity first)
@@ -348,3 +571,82 @@ ALL_RULES: list[ThreatRule] = [
     UnauthorizedScopeRule(),
     EvaluationManipulationRule(),
 ]
+
+SCAN_LIMIT_RULE = "scan_limit_exceeded"
+RULE_NAMES = [r.name for r in ALL_RULES] + [SCAN_LIMIT_RULE]
+
+
+def detect(
+    data: Any,
+    *,
+    untrusted_paths: Iterable[str] = (),
+    all_untrusted: bool = False,
+    rules: list[ThreatRule] | None = None,
+    max_nodes: int = MAX_NODES,
+    max_total_chars: int = MAX_TOTAL_CHARS,
+) -> list[ThreatMatch]:
+    """Run every detector over ``data``. One match per rule that fired."""
+    scan = build_scan_input(
+        data, untrusted_paths=untrusted_paths, all_untrusted=all_untrusted,
+        max_nodes=max_nodes, max_total_chars=max_total_chars,
+    )
+    matches: list[ThreatMatch] = []
+    for rule in rules or ALL_RULES:
+        matches.extend(rule.scan(scan))
+    if scan.limit_exceeded:
+        matches.append(ThreatMatch(
+            rule_name=SCAN_LIMIT_RULE,
+            reason=f"Payload too large to inspect fully: {scan.limit_exceeded}",
+            threat_level=ThreatLevel.HIGH,
+            evidence=["$"],
+        ))
+    return matches
+
+
+def redact(data: Any, rule_names: Iterable[str], *, rules: list[ThreatRule] | None = None) -> Any:
+    """Copy of ``data`` with the text matched by the named rules replaced.
+
+    Regex rules replace what their patterns match; for ``ssrf`` and
+    ``data_exfiltration`` the offending URLs are replaced.
+    """
+    wanted = set(rule_names)
+    active = [r for r in (rules or ALL_RULES) if r.name in wanted]
+    url_rules = wanted & {"ssrf", "data_exfiltration"}
+
+    def url_repl(m: re.Match) -> str:
+        u = _split_url(m.group(0))
+        if not u:
+            return m.group(0)
+        bad = ("ssrf" in url_rules and (u.scheme in DANGEROUS_SCHEMES or bool(u.host and classify_host_literal(u.host)))) \
+            or ("data_exfiltration" in url_rules and bool(exfil_domain(u.host)))
+        return "[REDACTED:url]" if bad else m.group(0)
+
+    def fix(text: str) -> str:
+        for r in active:
+            text = r.redact(text)
+        if url_rules:
+            text = URL_IN_TEXT.sub(url_repl, text)
+            if "data_exfiltration" in url_rules:
+                text = _BARE_EXFIL.sub("[REDACTED:url]", text)
+        return text
+
+    root: list[Any] = [None]
+    stack: list[tuple[Any, Any, Any]] = [(data, root, 0)]
+    while stack:
+        src, parent, key = stack.pop()
+        if isinstance(src, str):
+            parent[key] = fix(src)
+        elif isinstance(src, dict):
+            new: dict = {}
+            parent[key] = new
+            for k, v in src.items():
+                new[k] = None
+                stack.append((v, new, k))
+        elif isinstance(src, (list, tuple)):
+            new_list: list = [None] * len(src)
+            parent[key] = new_list
+            for i, v in enumerate(src):
+                stack.append((v, new_list, i))
+        else:
+            parent[key] = src
+    return root[0]

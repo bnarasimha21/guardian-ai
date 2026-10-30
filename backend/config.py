@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     # addresses. Off by default because the hosted demo must never fetch
     # internal URLs on behalf of a browser; turn it on for local development.
     allow_private_targets: bool = False
+    # Policy file for tool-call decisions (relative paths resolve from the repo
+    # root). Reloaded on change.
+    guardian_policy_file: str = ""
+    # "name=key,name2=key2". When set, /api/check needs "Authorization: Bearer
+    # <key>" and the caller's session and agent identity come from the key.
+    guardian_api_keys: str = ""
+    # Same format. Keys allowed to approve or deny pending calls. Required for
+    # approvals whenever GUARDIAN_API_KEYS is set.
+    guardian_approver_keys: str = ""
 
     @field_validator("block_threshold", mode="before")
     @classmethod

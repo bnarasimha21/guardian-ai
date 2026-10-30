@@ -2,31 +2,76 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from backend import auth, netguard
 from backend.config import settings
 from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, StatusEvent
-from backend.guardian.middleware import Guardian, is_blocking
+from backend.guardian.middleware import Guardian
+from backend.guardian.schema import CheckRequest, RequestError, ToolCall, to_tool_call
 from backend.guardian.taxonomy import taxonomy_payload
-from backend import netguard
+from backend.policy import engine as policy_engine
+from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
 from backend.targets import session_store
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
+from backend.tap.extract import extract_tool_calls, has_content, synthetic_event_call
 from backend.usage_logger import log_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Fail at startup, not on the first request, if the policy file or the key
+    # configuration is broken.
+    _policy_store()
+    _api_keys()
+    _approver_keys()
+    yield
+
+
+app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan)
 
 # Outbound hooks. Tests replace these to run offline: the resolver maps hostnames
 # to addresses, and the transport answers the verify health check.
 app.state.resolver = netguard.system_resolve
 app.state.verify_transport = None
+app.state.policy_store = None
+
+
+def _policy_store() -> PolicyStore:
+    """The policy store for the configured file (recreated if the setting changes)."""
+    store = getattr(app.state, "policy_store", None)
+    wanted = resolve_policy_path(settings.guardian_policy_file)
+    if store is None or store.path != wanted:
+        store = PolicyStore(wanted)
+        app.state.policy_store = store
+    return store
+
+
+def _api_keys() -> dict[str, str]:
+    return auth.parse_keys(settings.guardian_api_keys, env_name="GUARDIAN_API_KEYS")
+
+
+def _approver_keys() -> dict[str, str]:
+    return auth.parse_keys(settings.guardian_approver_keys, env_name="GUARDIAN_APPROVER_KEYS")
+
+
+def _client_sid(value: str | None) -> str:
+    """A session id chosen by the client. The app: namespace belongs to API keys."""
+    sid = value or "default"
+    if sid.startswith(auth.APP_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail="Session ids starting with 'app:' are reserved for API-key callers")
+    if len(sid) > 200:
+        raise HTTPException(status_code=400, detail="Session id too long")
+    return sid
 
 # Per-session state: event bus, guardian, observer tasks
 _sessions: dict[str, dict] = {}
@@ -115,27 +160,47 @@ def _make_event_handler(session_id: str):
 
     async def on_agent_event(app_name: str, event: dict):
         event_type = event.get("type", "unknown")
-        data = event.get("data", {})
+        if not isinstance(event_type, str):
+            event_type = "unknown"
+        raw_data = event.get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
         elapsed = event.get("elapsed", 0)
+        if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
+            elapsed = 0
 
         if event_type in SKIP_EVENTS:
             return
 
+        agent = data.get("agent", data.get("name", ""))
+        task_id = data.get("task_id", data.get("id", ""))
         await bus.emit(
             AgentActivityEvent(
                 event_type=event_type,
                 elapsed=elapsed,
-                agent=data.get("agent", data.get("name", "")),
-                task_id=data.get("task_id", data.get("id", "")),
+                agent=agent if isinstance(agent, str) else str(agent),
+                task_id=task_id if isinstance(task_id, str) else str(task_id),
                 summary=_summarize_event(event),
                 data={**data, "_source": app_name},
+                known_type=event_type in ACTIONABLE_EVENTS,
             )
         )
 
-        if event_type in ACTIONABLE_EVENTS:
-            enriched = {**event, "data": {**data, "_source": app_name}}
-            matches = await guardian.evaluate(enriched)
-            for match in matches:
+        # Every event is evaluated, whatever its type. Tool-call shapes become
+        # tool calls; the rest of the event is checked as guardian.event.<type>.
+        calls, remainder = extract_tool_calls(event, app_name=app_name)
+        if not calls or has_content(remainder):
+            calls.append(synthetic_event_call(event, remainder, app_name=app_name))
+        try:
+            loaded = _policy_store().get()
+        except PolicyError as exc:
+            logger.error("No policy available, observed event not evaluated: %s", exc)
+            return
+        for call in calls:
+            decision = policy_engine.evaluate(loaded, call, block_threshold=settings.block_threshold)
+            # The tap cannot stop anything: record what the policy would have done.
+            decision.enforced = False
+            await guardian.record(decision, call, source=app_name, observed=True)
+            for match in decision.matches:
                 asyncio.create_task(log_event(
                     "threat_flagged",
                     session_id=session_id,
@@ -212,13 +277,9 @@ class AddTargetRequest(BaseModel):
     ws_url: str
 
 
-def _get_sid(x_session_id: str | None = Header(None)) -> str:
-    return x_session_id or "default"
-
-
 @app.post("/api/targets")
 async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+    sid = _client_sid(x_session_id)
     if session_store.get(sid, req.name):
         return JSONResponse({"error": f"Target '{req.name}' already exists"}, status_code=409)
     try:
@@ -234,7 +295,7 @@ async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(No
 
 @app.delete("/api/targets/{name}")
 async def remove_target(name: str, x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+    sid = _client_sid(x_session_id)
     _stop_observer(sid, name)
     if session_store.remove(sid, name):
         return {"status": "removed", "name": name}
@@ -243,7 +304,7 @@ async def remove_target(name: str, x_session_id: str | None = Header(None)):
 
 @app.get("/api/targets")
 async def list_targets(x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+    sid = _client_sid(x_session_id)
     targets = [
         {"name": t.name, "ws_url": t.ws_url, "status": t.status}
         for t in session_store.list_all(sid)
@@ -251,61 +312,105 @@ async def list_targets(x_session_id: str | None = Header(None)):
     return {"targets": targets}
 
 
-class CheckRequest(BaseModel):
-    content: str | None = None
-    event: dict | None = None
-    source: str = "api-check"
+def _authenticate(request: Request) -> str | None:
+    """API-key principal for /api/check, or None when keys are not configured."""
+    keys = _api_keys()
+    if not keys:
+        return None
+    name = auth.match_key(auth.bearer_token(request.headers.get("authorization")), keys)
+    if name is None:
+        raise HTTPException(
+            status_code=401, detail="A valid API key is required (Authorization: Bearer <key>)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return name
+
+
+def _top_label(decision) -> tuple[str, str, str, str]:
+    top = decision.top_match
+    if top is not None and decision.deciding_detectors:
+        return top.rule_name, top.owasp_llm, top.threat_level.value, top.reason
+    return "policy", decision.owasp_llm, "high" if decision.effect == "deny" else "medium", decision.reasons[0]
 
 
 @app.post("/api/check")
-async def check_content(req: CheckRequest, x_session_id: str | None = Header(None)):
-    """Enforcing check. Returns 200 {"blocked": false} when clean, or 403 with
-    {"blocked": true, ...} when a rule at or above BLOCK_THRESHOLD matches.
+async def check_content(req: CheckRequest, request: Request, x_session_id: str | None = Header(None)):
+    """Policy decision point for a tool call.
 
-    The passive tap cannot stop traffic, so apps that want blocking call this
-    before acting on content (a tool call, an LLM output, a URL to fetch).
-    Pass either `content` (plain text) or `event` ({"type": ..., "data": {...}}).
+    Send ``{"tool": {"name": ...}, "arguments": {...}, "agent": {...}}``. The
+    detectors run over the arguments, then the policy file decides:
+
+    * allow: 200 ``{"effect": "allow", "blocked": false, ...}``
+    * deny: 403 ``{"effect": "deny", "blocked": true, "rule_id": ..., "reasons": [...]}``
+    * require_approval: 403 with ``effect: require_approval`` (the caller must
+      not run the tool; see the approvals API)
+
+    In monitor mode every call gets 200 and ``enforced: false``, with the
+    effect the policy would have applied. Legacy ``{"content": ...}`` and
+    ``{"event": ...}`` bodies are wrapped as ``guardian.content`` and
+    ``guardian.event.<type>`` tool calls.
     """
-    if req.event is None and req.content is None:
-        return JSONResponse({"error": "Provide 'content' or 'event'"}, status_code=400)
-    if req.event is not None:
-        ev_type = req.event.get("type", "tool_call")
-        ev_data = req.event.get("data")
-        if not isinstance(ev_type, str):
-            return JSONResponse({"error": "event.type must be a string"}, status_code=400)
-        if ev_data is not None and not isinstance(ev_data, dict):
-            return JSONResponse({"error": "event.data must be an object"}, status_code=400)
-    sid = x_session_id or "default"
-    guardian = _get_session(sid)["guardian"]
-    if req.event is not None:
-        event = {"type": ev_type, "data": dict(ev_data or {})}
+    principal = _authenticate(request)
+    if principal is not None:
+        sid = auth.APP_SESSION_PREFIX + principal
     else:
-        event = {"type": "tool_call", "data": {"content": req.content}}
-    event["data"]["_source"] = req.source
-    matches = await guardian.evaluate(event, enforce=True, block_threshold=settings.block_threshold)
-    blocking = [m for m in matches if is_blocking(m, settings.block_threshold)]
+        sid = _client_sid(x_session_id or req.session_id)
+    try:
+        call = to_tool_call(req)
+    except RequestError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    try:
+        loaded = _policy_store().get()
+    except PolicyError as exc:
+        logger.error("Policy unavailable: %s", exc)
+        return JSONResponse({"error": "Policy unavailable; refusing to decide", "blocked": True}, status_code=503)
+
+    decision = policy_engine.evaluate(
+        loaded, call, principal=principal, block_threshold=settings.block_threshold,
+    )
+    source = principal or call.agent_name or req.source
+    guardian = _get_session(sid)["guardian"]
+    await guardian.record(decision, call, source=source)
+
     body = {
-        "blocked": bool(blocking),
+        **decision.to_dict(),
         "threshold": settings.block_threshold,
         "matches": [
-            {**m.to_dict(), "blocking": m in blocking}
-            for m in matches
+            {**m.to_dict(), "blocking": decision.blocked and m.rule_name in decision.deciding_detectors}
+            for m in decision.matches
         ],
     }
-    if blocking:
-        top = blocking[0]
+    if decision.blocked:
+        rule_name, owasp_llm, level, reason = _top_label(decision)
         asyncio.create_task(log_event(
             "threat_blocked",
             session_id=sid,
-            app_name=req.source,
-            rule_name=top.rule_name,
-            owasp_id=top.owasp_llm,
-            threat_level=top.threat_level.value,
-            reason=top.reason,
+            app_name=source,
+            rule_name=rule_name,
+            owasp_id=owasp_llm,
+            threat_level=level,
+            reason=reason,
             total_events_checked=guardian._total_checked,
             total_blocked=guardian._total_blocked,
         ))
-    return JSONResponse(body, status_code=403 if blocking else 200)
+    return JSONResponse(body, status_code=403 if decision.blocked else 200)
+
+
+@app.get("/api/policy")
+async def policy_info():
+    """Which policy is in force: path, hash, mode, rule ids, and any reload error."""
+    store = _policy_store()
+    loaded = store.get()
+    return {
+        "path": loaded.path,
+        "sha256": loaded.sha256,
+        "version": loaded.policy.version,
+        "mode": loaded.policy.mode,
+        "default_effect": loaded.policy.default_effect,
+        "rules": [{"id": r.id, "phase": r.phase, "effect": r.effect, "description": r.description}
+                  for r in loaded.policy.rules],
+        "reload_error": store.last_error,
+    }
 
 
 @app.get("/api/taxonomy")
@@ -412,8 +517,18 @@ async def index():
 async def websocket_events(websocket: WebSocket):
     await websocket.accept()
 
-    # Get session ID from query param
-    sid = websocket.query_params.get("session", "default")
+    # Get session ID from query param. Sessions bound to an API key need that
+    # key (or an approver key) as ?token=.
+    sid = websocket.query_params.get("session", "default")[:200]
+    if sid.startswith(auth.APP_SESSION_PREFIX):
+        token = websocket.query_params.get("token")
+        owner = sid[len(auth.APP_SESSION_PREFIX):]
+        app_key = _api_keys().get(owner)
+        ok = (app_key is not None and token is not None and auth.match_key(token, {owner: app_key}) == owner) \
+            or auth.match_key(token, _approver_keys()) is not None
+        if not ok:
+            await websocket.close(code=1008)
+            return
     session = _get_session(sid)
     bus = session["bus"]
 

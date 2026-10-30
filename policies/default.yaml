@@ -1,0 +1,167 @@
+# GuardianAI policy, format version 1.
+#
+# The server reads this file at startup (path from GUARDIAN_POLICY_FILE,
+# default policies/default.yaml) and reloads it when it changes; no restart.
+# An invalid edit is rejected and the last good version stays in force.
+#
+# Every call to POST /api/check, every call through the MCP gateway and every
+# event seen on the observer tap is a tool call: {tool, arguments, agent}.
+# Rules are checked in order and the FIRST rule whose `match` holds decides.
+#
+# Call-phase effects:   allow | deny | require_approval
+# Result-phase effects: allow | warn | redact | deny   (MCP gateway, on tool output)
+#
+# match keys (all present keys must hold; `match: {}` holds for everything):
+#   tool:      glob or list of globs on the tool name ("shell.*", "*.deploy")
+#   server:    glob(s) on the MCP server / namespace the tool came from
+#   agent:     glob(s) on the caller. With GUARDIAN_API_KEYS set this is the
+#              key's name and cannot be spoofed; without keys it is the
+#              self-reported agent.id / agent.name, so treat it as a label,
+#              not an identity.
+#   arguments: list of predicates, all must hold. Each has a `path` (dotted,
+#              `*` for any key or list item) and one operator:
+#                host_in / host_not_in: [globs]   host of a URL or bare host
+#                host_in_private_ranges / host_not_in_private_ranges: true
+#                  (literal check, no DNS: 127.0.0.1, [::1], 2130706433,
+#                   10/8, 169.254.169.254, localhost, *.internal ...)
+#                path_prefix: "/data" or [list]   after normalising ../
+#                max_length: N                    string length (or JSON length)
+#                regex: "..."                     re.search
+#                equals: value / one_of: [values] / exists: true|false
+#              Optional `quantifier: any|all` (default: all for allow rules,
+#              any otherwise) and `negate: true`. A path with no values fails
+#              the predicate (and so passes it when negated).
+#   detectors: {rules: [names], min_severity: low|medium|high|critical|block_threshold}
+#              holds if a built-in detector fired. Names: prompt_injection,
+#              sensitive_data_leak, data_exfiltration, ssrf, dangerous_code,
+#              injection, excessive_agency, eval_manipulation, scan_limit_exceeded.
+#   not:       a nested match that must NOT hold
+#   any:       a list of nested matches, one of which must hold
+
+version: 1
+
+# enforce: deny and require_approval stop the call (HTTP 403 / 202).
+# monitor: decisions are computed, logged and shown, but every call is let through.
+mode: enforce
+
+# Tool calls that no rule matches. deny = unknown tools are refused.
+default_effect: deny
+# Tool output that no result rule matches.
+default_result_effect: allow
+
+approval:
+  timeout_seconds: 120     # no answer in time = denied (fail closed)
+  grant_ttl_seconds: 0     # 0 = an approval covers exactly one call
+
+# Argument paths that hold content the agent did not write. Detectors apply
+# extra checks there (for example "you are now ..." is ordinary English in a
+# chat reply but an injection signal inside a fetched web page).
+untrusted_inputs:
+  - tool: "*"
+    paths: [page, page_content, html, web_content, fetched_content, document,
+            email_body, search_results, tool_result, retrieved, context]
+  - tool: "guardian.content"     # legacy {"content": ...} checks
+    paths: [content]
+
+rules:
+  # 1. Anything a detector flags at or above BLOCK_THRESHOLD is refused,
+  #    whatever the tool.
+  - id: deny-detector-threats
+    description: A built-in detector found a threat at or above the block threshold
+    match:
+      detectors: {min_severity: block_threshold}
+    effect: deny
+
+  # 2. Shell access only for the ops agent.
+  - id: shell-ops-only
+    description: Shell tools are reserved for the ops agent
+    match:
+      tool: "shell.*"
+      not: {agent: ops}
+    effect: deny
+    owasp_llm: LLM06
+    owasp_agentic: ASI02
+
+  - id: shell-ops
+    description: The ops agent may use shell tools
+    match:
+      tool: "shell.*"
+      agent: ops
+    effect: allow
+
+  # 3. Deployments need a human.
+  - id: approve-deploys
+    description: Deployments need a human approval
+    match:
+      tool: ["*.deploy", "deploy"]
+    effect: require_approval
+    approval:
+      timeout_seconds: 300
+      grant_ttl_seconds: 0
+    owasp_llm: LLM06
+    owasp_agentic: ASI02
+
+  # 4. HTTP fetches: an allowlist goes through, anything else needs approval.
+  - id: fetch-allowlist
+    description: Fetch from an allowlisted public host
+    match:
+      tool: ["http.fetch", "*.http_fetch", "http_fetch"]
+      arguments:
+        - path: url
+          host_in: [api.github.com, "*.githubusercontent.com", docs.python.org, "*.wikipedia.org", example.com]
+        - path: url
+          regex: "^https://"
+    effect: allow
+
+  - id: fetch-needs-approval
+    description: Fetching a host outside the allowlist needs approval
+    match:
+      tool: ["http.fetch", "*.http_fetch", "http_fetch"]
+    effect: require_approval
+    owasp_llm: LLM06
+    owasp_agentic: ASI02
+
+  # 5. Read-only tools.
+  - id: allow-read-only
+    description: Read-only tools
+    match:
+      tool: ["*.read", "*.read_*", "read_*", "*.get", "*.get_*", "get_*", "*.list", "*.list_*", "list_*",
+             "*.search", "*.search_*", "search_*", "*.summarize", "summarize*"]
+    effect: allow
+
+  # 6. Chat output is checked by the detectors in rule 1, then allowed.
+  - id: allow-chat
+    description: Chat replies
+    match:
+      tool: "chat.*"
+    effect: allow
+
+  # 7. Legacy {"content": ...} / {"event": ...} checks and events seen on the
+  #    observer tap. Only the detectors (rule 1) apply to them.
+  - id: allow-legacy-and-observed
+    description: Content checks and observed events are judged by the detectors only
+    match:
+      tool: "guardian.*"
+    effect: allow
+
+  # Result phase (MCP gateway): what a tool returned, before the agent sees it.
+  - id: redact-secrets-in-results
+    phase: result
+    description: Secrets in tool output are redacted before the agent sees them
+    match:
+      detectors: {rules: [sensitive_data_leak], min_severity: high}
+    effect: redact
+
+  - id: deny-injection-in-results
+    phase: result
+    description: Tool output carrying an instruction override is withheld from the agent
+    match:
+      detectors: {rules: [prompt_injection], min_severity: high}
+    effect: deny
+
+  - id: warn-on-suspicious-results
+    phase: result
+    description: Tool output with weaker injection or exfiltration signals is passed on with a warning
+    match:
+      detectors: {min_severity: medium}
+    effect: warn
