@@ -108,8 +108,8 @@ function renderActivityCard(event) {
 
     const card = document.createElement('div');
     const data = event.data || {};
-    const elapsed = `<span class="elapsed-badge">${event.elapsed.toFixed(1)}s</span>`;
-    const taskTag = event.task_id ? `<span class="task-tag">${event.task_id}</span>` : '';
+    const elapsed = `<span class="elapsed-badge">${Number(event.elapsed || 0).toFixed(1)}s</span>`;
+    const taskTag = event.task_id ? `<span class="task-tag">${escapeHtml(String(event.task_id))}</span>` : '';
     const label = formatEventType(event.event_type);
     const category = classifyEvent(event);
 
@@ -146,12 +146,12 @@ function renderActivityCard(event) {
         }
 
         case 'agent': {
-            const agentName = (event.agent || data.agent || data.name || 'agent').toUpperCase();
+            const agentName = String(event.agent || data.agent || data.name || 'agent').toUpperCase();
             card.className = `event-card agent-start-card`;
             card.style.borderLeftColor = agentColor(agentName);
             body = `
                 <div class="agent-start-row">
-                    ${iconSvg('zap')}<span class="agent-name" style="color:${agentColor(agentName)}">${agentName}</span>${source}${taskTag}${elapsed}
+                    ${iconSvg('zap')}<span class="agent-name" style="color:${agentColor(agentName)}">${escapeHtml(agentName)}</span>${source}${taskTag}${elapsed}
                 </div>`;
             break;
         }
@@ -167,7 +167,7 @@ function renderActivityCard(event) {
             body = `
                 <div class="card-header">${iconSvg('bar-chart')}<span class="card-title">${label}</span>${source}${taskTag}${elapsed}</div>
                 <div class="eval-row">
-                    <span class="eval-score ${scoreClass}">${score}${typeof score === 'number' ? '/10' : ''}</span>
+                    <span class="eval-score ${scoreClass}">${escapeHtml(String(score))}${typeof score === 'number' ? '/10' : ''}</span>
                     ${passHtml}
                 </div>
                 ${strengths.length ? `<div class="eval-list eval-strengths">${strengths.map(s => '<span>+ ' + escapeHtml(String(s).substring(0, 80)) + '</span>').join('')}</div>` : ''}
@@ -315,7 +315,7 @@ function getEventBadgeClass(eventType) {
 }
 
 function formatEventType(eventType) {
-    return eventType.replace(/_/g, ' ');
+    return escapeHtml(String(eventType ?? '').replace(/_/g, ' '));
 }
 
 // ---- Render: Guardian Decisions (Right Panel) ----
@@ -324,9 +324,11 @@ function renderDecisionCard(event) {
     hideEmpty('decisionEmpty');
     const list = document.getElementById('decisionList');
 
-    const isBlocked = event.action === 'flagged' || event.action === 'blocked';
+    const isPending = event.action === 'require_approval';
+    const isBlocked = event.action === 'flagged' || event.action === 'blocked' || isPending;
     const card = document.createElement('div');
-    card.className = `event-card decision-card ${isBlocked ? 'flagged' : 'allowed'}`;
+    card.className = `event-card decision-card ${isPending ? 'pending' : (isBlocked ? 'flagged' : 'allowed')}`;
+    if (event.decision_id) card.dataset.decisionId = event.decision_id;
     card.dataset.source = event.details?._source || '';
     card.dataset.action = event.action || '';
     card.dataset.threat = event.threat_level || 'none';
@@ -346,8 +348,22 @@ function renderDecisionCard(event) {
         ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
         : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';
 
-    const iconClass = isBlocked ? 'flagged-icon' : 'allowed-icon';
-    const actionClass = isBlocked ? 'flagged-text' : 'allowed-text';
+    const iconClass = isPending ? 'pending-icon' : (isBlocked ? 'flagged-icon' : 'allowed-icon');
+    const actionClass = isPending ? 'pending-text' : (isBlocked ? 'flagged-text' : 'allowed-text');
+    const actionLabel = isPending ? 'NEEDS APPROVAL' : String(event.action || '').toUpperCase();
+
+    // Where the decision was made: observed on the passive tap (cannot stop
+    // anything), monitor mode (enforcement off) or enforced inline.
+    let modeHtml = '';
+    if (event.observed) {
+        modeHtml = '<span class="mode-badge observed" title="Seen on the observer tap. The tap is a copy of the traffic and cannot stop the call.">OBSERVED</span>';
+    } else if (event.mode === 'monitor') {
+        modeHtml = '<span class="mode-badge observed" title="Policy is in monitor mode: the call was let through.">MONITOR</span>';
+    } else if (event.enforced) {
+        modeHtml = '<span class="mode-badge enforced" title="Decided inline by the policy engine.">ENFORCED</span>';
+    }
+    const effectHtml = event.effect && event.effect !== 'allow'
+        ? `<span class="mode-badge effect">policy: ${escapeHtml(event.effect)}</span>` : '';
 
     // Threat level badge
     let threatHtml = '';
@@ -369,8 +385,15 @@ function renderDecisionCard(event) {
 
     // Rule name
     let ruleHtml = '';
-    if (event.rule_name) {
-        ruleHtml = `<div class="decision-rule">Rule: ${escapeHtml(event.rule_name)}</div>`;
+    if (event.policy_rule_id || event.rule_name) {
+        const parts = [];
+        if (event.policy_rule_id) parts.push(`Policy rule: ${escapeHtml(event.policy_rule_id)}`);
+        if (event.matched_detectors && event.matched_detectors.length) {
+            parts.push(`Detectors: ${escapeHtml(event.matched_detectors.join(', '))}`);
+        } else if (event.rule_name && !event.policy_rule_id) {
+            parts.push(`Rule: ${escapeHtml(event.rule_name)}`);
+        }
+        ruleHtml = `<div class="decision-rule">${parts.join(' &middot; ')}</div>`;
     }
 
     // Reason
@@ -383,7 +406,8 @@ function renderDecisionCard(event) {
     const srcName = event.details?._source || '';
     const srcHtml = srcName ? `<span class="source-badge" style="background:${sourceColor(srcName)}">${escapeHtml(srcName)}</span>` : '';
 
-    const eventLabel = formatEventType(event.event_type);
+    const eventLabel = event.tool_name && !String(event.tool_name).startsWith('guardian.')
+        ? escapeHtml(event.tool_name) : formatEventType(event.event_type);
     const agentLabel = event.agent ? ` (${event.agent})` : '';
 
     // Details (exclude _source from display)
@@ -429,13 +453,13 @@ function renderDecisionCard(event) {
     card.innerHTML = `
         <div class="decision-header ${isBlocked ? 'clickable' : ''}" ${isBlocked ? 'onclick="toggleExpand(this)"' : ''}>
             <div class="decision-icon ${iconClass}">${decisionIcon}</div>
-            <span class="decision-action ${actionClass}">${event.action.toUpperCase()}</span>
+            <span class="decision-action ${actionClass}">${actionLabel}</span>
             ${srcHtml}
             <span class="decision-tool">${eventLabel}${agentLabel}</span>
             ${isBlocked ? '<span class="expand-arrow">&#9662;</span>' : ''}
         </div>
         <div class="decision-badges">
-            ${threatHtml}${owaspHtml}
+            ${threatHtml}${modeHtml}${effectHtml}${owaspHtml}
         </div>
         ${reasonHtml}
         ${ruleHtml}
@@ -842,7 +866,8 @@ function filterDecisions() {
 
 function matchesDecisionFilter(card, filter) {
     if (filter === '__all') return true;
-    if (filter === 'flagged') return card.dataset.action === 'flagged' || card.dataset.action === 'blocked';
+    if (filter === 'flagged') return ['flagged', 'blocked', 'require_approval'].includes(card.dataset.action);
+    if (filter === 'require_approval') return card.dataset.action === 'require_approval';
     if (filter === 'allowed') return card.dataset.action === 'allowed';
     // critical, high, medium
     return card.dataset.threat === filter;
