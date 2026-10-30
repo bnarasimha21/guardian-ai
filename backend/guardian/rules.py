@@ -8,14 +8,16 @@ agent wrote).
 
 Each string is also scanned in normalised form when that differs from the
 original: Unicode NFKC, zero-width and bidi control characters removed,
-common Cyrillic and Greek look-alike letters folded to Latin, and runs of
-base64 decoded (one level) when they decode to readable text. So
-"ign\u200bore previous instructions", fullwidth or homoglyph spellings and a
-base64-wrapped command are seen as what they say. Matches from a variant
+common Cyrillic and Greek look-alike letters folded to Latin, percent-escapes
+decoded ("%20"), and runs of base64 decoded (one level) when they decode to
+readable text. So "ign\u200bore previous instructions", fullwidth or homoglyph
+spellings, "ignore%20previous%20instructions" and a base64-wrapped command are
+seen as what they say. Matches from a variant
 carry the original field's path.
 
 Walking is iterative with no depth cap. A node limit and a character limit
-bound the work; a payload over either limit produces a ``scan_limit_exceeded``
+(on the text as sent; the variants get a separate, larger allowance) bound
+the work; a payload over either limit produces a ``scan_limit_exceeded``
 match instead of being silently half-scanned (fail closed).
 
 OWASP mappings (LLM Top 10 2025 and Agentic Top 10 2026) live in taxonomy.py.
@@ -31,7 +33,7 @@ import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from backend.events.models import SEVERITY_ORDER, ThreatLevel
 from backend.netguard import classify_host_literal, parse_ip_literal
@@ -40,6 +42,8 @@ from .models import ThreatMatch
 
 MAX_NODES = 10_000
 MAX_TOTAL_CHARS = 1_000_000
+# Normalised and decoded variants may add up to this multiple of the limit.
+VARIANT_ALLOWANCE = 3
 JOINED_PATH = "$joined"
 
 
@@ -126,12 +130,22 @@ def decode_base64_runs(text: str) -> list[str]:
     return out
 
 
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
 def text_variants(text: str) -> list[str]:
     """Other spellings of ``text`` worth scanning (empty when there are none)."""
     variants: list[str] = []
     norm = normalise_text(text)
     if norm != text:
         variants.append(norm)
+    if _PERCENT_ESCAPE.search(norm):
+        decoded = unquote(norm)
+        if decoded != norm:
+            variants.append(decoded)
+            again = normalise_text(decoded)
+            if again != decoded:
+                variants.append(again)
     for decoded in decode_base64_runs(norm):
         variants.append(decoded)
         again = normalise_text(decoded)
@@ -180,6 +194,7 @@ def build_scan_input(
     out = ScanInput()
     nodes = 0
     chars = 0
+    variant_chars = 0
 
     def is_untrusted(path: str) -> bool:
         return all_untrusted or (bool(untrusted_paths) and path_matches(path, untrusted_paths))
@@ -213,10 +228,16 @@ def build_scan_input(
             continue
         text = value if isinstance(value, str) else str(value)
         untrusted = is_untrusted(path)
-        texts = [text, *text_variants(text)]
-        chars += sum(len(t) for t in texts)
+        chars += len(text)
         if chars > max_total_chars:
             out.limit_exceeded = f"payload has more than {max_total_chars} characters of text"
+            break
+        texts = [text, *text_variants(text)]
+        # Variants are bounded separately: NFKC can expand a string many times
+        # over, but ordinary normalised text must not halve the real limit.
+        variant_chars += sum(len(t) for t in texts[1:])
+        if variant_chars > VARIANT_ALLOWANCE * max_total_chars:
+            out.limit_exceeded = "payload expands to too much text when normalised or decoded"
             break
         for t in texts:
             out.fields.append(ScanField(path=path, key=key, value=t, untrusted=untrusted))
@@ -679,6 +700,8 @@ ALL_RULES: list[ThreatRule] = [
 
 SCAN_LIMIT_RULE = "scan_limit_exceeded"
 RULE_NAMES = [r.name for r in ALL_RULES] + [SCAN_LIMIT_RULE]
+# Names the gateway and the policy engine give their own matches.
+RESERVED_NAMES = {"policy", "tool_poisoning", "tool_definition_changed"}
 
 # Extra detectors registered at runtime (model-based detectors, see
 # backend/guardian/detectors). They run after the built-in rules.
@@ -688,7 +711,7 @@ _env_loaded = False
 
 def register_rule(rule: ThreatRule) -> None:
     """Add a detector to every default scan. Replaces one with the same name."""
-    if rule.name in RULE_NAMES:
+    if rule.name in RULE_NAMES or rule.name in RESERVED_NAMES:
         raise ValueError(f"'{rule.name}' is a built-in detector name")
     unregister_rule(rule.name)
     _EXTRA_RULES.append(rule)
@@ -702,9 +725,9 @@ def default_rules() -> list[ThreatRule]:
     """Built-in rules plus registered ones (loading GUARDIAN_MODEL_DETECTORS once)."""
     global _env_loaded
     if not _env_loaded:
-        _env_loaded = True
         from backend.guardian.detectors import load_from_env
-        load_from_env()
+        load_from_env()  # raises on a bad entry; the next call tries again
+        _env_loaded = True
     return ALL_RULES + _EXTRA_RULES
 
 

@@ -76,3 +76,32 @@ def test_usage_logging_failure_is_logged_not_raised(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="backend.usage_logger"):
         asyncio.run(usage_logger.log_event("session_started"))
     assert "usage log to Supabase failed: ConnectError" in caplog.text
+
+
+def test_dotenv_feeds_variables_read_outside_settings(tmp_path):
+    """OTEL_*, SUPABASE_* and GUARDIAN_MODEL_DETECTORS set only in .env are seen;
+    a variable already in the environment wins over .env."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    (tmp_path / ".env").write_text(
+        "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318\n"
+        "SUPABASE_URL=https://from-dotenv.example\n"
+        "GUARDIAN_MODEL_DETECTORS=from.dotenv:Thing\n"
+        "GUARDIAN_OTEL_CAPTURE_ARGUMENTS=from-dotenv\n",
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("OTEL_", "SUPABASE_", "GUARDIAN_"))}
+    env.update(PYTHONPATH=str(repo), GUARDIAN_OTEL_CAPTURE_ARGUMENTS="from-env")
+    code = ("import os, backend.usage_logger as u, backend.telemetry as t; "
+            "print(t.exporter_endpoint(), u.SUPABASE_URL, os.environ['GUARDIAN_MODEL_DETECTORS'], "
+            "os.environ['GUARDIAN_OTEL_CAPTURE_ARGUMENTS'])")
+    out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True,
+                         timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["http://127.0.0.1:4318", "https://from-dotenv.example", "from.dotenv:Thing",
+                                  "from-env"]

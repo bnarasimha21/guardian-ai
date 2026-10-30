@@ -1,5 +1,6 @@
 import logging
 
+from dotenv import load_dotenv
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
@@ -47,4 +48,17 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 
+def load_env_file(path: str = ".env") -> None:
+    """Put ``.env`` entries into the process environment, without overriding
+    variables that are already set.
+
+    Settings fields read ``.env`` themselves, but several variables are read
+    from ``os.environ`` directly (OTEL_*, SUPABASE_*, GUARDIAN_MODEL_DETECTORS,
+    GUARDIAN_OTEL_CAPTURE_ARGUMENTS), so without this they would be ignored
+    when set only in ``.env``.
+    """
+    load_dotenv(path, override=False)
+
+
+load_env_file()
 settings = Settings()

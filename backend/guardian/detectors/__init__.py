@@ -64,7 +64,7 @@ class ModelDetector(ABC):
       decides whether that level blocks).
     * ``untrusted_only``: only score fields the policy marks as untrusted
       content (fetched pages, tool results), not the agent's own arguments.
-    * ``fail_closed``: if ``score`` raises, report a match at ``level`` instead
+    * ``fail_closed``: if ``score`` raises or returns NaN, report a match at ``level`` instead
       of logging and skipping. Off by default so an unavailable model does not
       block all traffic; turn it on when the detector is a required control.
     """
@@ -119,13 +119,13 @@ class ModelRule(ThreatRule):
             scored.add((f.path, f.value))
             try:
                 s = float(d.score(f.value))
+                if s != s:
+                    raise ValueError("score is NaN")
             except Exception as exc:  # a broken model must not crash the request
                 if d.fail_closed:
                     return [self._match(f"{d.name} could not score the input ({type(exc).__name__}); "
                                         "failing closed", None, [f.path or "$"])]
                 logger.warning("model detector %s failed on %s: %s", d.name, f.path, exc)
-                continue
-            if s != s:  # NaN counts as a failure to score
                 continue
             if s >= d.threshold:
                 if f.path not in evidence:
