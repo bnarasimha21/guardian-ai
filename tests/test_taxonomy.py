@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from backend.guardian.taxonomy import OWASP_AGENTIC_2026, OWASP_LLM_2025, RULES
 
@@ -71,3 +75,24 @@ def test_no_2023_numbering_in_rules_ui_or_readme():
         text = path.read_text(encoding="utf-8")
         for pattern in STALE:
             assert not pattern.search(text), f"{path}: stale OWASP reference {pattern.pattern}"
+
+
+def test_dashboard_never_interpolates_values_into_inline_handlers():
+    """A target name like x');alert(1);(' must not become script: values reach
+    click handlers through data-* attributes, escaped for attribute context."""
+    source = (REPO / "frontend" / "app.js").read_text(encoding="utf-8")
+    assert not re.search(r'(?<!\[)\bon[a-z]+="[^"]*\$\{', source), "inline handler with an interpolated value"
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    start = source.index("function escapeHtml(")
+    end = source.index("function scrollToBottom(")
+    script = (
+        "const document = {createElement() { return { set textContent(v) { this.v = String(v); },"
+        " get innerHTML() { return this.v.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); } }; } };\n"
+        + source[start:end]
+        + "\nprocess.stdout.write(escapeAttr(`a\"b'c<d>&e`));"
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout
+    assert out == "a&quot;b&#39;c&lt;d&gt;&amp;e"

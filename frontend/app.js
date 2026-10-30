@@ -670,6 +670,13 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+// For attribute values: escapeHtml leaves quotes alone, so a name with a quote
+// would end the attribute. Names reach handlers through data-* attributes,
+// never through inline JS strings.
+function escapeAttr(str) {
+    return escapeHtml(String(str ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function scrollToBottom(el) {
     requestAnimationFrame(() => {
         el.scrollTop = el.scrollHeight;
@@ -768,10 +775,10 @@ function updateAppsList(targets) {
     }
     list.innerHTML = targets.map(t => `
         <div class="app-item">
-            <span class="app-status-dot ${t.status}"></span>
+            <span class="app-status-dot ${escapeAttr(t.status)}"></span>
             <span class="app-item-name">${escapeHtml(t.name)}</span>
             <span class="app-item-url">${escapeHtml(t.ws_url)}</span>
-            <button class="app-remove-btn" onclick="removeApp('${escapeHtml(t.name)}')" title="Disconnect">&times;</button>
+            <button class="app-remove-btn" data-name="${escapeAttr(t.name)}" onclick="removeApp(this.dataset.name)" title="Disconnect">&times;</button>
         </div>
     `).join('');
 }
