@@ -75,8 +75,13 @@ class Guardian:
         observed: bool = False,
         details: dict | None = None,
         approval_id: str = "",
+        force_card: bool = False,
     ) -> DecisionEvent | None:
-        """Update stats and emit the decision card. Returns the card, if any."""
+        """Update stats and emit the decision card. Returns the card, if any.
+
+        A clean allow normally gets no card; ``force_card`` emits one anyway
+        (a call a human approved is worth showing).
+        """
         self._total_checked += 1
         app = self._app_stats(source)
         if app is not None:
@@ -106,6 +111,7 @@ class Guardian:
             self._total_flagged += 1
             if app is not None:
                 app["flagged"] += 1
+        if action != DecisionAction.ALLOWED or force_card:
             card = self._card(decision, call, action, observed=observed, source=source,
                               details=details or {}, approval_id=approval_id)
             await self.event_bus.emit(card)

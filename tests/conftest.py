@@ -3,7 +3,6 @@ replaced, and per-session target files go to a temp directory."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import socket
 import threading

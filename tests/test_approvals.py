@@ -6,7 +6,6 @@ import asyncio
 import threading
 import time
 
-import pytest
 
 import server
 from backend.approvals import InMemoryApprovalStore

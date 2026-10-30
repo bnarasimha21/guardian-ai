@@ -10,9 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import auth, netguard
-from backend.approvals import (
-    APPROVED, arguments_sha256, ApprovalCapacityError, ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval,
-)
+from backend.approvals import ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval
+from backend.approvals.flow import GRANTED, REFUSED, WAITING, queue_for_approval
 from backend.config import settings
 from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, ApprovalEvent, StatusEvent
@@ -466,38 +465,28 @@ def _agent_key(call: ToolCall, principal: str | None) -> str:
 async def _approval_flow(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
                          guardian: Guardian) -> JSONResponse:
     """require_approval in enforce mode: reuse a grant, join a pending approval, or open one."""
-    store = _approvals()
-    agent = _agent_key(call, principal)
-    sha = arguments_sha256(call.name, call.server, call.arguments)
-    existing = await store.find(session=sid, agent=agent, sha256=sha)
+    outcome = await queue_for_approval(_approvals(), decision, call, session=sid, agent=_agent_key(call, principal))
+    approval, sha = outcome.approval, outcome.arguments_sha256
 
-    if existing is not None and existing.status == APPROVED and await store.use(existing.id):
+    if outcome.status == GRANTED:
         decision.effect = "allow"
-        decision.reasons.append(f"Approved by {existing.resolved_by or 'an approver'} (approval {existing.id})")
-        await guardian.record(decision, call, source=source, approval_id=existing.id)
+        decision.reasons.append(f"Approved by {approval.resolved_by or 'an approver'} (approval {approval.id})")
+        await guardian.record(decision, call, source=source, approval_id=approval.id)
         return _decision_response(decision, sid=sid, source=source, guardian=guardian, extra={
-            "status": "approved", "approval_id": existing.id, "arguments_sha256": sha,
-            "grant_valid_until": existing.grant_valid_until(),
+            "status": "approved", "approval_id": approval.id, "arguments_sha256": sha,
+            "grant_valid_until": approval.grant_valid_until(),
         })
 
-    if existing is not None and existing.status == "pending":
+    if outcome.status == WAITING:
         # Same call retried while a human is still deciding: no second card.
         return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={
-            "status": "pending", "approval_id": existing.id, "poll_url": f"/api/approvals/{existing.id}",
-            "expires_at": existing.expires_at, "arguments_sha256": sha,
+            "status": "pending", "approval_id": approval.id, "poll_url": f"/api/approvals/{approval.id}",
+            "expires_at": approval.expires_at, "arguments_sha256": sha,
         })
 
-    settings_ = decision.approval
-    try:
-        approval = await store.create(
-            session=sid, agent=agent, tool=call.name, server=call.server, arguments=call.arguments,
-            decision=decision.to_dict(),
-            timeout_seconds=settings_.timeout_seconds if settings_ else 120,
-            grant_ttl_seconds=settings_.grant_ttl_seconds if settings_ else 0,
-        )
-    except ApprovalCapacityError as exc:
+    if outcome.status == REFUSED:
         decision.effect = "deny"
-        decision.reasons.append(str(exc))
+        decision.reasons.append(outcome.error)
         await guardian.record(decision, call, source=source)
         return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=429)
 

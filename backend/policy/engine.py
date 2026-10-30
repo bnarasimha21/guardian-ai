@@ -38,7 +38,7 @@ import json
 import posixpath
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
