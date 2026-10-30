@@ -127,7 +127,7 @@ rules:
     description: Read-only tools
     match:
       tool: ["*.read", "*.read_*", "read_*", "*.get", "*.get_*", "get_*", "*.list", "*.list_*", "list_*",
-             "*.search", "*.search_*", "search_*", "*.summarize", "summarize*"]
+             "*.search", "*.search_*", "search_*", "*.summarize", "*.summarize_*", "summarize*"]
     effect: allow
 
   # 6. Chat output is checked by the detectors in rule 1, then allowed.

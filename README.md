@@ -28,7 +28,24 @@ Detectors are regex and URL checks run over every string in the arguments (keys 
 | `injection` | LLM05 Improper Output Handling | ASI02 Tool Misuse and Exploitation | SQL injection payloads, XSS, command injection |
 | `excessive_agency` | LLM06 Excessive Agency | ASI02 Tool Misuse and Exploitation | Real deployments via terraform/kubectl/docker/aws/gcloud |
 | `eval_manipulation` | none (anomaly signal) | none | Anomalous evaluation scores below 2/10 |
-| `scan_limit_exceeded` | none | none | The arguments were too large to scan completely (over 10,000 nodes or 1,000,000 characters); treated as HIGH so it fails closed |
+| `scan_limit_exceeded` | LLM10 Unbounded Consumption | none | The arguments were too large to scan completely (over 10,000 nodes or 1,000,000 characters); treated as HIGH so it fails closed |
+
+Before matching, each string is also checked in normalised form: Unicode NFKC (so fullwidth letters become ASCII), zero-width and bidi control characters removed, common Cyrillic and Greek look-alike letters folded to Latin, and runs of base64 decoded one level when they decode to readable text. A match on a normalised or decoded variant reports the original argument path. Leetspeak, translation, synonyms and multi-level encodings are not normalised, and the scorecard below shows attacks that still get through.
+
+**Model detectors (optional).** `backend/guardian/detectors` defines `ModelDetector`: a class with a `score(text) -> float` method, a threshold, a severity and OWASP ids. Register one in code with `register_model_detector(...)` or by setting `GUARDIAN_MODEL_DETECTORS=package.module:ClassName` (comma-separated). It then runs on every scan beside the regex detectors, its name can be used in policy `detectors.rules`, and `python evals/run.py --model-detector package.module:ClassName` scores it on the corpus. None ships with GuardianAI and none is enabled by default, so there is no model dependency. If `score` raises, the detector is skipped with a warning unless it sets `fail_closed = True`.
+
+## Detection scorecard
+
+[`evals/report.md`](evals/report.md) has the current numbers: precision, recall and false-positive rate per detector, a confusion table per OWASP category, and every missed attack and flagged benign record. The labelled corpus is in `evals/corpus/*.jsonl`: 246 records, 42% of them benign: mostly ordinary tool calls from the three demo apps, plus near-miss phrasing, clean tool output and clean tool definitions. It includes obfuscated variants (zero-width, fullwidth, homoglyph, base64, split across arguments, leetspeak), paraphrases of attack patterns from AgentDojo, garak and PromptInject (paraphrased, not copied; source and licence are recorded per record), tool-poisoning and rug-pull definitions, and the three false positives and three SSRF misses listed in issue #5 as regression records.
+
+```bash
+python evals/run.py            # writes evals/report.md and evals/report.json, offline
+python evals/run.py --check    # exit 1 if a critical rule's recall drops or benign flag/block rates rise
+```
+
+CI (`.github/workflows/evals.yml`) runs `--check` against `evals/baseline.json` on every pull request. The critical rules are `prompt_injection`, `data_exfiltration` and `dangerous_code`. To accept a deliberate change, run `python evals/run.py --write-baseline` and commit the result.
+
+The corpus is small, and the same people wrote it and the detectors. Read the numbers as regression coverage for known patterns, not as an accuracy claim. At the time of writing, 83% of attacks fire their expected detector, 3% of benign records trip a detector, and `prompt_injection` recall is 73%.
 
 ## Policy
 
@@ -166,6 +183,7 @@ That's it. Your app now exposes a `/ws-observe` endpoint that GuardianAI connect
 - **Policy as code**: one YAML file decides, reloaded on change
 - **Human approvals**: Approve/Deny on the dashboard, bound to the exact arguments, fail closed on timeout
 - **MCP gateway**: enforce the policy in front of MCP servers, with approval prompts, output scanning and tool pinning
+- **Detection scorecard**: a labelled corpus scored per detector, with a CI gate on regressions
 - **Expandable flagged cards**: Click to see OWASP context, remediation steps, and raw event data
 - **App and event filtering**: Filter by connected app or event category
 - **Rolling summary**: Real-time stats with per-app breakdowns
@@ -183,7 +201,7 @@ Your App (FastAPI/Express)
 GuardianAI Server (FastAPI)
     |
     |-- WebSocket tap client (passive observer, decisions are observed only)
-    |-- Detectors (backend/guardian/rules.py)
+    |-- Detectors (backend/guardian/rules.py, optional model detectors in backend/guardian/detectors)
     |-- Policy engine + hot-reloaded YAML policy (backend/policy)
     |-- POST /api/check (policy decision point: 200 allow, 403 deny, 202 approval)
     |-- Approval queue (in memory) + /api/approvals
@@ -219,7 +237,7 @@ python -m pytest
 ```
 
 The suite runs offline: DNS, outbound HTTP and Supabase are replaced in
-`tests/conftest.py`.
+`tests/conftest.py`. The detection scorecard is separate: `python evals/run.py`.
 
 ## Environment Variables
 
@@ -231,6 +249,7 @@ ALLOW_PRIVATE_TARGETS=false                       # let targets point at loopbac
 GUARDIAN_POLICY_FILE=                             # policy YAML path (default policies/default.yaml)
 GUARDIAN_API_KEYS=                                # name=key,name=key; when set, /api/check needs a Bearer key (16+ chars)
 GUARDIAN_APPROVER_KEYS=                           # name=key; may watch every app:* dashboard session
+GUARDIAN_MODEL_DETECTORS=                         # module:Attr,...; optional ModelDetector classes (none by default)
 SUPABASE_URL=https://your-project.supabase.co    # optional, for usage logging
 SUPABASE_ANON_KEY=your-anon-key                   # optional, for usage logging
 ```

@@ -1,0 +1,9 @@
+{
+  "benign_blocked_rate": 0.0194,
+  "benign_flagged_rate": 0.0291,
+  "critical_rule_recall": {
+    "dangerous_code": 0.8421,
+    "data_exfiltration": 0.75,
+    "prompt_injection": 0.7333
+  }
+}
