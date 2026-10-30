@@ -1,0 +1,29 @@
+# GuardianAI MCP gateway: example configuration.
+# Run from the repo root:  guardian-mcp --config examples/mcp/gateway.yaml
+# Relative paths below are resolved against this file's folder.
+
+servers:
+  files:                        # tools appear as files.read_file, files.http_fetch, files.deploy
+    command: python
+    args: [upstream.py]
+    env:
+      EXAMPLE_ROOT: data
+  sketchy:                      # its poisoned tool is hidden; sketchy.get_time stays
+    command: python
+    args: [poisoned_upstream.py]
+
+agent: claude-desktop           # what the policy's `agent:` patterns match
+policy_file: ../../policies/default.yaml
+pins_file: .guardian/mcp-pins.json
+audit_log: .guardian/mcp-audit.jsonl
+separator: "."                  # use "__" for clients that only accept [a-zA-Z0-9_-] tool names
+elicitation: true               # ask the user through the client when policy says require_approval
+
+# Run the dashboard in the same process: decisions show at
+# http://127.0.0.1:8000/?session=mcp-gateway and approvals can be answered there
+# when the client cannot show an approval prompt.
+dashboard:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000
+  session: mcp-gateway

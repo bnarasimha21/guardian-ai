@@ -1,6 +1,6 @@
 # GuardianAI
 
-A policy decision point for AI agent tool calls, plus a live dashboard. Agents (or the apps that run them) ask `POST /api/check` "may this agent call this tool with these arguments?" and get an allow or deny decided by a YAML policy file and a set of built-in detectors mapped to the OWASP Top 10 for LLM Applications (2025) and the OWASP Top 10 for Agentic Applications (2026). Separately, GuardianAI can passively observe apps through a WebSocket tap and show what the same policy would have decided; the tap cannot stop anything.
+A policy decision point for AI agent tool calls, plus a live dashboard. Agents (or the apps that run them) ask `POST /api/check` "may this agent call this tool with these arguments?" and get an allow or deny decided by a YAML policy file and a set of built-in detectors mapped to the OWASP Top 10 for LLM Applications (2025) and the OWASP Top 10 for Agentic Applications (2026). Separately, GuardianAI can passively observe apps through a WebSocket tap and show what the same policy would have decided; the tap cannot stop anything. And it can run as an MCP gateway (`guardian-mcp`) in front of your MCP servers, where it does sit in the call path and enforces the policy itself.
 
 ## Screenshots
 
@@ -9,6 +9,7 @@ A policy decision point for AI agent tool calls, plus a live dashboard. Agents (
 ## What it does
 
 - **Decides** (`POST /api/check`): evaluates a structured tool call `{tool, arguments, agent}` against `policies/default.yaml` and returns allow (200), deny (403) or pending human approval (202). Your agent runtime must call it before running the tool and honor the answer; GuardianAI does not sit in the call path by itself.
+- **Enforces for MCP** (`guardian-mcp`): an MCP server that fronts other MCP servers. Calls the policy denies never reach the upstream, approvals are asked for before the call runs, tool output is scanned before the client sees it, and tool definitions are screened and pinned. See [Gateway mode](#gateway-mode-mcp).
 - **Observes** (guardian-tap): connects to your app's `/ws-observe` endpoint, finds tool calls inside every event it sees (any event type, OpenAI and Anthropic tool-call shapes included) and runs the same policy over them. These decisions are shown as `OBSERVED`/`FLAGGED`; the traffic has already happened.
 
 **Left panel**: live feed of agent activity. **Right panel**: decisions with the policy rule that decided, the detectors that fired, severity, OWASP categories and remediation.
@@ -78,6 +79,56 @@ Dashboard event streams are bounded (1000 events per browser); a browser that st
 
 ![Approvals lane](docs/images/approvals-lane.png)
 
+## Gateway mode (MCP)
+
+`guardian-mcp` is an MCP server that sits between an MCP client (Claude Desktop, Claude Code, an agent framework) and the MCP servers it uses. The client connects to the gateway over stdio; the gateway connects to each upstream over stdio or Streamable HTTP and exposes their tools as `<server>.<tool>`. Here GuardianAI is in the call path: a call the policy denies is never sent upstream.
+
+```bash
+pip install -e .          # installs the guardian-mcp command
+guardian-mcp --config examples/mcp/gateway.yaml
+```
+
+`examples/mcp/gateway.yaml` fronts two example servers: `upstream.py` (`read_file`, `http_fetch` with a canned response, a pretend `deploy`) and `poisoned_upstream.py` (one tool with instructions hidden in its description). The config keys are documented at the top of `backend/mcp_gateway/config.py`; `${VAR}` in `env` and `headers` is read from the gateway's environment so tokens stay out of the file.
+
+**Claude Desktop** (`claude_desktop_config.json`). Use absolute paths, and make sure the `command` in `gateway.yaml` is a Python that has `mcp` installed (the example's `python` must resolve to the repo venv, or write the full path):
+
+```json
+{
+  "mcpServers": {
+    "guardian": {
+      "command": "/path/to/guardian-ai/.venv/bin/guardian-mcp",
+      "args": ["--config", "/path/to/guardian-ai/examples/mcp/gateway.yaml"]
+    }
+  }
+}
+```
+
+Some clients only accept tool names matching `[a-zA-Z0-9_-]`; set `separator: "__"` and the tools appear as `files__read_file`. Policy rules always see the canonical `files.read_file`.
+
+What happens to each request:
+
+- **`tools/call`**: the call is evaluated as tool `<server>.<tool>` with `server: <server>` and `agent:` set to the `agent` value in `gateway.yaml` (the client's self-reported name is not used). `deny` returns an MCP tool error with the reasons and the decision in `_meta["guardian-ai/decision"]`; nothing is forwarded.
+- **`require_approval`**: if the client supports MCP elicitation, the user is asked in the client, showing the tool, the rule and the exact arguments; only an explicit "approve" runs the call, and decline, cancel, a timeout or an answer for different arguments is a denial. This works in both the 2025 protocol (`elicitation/create`) and 2026-07-28 (`InputRequiredResult`; the request state is a single-use server-side key, so a client cannot forge an approval by editing it). If the client cannot elicit (or `elicitation: false`), and the dashboard is enabled, the call joins the [approval queue](#approvals): the client gets a "held for approval" tool error with the approval id and the dashboard link, a human answers there, and the identical call retried afterwards runs. With neither, the call is denied.
+- **Tool output** is scanned (all of it treated as untrusted) and judged by the policy's `result` rules before the client sees it: `deny` replaces it with an error saying it was withheld, `redact` masks the matched values (for example an AWS key) and keeps the rest, `warn` passes it with a warning block in front.
+- **`tools/list`**: every tool definition (name, description, schemas, annotations) is scanned like tool output. A definition carrying injection text at or above the block threshold is hidden and recorded as `tool_poisoning` (OWASP LLM01, ASI04). Clean definitions are pinned by SHA-256 in `pins_file` on first sight; if a later listing returns a different definition (a "rug pull"), the tool is hidden and recorded as `tool_definition_changed` (LLM03, ASI04) until an operator reviews it:
+
+  ```bash
+  guardian-mcp --config gateway.yaml pins list
+  guardian-mcp --config gateway.yaml pins approve files.deploy
+  ```
+
+- **Monitor mode** (`mode: monitor` in the policy): nothing is blocked or hidden; decisions are still recorded and attached to results.
+
+Every decision goes to the optional `audit_log` (JSONL, one line per decision card and per approval change). With `dashboard: {enabled: true}` the gateway also runs the GuardianAI web app in the same process, so its decisions appear live at `http://127.0.0.1:8000/?session=mcp-gateway` and queued approvals can be answered there.
+
+Limits, stated plainly:
+
+- **Elicitation trusts the client.** The approval prompt is rendered by the MCP client, and the gateway only sees the answer it sends back. A compromised or automated client can answer "approve" itself. If that matters, set `elicitation: false` so approvals go through the dashboard queue, and protect it with `GUARDIAN_APPROVER_KEYS`.
+- **Standalone mode has no approval queue.** Without `dashboard.enabled`, `require_approval` works only through elicitation; otherwise it fails closed.
+- **Detection is pattern based.** Tool poisoning and output injection are found by the same regex detectors as `/api/check`, so reworded attacks can get through. Pinning catches any change to a definition, but the first version seen is trusted.
+- **Pins are per file.** Two gateways sharing one `pins_file` can overwrite each other's new pins. A corrupt pins file stops the gateway rather than silently trusting everything again.
+- Resources and prompts from upstreams are not proxied; only tools are.
+
 ## Connect Your App
 
 GuardianAI works with any FastAPI (Python) or Express (Node.js) app. Two lines of code:
@@ -114,6 +165,7 @@ That's it. Your app now exposes a `/ws-observe` endpoint that GuardianAI connect
 - **Health check verification**: Validates guardian-tap installation before connecting
 - **Policy as code**: one YAML file decides, reloaded on change
 - **Human approvals**: Approve/Deny on the dashboard, bound to the exact arguments, fail closed on timeout
+- **MCP gateway**: enforce the policy in front of MCP servers, with approval prompts, output scanning and tool pinning
 - **Expandable flagged cards**: Click to see OWASP context, remediation steps, and raw event data
 - **App and event filtering**: Filter by connected app or event category
 - **Rolling summary**: Real-time stats with per-app breakdowns
@@ -135,6 +187,7 @@ GuardianAI Server (FastAPI)
     |-- Policy engine + hot-reloaded YAML policy (backend/policy)
     |-- POST /api/check (policy decision point: 200 allow, 403 deny, 202 approval)
     |-- Approval queue (in memory) + /api/approvals
+    |-- guardian-mcp: MCP gateway (backend/mcp_gateway), same policy engine
     |-- Per-session event bus
     |-- Supabase usage logging
     |
