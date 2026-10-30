@@ -17,6 +17,7 @@ from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, ApprovalEvent, StatusEvent
 from backend.guardian.middleware import Guardian
 from backend.guardian.schema import CheckRequest, RequestError, ToolCall, to_tool_call
+from backend.guardian.rules import default_rules
 from backend.guardian.taxonomy import taxonomy_payload
 from backend.policy import engine as policy_engine
 from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
@@ -32,7 +33,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail at startup, not on the first request, if the policy file or the key
-    # configuration is broken.
+    # configuration is broken, or a GUARDIAN_MODEL_DETECTORS entry cannot load.
+    default_rules()
     _policy_store()
     _api_keys()
     _approver_keys()

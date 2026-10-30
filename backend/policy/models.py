@@ -8,7 +8,7 @@ from typing import Any, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.events.models import SEVERITY_ORDER
-from backend.guardian.rules import RULE_NAMES
+from backend.guardian.rules import known_detector_names
 
 CALL_EFFECTS = ("allow", "deny", "require_approval")
 RESULT_EFFECTS = ("allow", "warn", "redact", "deny")
@@ -87,9 +87,10 @@ class DetectorMatch(_Strict):
     @field_validator("rules")
     @classmethod
     def _known(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        known = known_detector_names()
         for name in v or []:
-            if name not in RULE_NAMES:
-                raise ValueError(f"unknown detector '{name}' (known: {', '.join(RULE_NAMES)})")
+            if name not in known:
+                raise ValueError(f"unknown detector '{name}' (known: {', '.join(known)})")
         return v
 
     @field_validator("min_severity")

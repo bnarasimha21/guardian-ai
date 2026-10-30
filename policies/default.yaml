@@ -32,9 +32,10 @@
 #              any otherwise) and `negate: true`. A path with no values fails
 #              the predicate (and so passes it when negated).
 #   detectors: {rules: [names], min_severity: low|medium|high|critical|block_threshold}
-#              holds if a built-in detector fired. Names: prompt_injection,
+#              holds if a detector fired. Built-in names: prompt_injection,
 #              sensitive_data_leak, data_exfiltration, ssrf, dangerous_code,
 #              injection, excessive_agency, eval_manipulation, scan_limit_exceeded.
+#              Model detectors registered via GUARDIAN_MODEL_DETECTORS add theirs.
 #   not:       a nested match that must NOT hold
 #   any:       a list of nested matches, one of which must hold
 

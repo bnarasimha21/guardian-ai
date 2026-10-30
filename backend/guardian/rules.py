@@ -6,6 +6,14 @@ path, so a match says which argument triggered it, and a detector can treat
 some paths as untrusted (content the agent fetched, as opposed to content the
 agent wrote).
 
+Each string is also scanned in normalised form when that differs from the
+original: Unicode NFKC, zero-width and bidi control characters removed,
+common Cyrillic and Greek look-alike letters folded to Latin, and runs of
+base64 decoded (one level) when they decode to readable text. So
+"ign\u200bore previous instructions", fullwidth or homoglyph spellings and a
+base64-wrapped command are seen as what they say. Matches from a variant
+carry the original field's path.
+
 Walking is iterative with no depth cap. A node limit and a character limit
 bound the work; a payload over either limit produces a ``scan_limit_exceeded``
 match instead of being silently half-scanned (fail closed).
@@ -15,8 +23,11 @@ OWASP mappings (LLM Top 10 2025 and Agentic Top 10 2026) live in taxonomy.py.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fnmatch
 import re
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
@@ -52,6 +63,81 @@ class ScanInput:
     fields: list[ScanField] = field(default_factory=list)
     numbers: dict[str, float] = field(default_factory=dict)
     limit_exceeded: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Normalisation
+# ---------------------------------------------------------------------------
+
+# Invisible characters used to split keywords: zero-width, joiners, word
+# joiner, invisible operators, BOM, soft hyphen, bidi embeddings and isolates.
+_INVISIBLE = re.compile("[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+# Look-alike letters that NFKC leaves alone (Cyrillic and Greek), folded to Latin.
+_CONFUSABLES = str.maketrans({
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c", "\u0443": "y",
+    "\u0445": "x", "\u0456": "i", "\u0455": "s", "\u0458": "j", "\u0501": "d", "\u04bb": "h",
+    "\u04cf": "l", "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K", "\u041c": "M",
+    "\u041d": "H", "\u041e": "O", "\u0420": "P", "\u0421": "C", "\u0422": "T", "\u0425": "X",
+    "\u0406": "I", "\u0405": "S", "\u03bf": "o", "\u03b1": "a", "\u03b5": "e", "\u03b9": "i",
+    "\u03ba": "k", "\u03bd": "v", "\u03c1": "p", "\u03c4": "t", "\u03c5": "u", "\u03c7": "x",
+    "\u039f": "O", "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0397": "H", "\u0399": "I",
+    "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u03a1": "P", "\u03a4": "T", "\u03a7": "X",
+})
+_BASE64_RUN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])")
+MAX_DECODES_PER_FIELD = 8
+
+
+def normalise_text(text: str) -> str:
+    """NFKC, invisible characters removed, look-alike letters folded to Latin."""
+    return unicodedata.normalize("NFKC", _INVISIBLE.sub("", text)).translate(_CONFUSABLES)
+
+
+def _readable(raw: bytes) -> str | None:
+    if len(raw) < 8:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+    if printable < 0.95 * len(text):
+        return None
+    # Mostly letters, digits and spaces: ordinary text or a command, not binary noise.
+    plain = sum(1 for ch in text if ch.isalnum() or ch in " \n\t./:-_")
+    return text if plain >= 0.7 * len(text) else None
+
+
+def decode_base64_runs(text: str) -> list[str]:
+    """Readable text hidden in base64 runs of ``text`` (one level, a few runs at most)."""
+    out: list[str] = []
+    for m in _BASE64_RUN.finditer(text):
+        if len(out) >= MAX_DECODES_PER_FIELD:
+            break
+        run = m.group(0)
+        altchars = b"-_" if ("-" in run or "_" in run) else None
+        padded = run + "=" * (-len(run) % 4)
+        try:
+            raw = base64.b64decode(padded, altchars=altchars, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        decoded = _readable(raw)
+        if decoded is not None:
+            out.append(decoded)
+    return out
+
+
+def text_variants(text: str) -> list[str]:
+    """Other spellings of ``text`` worth scanning (empty when there are none)."""
+    variants: list[str] = []
+    norm = normalise_text(text)
+    if norm != text:
+        variants.append(norm)
+    for decoded in decode_base64_runs(norm):
+        variants.append(decoded)
+        again = normalise_text(decoded)
+        if again != decoded:
+            variants.append(again)
+    return variants
 
 
 def path_segments(path: str) -> list[str]:
@@ -126,11 +212,14 @@ def build_scan_input(
                 stack.append((child, "", value[i]))
             continue
         text = value if isinstance(value, str) else str(value)
-        chars += len(text)
+        untrusted = is_untrusted(path)
+        texts = [text, *text_variants(text)]
+        chars += sum(len(t) for t in texts)
         if chars > max_total_chars:
             out.limit_exceeded = f"payload has more than {max_total_chars} characters of text"
             break
-        out.fields.append(ScanField(path=path, key=key, value=text, untrusted=is_untrusted(path)))
+        for t in texts:
+            out.fields.append(ScanField(path=path, key=key, value=t, untrusted=untrusted))
     return out
 
 
@@ -575,6 +664,38 @@ ALL_RULES: list[ThreatRule] = [
 SCAN_LIMIT_RULE = "scan_limit_exceeded"
 RULE_NAMES = [r.name for r in ALL_RULES] + [SCAN_LIMIT_RULE]
 
+# Extra detectors registered at runtime (model-based detectors, see
+# backend/guardian/detectors). They run after the built-in rules.
+_EXTRA_RULES: list[ThreatRule] = []
+_env_loaded = False
+
+
+def register_rule(rule: ThreatRule) -> None:
+    """Add a detector to every default scan. Replaces one with the same name."""
+    if rule.name in RULE_NAMES:
+        raise ValueError(f"'{rule.name}' is a built-in detector name")
+    unregister_rule(rule.name)
+    _EXTRA_RULES.append(rule)
+
+
+def unregister_rule(name: str) -> None:
+    _EXTRA_RULES[:] = [r for r in _EXTRA_RULES if r.name != name]
+
+
+def default_rules() -> list[ThreatRule]:
+    """Built-in rules plus registered ones (loading GUARDIAN_MODEL_DETECTORS once)."""
+    global _env_loaded
+    if not _env_loaded:
+        _env_loaded = True
+        from backend.guardian.detectors import load_from_env
+        load_from_env()
+    return ALL_RULES + _EXTRA_RULES
+
+
+def known_detector_names() -> list[str]:
+    """Names a policy may reference under ``detectors.rules``."""
+    return RULE_NAMES + [r.name for r in default_rules() if r.name not in RULE_NAMES]
+
 
 def detect(
     data: Any,
@@ -591,7 +712,7 @@ def detect(
         max_nodes=max_nodes, max_total_chars=max_total_chars,
     )
     matches: list[ThreatMatch] = []
-    for rule in rules or ALL_RULES:
+    for rule in rules or default_rules():
         matches.extend(rule.scan(scan))
     if scan.limit_exceeded:
         matches.append(ThreatMatch(

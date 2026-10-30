@@ -23,6 +23,7 @@ import anyio
 from backend.config import settings
 from backend.events.bus import EventBus
 from backend.guardian.middleware import Guardian
+from backend.guardian.rules import default_rules
 from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
 
 from .config import ConfigError, GatewayConfig, load_config
@@ -162,9 +163,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config)
         if args.command == "pins":
             return _pins_command(cfg, args)
+        default_rules()  # load GUARDIAN_MODEL_DETECTORS now, so a bad entry stops startup
         PolicyStore(_policy_path(cfg)).get()  # refuse to start on a broken policy
         anyio.run(serve, cfg)
-    except (ConfigError, PolicyError, PinError) as exc:
+    except (ConfigError, PolicyError, PinError, ValueError) as exc:
         print(f"guardian-mcp: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

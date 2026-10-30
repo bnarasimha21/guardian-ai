@@ -121,6 +121,21 @@ class _PendingElicitation:
     expires_at: float
 
 
+DEFINITION_FIELDS = ("name", "title", "description", "inputSchema", "outputSchema", "annotations")
+
+
+def screen_definition(loaded, call: ToolCall, definition: dict, block_threshold: str) -> tuple[Decision, bool]:
+    """Scan a tool definition the way tool output is scanned (all untrusted).
+
+    Returns the result-phase verdict and whether the tool counts as poisoned:
+    a deny or redact verdict, or any match at or above the block threshold.
+    """
+    scan = {k: definition.get(k) for k in DEFINITION_FIELDS if definition.get(k) is not None}
+    verdict = policy_engine.evaluate(loaded, call, phase="result", result=scan, block_threshold=block_threshold)
+    severe = [m for m in verdict.matches if is_blocking(m, block_threshold)]
+    return verdict, verdict.effect in ("deny", "redact") or bool(severe)
+
+
 @dataclass
 class GatewayResult:
     """What one tools/call ended in (for tests, telemetry and the audit log)."""
@@ -325,12 +340,8 @@ class Gateway:
 
     def _screen(self, loaded, call: ToolCall, definition: dict) -> Decision | None:
         """Scan a tool definition as untrusted content. Returns a poisoning decision or None."""
-        scan = {k: definition.get(k) for k in ("name", "title", "description", "inputSchema", "outputSchema",
-                                              "annotations") if definition.get(k) is not None}
-        verdict = policy_engine.evaluate(loaded, call, phase="result", result=scan,
-                                         block_threshold=self.block_threshold)
-        severe = [m for m in verdict.matches if is_blocking(m, self.block_threshold)]
-        if verdict.effect in ("deny", "redact") or severe:
+        verdict, poisoned = screen_definition(loaded, call, definition, self.block_threshold)
+        if poisoned:
             reason = (f"The definition of {call.name} contains text aimed at the model "
                       f"({', '.join(sorted({m.rule_name for m in verdict.matches})) or verdict.rule_id}); "
                       "the tool is hidden")

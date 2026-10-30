@@ -213,5 +213,23 @@ def taxonomy_payload() -> dict:
                 "remediation": info.remediation,
             }
             for name, info in RULES.items()
-        },
+        } | _registered_detectors(),
     }
+
+
+def _registered_detectors() -> dict:
+    """Model detectors registered at runtime, described the same way."""
+    from .rules import default_rules  # late import: rules imports this module
+
+    out = {}
+    for rule in default_rules():
+        det = getattr(rule, "detector", None)
+        if det is not None and rule.name not in RULES:
+            out[rule.name] = {
+                "title": det.description or det.name,
+                "owasp_llm": det.owasp_llm,
+                "owasp_agentic": det.owasp_agentic,
+                "remediation": "Flagged by a model-based detector. Review the input it scored and the "
+                               "detector's threshold.",
+            }
+    return out
