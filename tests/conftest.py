@@ -38,6 +38,11 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(server.settings, "guardian_approver_keys", "")
     monkeypatch.setattr(server.settings, "block_threshold", "high")
     monkeypatch.setattr(server.settings, "allow_private_targets", False)
+    monkeypatch.setattr(server.settings, "guardian_usage_logging", False)
+    # No real OTLP export from tests; tracing tests use an in-memory exporter.
+    for name in ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL",
+                 "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "GUARDIAN_OTEL_CAPTURE_ARGUMENTS"):
+        monkeypatch.delenv(name, raising=False)
     for sess in list(server._sessions.values()):
         for task in sess["observers"].values():
             task.cancel()

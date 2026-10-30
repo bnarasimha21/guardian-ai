@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # Same format. Keys allowed to approve or deny pending calls. Required for
     # approvals whenever GUARDIAN_API_KEYS is set.
     guardian_approver_keys: str = ""
+    # Send usage rows (connections, blocks, session starts with IP and user
+    # agent) to Supabase. Off by default; also needs SUPABASE_URL and
+    # SUPABASE_ANON_KEY. Traces (OTEL_EXPORTER_OTLP_ENDPOINT) are the audit path.
+    guardian_usage_logging: bool = False
 
     @field_validator("block_threshold", mode="before")
     @classmethod

@@ -25,6 +25,7 @@ from backend.events.bus import EventBus
 from backend.guardian.middleware import Guardian
 from backend.guardian.rules import default_rules
 from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
+from backend.telemetry import force_flush, get_telemetry, setup_from_env
 
 from .config import ConfigError, GatewayConfig, load_config
 from .pins import PinError, PinStore
@@ -139,7 +140,8 @@ async def serve(cfg: GatewayConfig, *, log_level: str = "INFO") -> None:
 
     if not cfg.dashboard.enabled:
         gateway = Gateway(cfg, recorder=Guardian(event_bus=EventBus()), policy_store=policy_store, pins=pins,
-                          session=cfg.dashboard.session, block_threshold=settings.block_threshold, audit=audit)
+                          session=cfg.dashboard.session, block_threshold=settings.block_threshold, audit=audit,
+                          telemetry=get_telemetry())
         await run(gateway)
         return
 
@@ -151,7 +153,7 @@ async def serve(cfg: GatewayConfig, *, log_level: str = "INFO") -> None:
         gateway = Gateway(cfg, recorder=_SessionRecorder(web, cfg.dashboard.session),
                           policy_store=web._policy_store(), pins=pins, approvals=web._approvals(),
                           session=cfg.dashboard.session, block_threshold=settings.block_threshold, audit=audit,
-                          dashboard_url=url)
+                          dashboard_url=url, telemetry=get_telemetry())
         await run(gateway)
 
 
@@ -165,7 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             return _pins_command(cfg, args)
         default_rules()  # load GUARDIAN_MODEL_DETECTORS now, so a bad entry stops startup
         PolicyStore(_policy_path(cfg)).get()  # refuse to start on a broken policy
-        anyio.run(serve, cfg)
+        setup_from_env()  # OTLP export when OTEL_EXPORTER_OTLP_ENDPOINT is set; a bad protocol stops startup
+        try:
+            anyio.run(serve, cfg)
+        finally:
+            force_flush()
     except (ConfigError, PolicyError, PinError, ValueError) as exc:
         print(f"guardian-mcp: {exc}", file=sys.stderr)
         return 2

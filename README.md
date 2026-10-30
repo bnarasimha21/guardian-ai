@@ -70,7 +70,7 @@ curl -s -X POST localhost:8000/api/check \
   -d '{"tool": {"name": "http.fetch"}, "arguments": {"url": "http://[::1]:8080/admin"}, "agent": {"id": "researcher"}}'
 ```
 
-The response carries `effect`, `blocked`, `enforced`, `rule_id`, `reasons`, `matched_detectors`, `matches` (each with severity, OWASP ids, evidence paths and `blocking`), both OWASP ids for the decision, and the policy version and sha256. HTTP 200 means allow, 403 deny, 202 waiting for a human, 429 too many approvals already waiting (refused).
+The response carries `decision_id` (also on the dashboard card and the trace span), `effect`, `blocked`, `enforced`, `rule_id`, `reasons`, `matched_detectors`, `matches` (each with severity, OWASP ids, evidence paths and `blocking`), both OWASP ids for the decision, and the policy version and sha256. HTTP 200 means allow, 403 deny, 202 waiting for a human, 429 too many approvals already waiting (refused).
 
 The older shapes still work: `{"content": "..."}` is checked as the tool `guardian.content` and `{"event": {"type": "...", "data": {...}}}` as `guardian.event.<type>`. Matches below `BLOCK_THRESHOLD` are listed with `"blocking": false`.
 
@@ -146,6 +146,43 @@ Limits, stated plainly:
 - **Pins are per file.** Two gateways sharing one `pins_file` can overwrite each other's new pins. A corrupt pins file stops the gateway rather than silently trusting everything again.
 - Resources and prompts from upstreams are not proxied; only tools are.
 
+## Tracing (OpenTelemetry)
+
+Every `/api/check` and MCP gateway decision becomes an OpenTelemetry span that joins the caller's trace. Events seen by the passive tap observer are not traced. Tracing is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set; without it the OpenTelemetry API's no-op tracer is used and nothing is recorded or sent. With it, spans are batched and exported over OTLP/HTTP (protobuf). Other OTLP protocols are refused at startup. `OTEL_SERVICE_NAME` defaults to `guardian-ai`.
+
+- **`/api/check`** reads a W3C `traceparent` (and `tracestate`) header, or `trace_context.traceparent` in the body when there is no header. It records a span named `execute_tool {tool}`. If the caller already has its own tool span, it sends `"trace_context": {"traceparent": "...", "tool_span": true}` and GuardianAI records a child span named `guardian.check` instead.
+- **The MCP gateway** records the same `execute_tool {tool}` span for every `tools/call`. Trace context travels in the request's `params._meta`, which the MCP SDK reads into its own `tools/call` server span; GuardianAI's span is a child of it. Each decision on the call (the call itself, an approval, the output scan) is an event named `guardian.decision` on that span. A tool definition hidden while listing tools (poisoning, a changed pin) gets its own `guardian.tool_definition {tool}` span.
+- **Approvals** emit one short span per state change (`guardian.approval pending`, `approved`, `denied`, `used`), all parented on the check that opened the approval and tagged with `guardian.approval.id`. When the change happens in a later request (the approver's answer, the retried call), the span also links to that request's span.
+
+Attributes on the check span:
+
+| Attribute | Value |
+|---|---|
+| `gen_ai.operation.name` | `execute_tool` (not set on `guardian.check`) |
+| `gen_ai.tool.name`, `gen_ai.tool.call.id` | tool name; `call_id` from the body, or the JSON-RPC id in the gateway |
+| `gen_ai.agent.name`, `gen_ai.agent.id` | the agent (the API key name when keys are on) |
+| `guardian.decision`, `guardian.decision.id`, `guardian.decision.enforced` | `allow`, `deny` or `require_approval`; the `decision_id` returned to the caller; false in monitor mode |
+| `guardian.policy.rule_id`, `guardian.policy.mode`, `guardian.policy.version` | the deciding rule |
+| `guardian.owasp.llm`, `guardian.owasp.agentic`, `guardian.detectors` | OWASP ids and the detectors that matched |
+| `guardian.approval.id`, `guardian.approval.status` | when the call went through the approval queue |
+| `guardian.result.*` | gateway only: the decision on the tool's output |
+
+**Arguments are not recorded by default.** `GUARDIAN_OTEL_CAPTURE_ARGUMENTS=true` adds `gen_ai.tool.call.arguments` (JSON, cut at 8 KB), following the conventions' opt-in guidance. Decision reasons are never put on spans, since they can quote argument text. Tool output is not recorded.
+
+**Conventions version.** The GenAI semantic conventions are still marked Development and have moved to their own repository, so attribute names may change. The names used here are pinned in `backend/telemetry.py` (`SEMCONV_VERSION = "1.44.0"`, the schema of `opentelemetry-semantic-conventions` 0.66b2), and a test checks them against that package.
+
+**Viewing traces locally.** `docker-compose.observability.yml` runs an OpenTelemetry Collector and Jaeger (the tests do not start it):
+
+```bash
+docker compose -f docker-compose.observability.yml up -d
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 uvicorn server:app --port 8000
+# send a call with a traceparent, then open http://localhost:16686 (service "guardian-ai")
+```
+
+There is no Jaeger screenshot in this README yet: the tracing was built and tested offline, against an in-memory exporter and a local fake OTLP collector, without Docker. The compose file was checked as YAML only.
+
+**Usage logging (Supabase).** The old usage logger is off unless `GUARDIAN_USAGE_LOGGING=true` and `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set. Its rows hold session ids, IP addresses, user agents and block reasons, so `create_table.sql` no longer lets the anon role read the table (it drops the old `Allow anonymous reads` policy if present). Failed inserts are logged as warnings.
+
 ## Connect Your App
 
 GuardianAI works with any FastAPI (Python) or Express (Node.js) app. Two lines of code:
@@ -187,7 +224,8 @@ That's it. Your app now exposes a `/ws-observe` endpoint that GuardianAI connect
 - **Expandable flagged cards**: Click to see OWASP context, remediation steps, and raw event data
 - **App and event filtering**: Filter by connected app or event category
 - **Rolling summary**: Real-time stats with per-app breakdowns
-- **Usage logging**: Tracks sessions, connections, and flagged threats via Supabase
+- **OpenTelemetry tracing**: every `/api/check` and gateway decision, and every approval change, is a span in the caller's trace (off unless an OTLP endpoint is set)
+- **Usage logging (optional)**: sessions, connections and blocks to Supabase, off unless `GUARDIAN_USAGE_LOGGING=true`
 
 ## Architecture
 
@@ -207,7 +245,8 @@ GuardianAI Server (FastAPI)
     |-- Approval queue (in memory) + /api/approvals
     |-- guardian-mcp: MCP gateway (backend/mcp_gateway), same policy engine
     |-- Per-session event bus
-    |-- Supabase usage logging
+    |-- OpenTelemetry spans for decisions and approvals (backend/telemetry.py)
+    |-- Supabase usage logging (optional, off by default)
     |
     v
 Browser Dashboard
@@ -237,7 +276,7 @@ python -m pytest
 ```
 
 The suite runs offline: DNS, outbound HTTP and Supabase are replaced in
-`tests/conftest.py`. The detection scorecard is separate: `python evals/run.py`.
+`tests/conftest.py`, and tracing tests use an in-memory span exporter and a fake OTLP collector on 127.0.0.1. The detection scorecard is separate: `python evals/run.py`.
 
 ## Environment Variables
 
@@ -250,6 +289,10 @@ GUARDIAN_POLICY_FILE=                             # policy YAML path (default po
 GUARDIAN_API_KEYS=                                # name=key,name=key; when set, /api/check needs a Bearer key (16+ chars)
 GUARDIAN_APPROVER_KEYS=                           # name=key; may watch every app:* dashboard session
 GUARDIAN_MODEL_DETECTORS=                         # module:Attr,...; optional ModelDetector classes (none by default)
+OTEL_EXPORTER_OTLP_ENDPOINT=                      # e.g. http://localhost:4318; tracing is off when empty
+OTEL_SERVICE_NAME=                               # default guardian-ai
+GUARDIAN_OTEL_CAPTURE_ARGUMENTS=false            # put tool arguments on spans (off by default)
+GUARDIAN_USAGE_LOGGING=false                     # send usage rows to Supabase (needs the two below)
 SUPABASE_URL=https://your-project.supabase.co    # optional, for usage logging
 SUPABASE_ANON_KEY=your-anon-key                   # optional, for usage logging
 ```

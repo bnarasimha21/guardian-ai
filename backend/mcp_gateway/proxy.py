@@ -233,6 +233,8 @@ class Gateway:
         self._stack: AsyncExitStack | None = None
         if approvals is not None and audit is not None:
             approvals.add_listener(self._audit_approval)
+        if approvals is not None and telemetry is not None:
+            telemetry.watch_approvals(approvals)
         self.server = Server(
             "guardian-mcp-gateway",
             version="0.2.0",
@@ -441,7 +443,7 @@ class Gateway:
     async def _on_call_tool(self, ctx: Any, params: types.CallToolRequestParams):
         outcome = GatewayResult()
         if self.telemetry is not None:
-            async with self.telemetry.gateway_call(params.name, ctx) as span_outcome:
+            async with self.telemetry.gateway_call(params.name, ctx, agent_name=self.config.agent) as span_outcome:
                 result = await self._handle_call(ctx, params, outcome)
                 span_outcome.update(outcome)
                 return result

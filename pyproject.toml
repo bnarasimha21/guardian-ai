@@ -13,6 +13,9 @@ dependencies = [
     "websockets>=13.0",
     "pyyaml>=6.0",
     "mcp>=2.3,<3",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-exporter-otlp-proto-http>=1.28",
 ]
 
 [project.scripts]

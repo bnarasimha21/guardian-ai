@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -22,6 +23,7 @@ from backend.guardian.taxonomy import taxonomy_payload
 from backend.policy import engine as policy_engine
 from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
 from backend.targets import session_store
+from backend import telemetry as otel
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
 from backend.tap.extract import extract_tool_calls, has_content, synthetic_event_call
 from backend.usage_logger import log_event
@@ -38,13 +40,16 @@ async def lifespan(app: FastAPI):
     _policy_store()
     _api_keys()
     _approver_keys()
+    otel.setup_from_env()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     store = InMemoryApprovalStore()
     store.add_listener(_on_approval_change)
+    _telemetry().watch_approvals(store)
     app.state.approvals = store
     try:
         yield
     finally:
         await store.close()
+        otel.force_flush()
 
 
 app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan)
@@ -55,6 +60,13 @@ app.state.resolver = netguard.system_resolve
 app.state.verify_transport = None
 app.state.policy_store = None
 app.state.approvals = None
+# Tracing. None means the process-wide one from backend.telemetry (a no-op
+# unless an OTLP endpoint is configured); tests put an in-memory one here.
+app.state.telemetry = None
+
+
+def _telemetry() -> otel.Telemetry:
+    return getattr(app.state, "telemetry", None) or otel.get_telemetry()
 
 
 def _approvals() -> ApprovalStore:
@@ -63,6 +75,7 @@ def _approvals() -> ApprovalStore:
         store = InMemoryApprovalStore()
         store.add_listener(_on_approval_change)
         app.state.approvals = store
+    _telemetry().watch_approvals(store)
     return store
 
 
@@ -414,17 +427,22 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
         logger.error("Policy unavailable: %s", exc)
         return JSONResponse({"error": "Policy unavailable; refusing to decide", "blocked": True}, status_code=503)
 
-    decision = policy_engine.evaluate(
-        loaded, call, principal=principal, block_threshold=settings.block_threshold,
-    )
-    source = principal or call.agent_name or req.source
-    guardian = _get_session(sid)["guardian"]
+    with _telemetry().check_span(call, headers=request.headers, trace_context=req.trace_context,
+                                 principal=principal) as span:
+        decision = policy_engine.evaluate(
+            loaded, call, principal=principal, block_threshold=settings.block_threshold,
+        )
+        source = principal or call.agent_name or req.source
+        guardian = _get_session(sid)["guardian"]
 
-    if decision.effect == "require_approval" and decision.enforced:
-        return await _approval_flow(decision, call, sid=sid, principal=principal, source=source, guardian=guardian)
+        if decision.effect == "require_approval" and decision.enforced:
+            return await _approval_flow(decision, call, sid=sid, principal=principal, source=source,
+                                        guardian=guardian, span=span)
 
-    await guardian.record(decision, call, source=source)
-    return _decision_response(decision, sid=sid, source=source, guardian=guardian)
+        await guardian.record(decision, call, source=source)
+        response = _decision_response(decision, sid=sid, source=source, guardian=guardian)
+        span.decided(decision, call=call, status_code=response.status_code)
+        return response
 
 
 def _decision_body(decision) -> dict:
@@ -465,8 +483,18 @@ def _agent_key(call: ToolCall, principal: str | None) -> str:
 
 
 async def _approval_flow(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
-                         guardian: Guardian) -> JSONResponse:
+                         guardian: Guardian, span: otel.CheckSpan) -> JSONResponse:
     """require_approval in enforce mode: reuse a grant, join a pending approval, or open one."""
+    response = await _approval_response(decision, call, sid=sid, principal=principal, source=source,
+                                        guardian=guardian)
+    body = json.loads(response.body)
+    span.decided(decision, call=call, approval_id=body.get("approval_id", ""),
+                 approval_status=body.get("status", ""), status_code=response.status_code)
+    return response
+
+
+async def _approval_response(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
+                             guardian: Guardian) -> JSONResponse:
     outcome = await queue_for_approval(_approvals(), decision, call, session=sid, agent=_agent_key(call, principal))
     approval, sha = outcome.approval, outcome.arguments_sha256
 
