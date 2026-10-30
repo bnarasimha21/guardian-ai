@@ -28,9 +28,9 @@ Detectors are regex and URL checks run over every string in the arguments (keys 
 | `injection` | LLM05 Improper Output Handling | ASI02 Tool Misuse and Exploitation | SQL injection payloads, XSS, command injection |
 | `excessive_agency` | LLM06 Excessive Agency | ASI02 Tool Misuse and Exploitation | Real deployments via terraform/kubectl/docker/aws/gcloud |
 | `eval_manipulation` | none (anomaly signal) | none | Anomalous evaluation scores below 2/10 |
-| `scan_limit_exceeded` | LLM10 Unbounded Consumption | none | The arguments were too large to scan completely (over 10,000 nodes or 1,000,000 characters); treated as HIGH so it fails closed |
+| `scan_limit_exceeded` | LLM10 Unbounded Consumption | none | The arguments were too large to scan completely (over 10,000 nodes or 1,000,000 characters, or normalised and decoded forms adding up to more than three times that); treated as HIGH so it fails closed |
 
-Before matching, each string is also checked in normalised form: Unicode NFKC (so fullwidth letters become ASCII), zero-width and bidi control characters removed, common Cyrillic and Greek look-alike letters folded to Latin, and runs of base64 decoded one level when they decode to readable text. A match on a normalised or decoded variant reports the original argument path. Leetspeak, translation, synonyms and multi-level encodings are not normalised, and the scorecard below shows attacks that still get through.
+Before matching, each string is also checked in normalised form: Unicode NFKC (so fullwidth letters become ASCII), zero-width and bidi control characters removed, common Cyrillic and Greek look-alike letters folded to Latin, percent-escapes (`%20`) decoded, and runs of base64 decoded one level when they decode to readable text. Only the text as sent counts against the 1,000,000 character limit; the extra variants have their own allowance of three times that. A match on a normalised or decoded variant reports the original argument path. Leetspeak, translation, synonyms and multi-level encodings are not normalised, and the scorecard below shows attacks that still get through.
 
 **Model detectors (optional).** `backend/guardian/detectors` defines `ModelDetector`: a class with a `score(text) -> float` method, a threshold, a severity and OWASP ids. Register one in code with `register_model_detector(...)` or by setting `GUARDIAN_MODEL_DETECTORS=package.module:ClassName` (comma-separated). It then runs on every scan beside the regex detectors, its name can be used in policy `detectors.rules`, and `python evals/run.py --model-detector package.module:ClassName` scores it on the corpus. None ships with GuardianAI and none is enabled by default, so there is no model dependency. If `score` raises, the detector is skipped with a warning unless it sets `fail_closed = True`.
 
@@ -74,7 +74,7 @@ The response carries `decision_id` (also on the dashboard card and the trace spa
 
 The older shapes still work: `{"content": "..."}` is checked as the tool `guardian.content` and `{"event": {"type": "...", "data": {...}}}` as `guardian.event.<type>`. Matches below `BLOCK_THRESHOLD` are listed with `"blocking": false`.
 
-**Authentication.** With `GUARDIAN_API_KEYS` unset, `/api/check` is open demo behaviour: sessions come from `X-Session-Id` (at most 1000 are kept, least recently used evicted), and the `agent` in the body is self-reported, so a policy rule on `agent` is a label, not a control. With `GUARDIAN_API_KEYS=billing=<key>,ops=<key>` set, every call needs `Authorization: Bearer <key>` (401 otherwise), the agent identity used for `agent:` rules is the key's name, and decisions go to the dashboard session `app:<name>`, which a browser can only watch with `?token=<that key or an approver key>`. Client session ids starting with `app:` are rejected.
+**Authentication.** With `GUARDIAN_API_KEYS` unset, `/api/check` is open demo behaviour: sessions come from `X-Session-Id` (at most 1000 are kept, least recently used evicted), and the `agent` in the body is self-reported, so a policy rule on `agent` is a label, not a control. With `GUARDIAN_API_KEYS=billing=<key>,ops=<key>` set, every call needs `Authorization: Bearer <key>` (401 otherwise), the agent identity used for `agent:` rules is the key's name, and decisions go to the dashboard session `app:<name>`, which a browser can only watch with `?token=<that key or an approver key>`. The token is removed from uvicorn's access and error log lines. Client session ids starting with `app:` are rejected.
 
 ## Approvals
 
@@ -126,7 +126,7 @@ What happens to each request:
 
 - **`tools/call`**: the call is evaluated as tool `<server>.<tool>` with `server: <server>` and `agent:` set to the `agent` value in `gateway.yaml` (the client's self-reported name is not used). `deny` returns an MCP tool error with the reasons and the decision in `_meta["guardian-ai/decision"]`; nothing is forwarded.
 - **`require_approval`**: if the client supports MCP elicitation, the user is asked in the client, showing the tool, the rule and the exact arguments; only an explicit "approve" runs the call, and decline, cancel, a timeout or an answer for different arguments is a denial. This works in both the 2025 protocol (`elicitation/create`) and 2026-07-28 (`InputRequiredResult`; the request state is a single-use server-side key, so a client cannot forge an approval by editing it). If the client cannot elicit (or `elicitation: false`), and the dashboard is enabled, the call joins the [approval queue](#approvals): the client gets a "held for approval" tool error with the approval id and the dashboard link, a human answers there, and the identical call retried afterwards runs. With neither, the call is denied.
-- **Tool output** is scanned (all of it treated as untrusted) and judged by the policy's `result` rules before the client sees it: `deny` replaces it with an error saying it was withheld, `redact` masks the matched values (for example an AWS key) and keeps the rest, `warn` passes it with a warning block in front.
+- **Tool output** is scanned (all of it treated as untrusted) and judged by the policy's `result` rules before the client sees it: `deny` replaces it with an error saying it was withheld, `redact` masks the matched values (for example an AWS key) and keeps the rest, `warn` passes it with a warning block in front. The scan covers text blocks, embedded text resources, embedded blobs that decode to UTF-8 text, and the name, title, description and uri of `resource_link` blocks; images, audio and binary blobs are passed through unscanned. In the default policy, output too large to scan fully is withheld, and output with an injection is withheld before any redaction is tried, so a secret sitting next to an injection is not passed on in redacted form. If the redacted text still matches (an obfuscated secret, for example split by zero-width characters, that the masking cannot find in the original), the output is withheld instead.
 - **`tools/list`**: every tool definition (name, description, schemas, annotations) is scanned like tool output. A definition carrying injection text at or above the block threshold is hidden and recorded as `tool_poisoning` (OWASP LLM01, ASI04). Clean definitions are pinned by SHA-256 in `pins_file` on first sight; if a later listing returns a different definition (a "rug pull"), the tool is hidden and recorded as `tool_definition_changed` (LLM03, ASI04) until an operator reviews it:
 
   ```bash
@@ -160,14 +160,14 @@ Attributes on the check span:
 |---|---|
 | `gen_ai.operation.name` | `execute_tool` (not set on `guardian.check`) |
 | `gen_ai.tool.name`, `gen_ai.tool.call.id` | tool name; `call_id` from the body, or the JSON-RPC id in the gateway |
-| `gen_ai.agent.name`, `gen_ai.agent.id` | the agent (the API key name when keys are on) |
+| `gen_ai.agent.name`, `gen_ai.agent.id` | the agent: the API key name when keys are on, otherwise the self-reported name. With keys on, a different self-reported name is kept in `guardian.agent.claimed_name` |
 | `guardian.decision`, `guardian.decision.id`, `guardian.decision.enforced` | `allow`, `deny` or `require_approval`; the `decision_id` returned to the caller; false in monitor mode |
 | `guardian.policy.rule_id`, `guardian.policy.mode`, `guardian.policy.version` | the deciding rule |
 | `guardian.owasp.llm`, `guardian.owasp.agentic`, `guardian.detectors` | OWASP ids and the detectors that matched |
 | `guardian.approval.id`, `guardian.approval.status` | when the call went through the approval queue |
 | `guardian.result.*` | gateway only: the decision on the tool's output |
 
-**Arguments are not recorded by default.** `GUARDIAN_OTEL_CAPTURE_ARGUMENTS=true` adds `gen_ai.tool.call.arguments` (JSON, cut at 8 KB), following the conventions' opt-in guidance. Decision reasons are never put on spans, since they can quote argument text. Tool output is not recorded.
+**Arguments are not recorded by default.** `GUARDIAN_OTEL_CAPTURE_ARGUMENTS=true` adds `gen_ai.tool.call.arguments` (JSON, cut at 8 KB), following the conventions' opt-in guidance. Decision reasons are never put on spans, since they can quote argument text. Tool output is not recorded. When a check or gateway call raises, the span gets `error.type` and an error status with the exception's type name only; its message and stack are not recorded, for the same reason.
 
 **Conventions version.** The GenAI semantic conventions are still marked Development and have moved to their own repository, so attribute names may change. The names used here are pinned in `backend/telemetry.py` (`SEMCONV_VERSION = "1.44.0"`, the schema of `opentelemetry-semantic-conventions` 0.66b2), and a test checks them against that package.
 
@@ -279,6 +279,8 @@ The suite runs offline: DNS, outbound HTTP and Supabase are replaced in
 `tests/conftest.py`, and tracing tests use an in-memory span exporter and a fake OTLP collector on 127.0.0.1. The detection scorecard is separate: `python evals/run.py`.
 
 ## Environment Variables
+
+A `.env` file in the working directory is read at startup. Variables already set in the environment win over it.
 
 ```
 HOST=0.0.0.0
