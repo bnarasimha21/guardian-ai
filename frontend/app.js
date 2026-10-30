@@ -18,10 +18,25 @@ function getSessionId() {
     }
     return sid;
 }
-const SESSION_ID = getSessionId();
+// ?session=app:<name>&token=<key> watches the session of an API-key caller.
+// The token is an approver key (or that app's key); it is kept for this tab only.
+const URL_PARAMS = new URLSearchParams(location.search);
+if (URL_PARAMS.get('token')) {
+    sessionStorage.setItem('guardian_token', URL_PARAMS.get('token'));
+    // Do not leave the key in the address bar or history.
+    URL_PARAMS.delete('token');
+    history.replaceState(null, '', location.pathname + (URL_PARAMS.toString() ? '?' + URL_PARAMS : ''));
+}
+const AUTH_TOKEN = sessionStorage.getItem('guardian_token') || '';
+const SESSION_ID = URL_PARAMS.get('session') || getSessionId();
+const IS_APP_SESSION = SESSION_ID.startsWith('app:');
 
 function apiHeaders() {
-    return { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID };
+    const h = { 'Content-Type': 'application/json' };
+    // app:* sessions are chosen by the API key, never by the header.
+    if (!IS_APP_SESSION) h['X-Session-Id'] = SESSION_ID;
+    if (AUTH_TOKEN) h['Authorization'] = `Bearer ${AUTH_TOKEN}`;
+    return h;
 }
 
 // ---- OWASP taxonomy (served by /api/taxonomy, never hard-coded here) ----
@@ -63,7 +78,9 @@ function renderRuleChips() {
 
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events?session=${SESSION_ID}`);
+    const q = new URLSearchParams({ session: SESSION_ID });
+    if (AUTH_TOKEN) q.set('token', AUTH_TOKEN);
+    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events?${q}`);
 
     ws.onopen = () => console.log('[Guardian] Connected to event stream');
 
@@ -96,6 +113,122 @@ function handleEvent(event) {
         case 'status':
             updateStatus(event);
             break;
+        case 'approval':
+            renderApproval(event);
+            break;
+    }
+}
+
+// ---- Approvals lane ----
+// One card per approval. Pending cards have Approve / Deny; resolved cards
+// keep their outcome so the history stays visible.
+
+function approvalStatusLabel(a) {
+    if (a.status === 'pending') return 'WAITING';
+    if (a.status === 'approved') return a.uses > 0 ? `APPROVED, USED ${a.uses}x` : 'APPROVED';
+    if (a.reason === 'timeout') return 'DENIED (TIMEOUT)';
+    return 'DENIED';
+}
+
+function fmtValue(v) {
+    return typeof v === 'string' ? v : JSON.stringify(v);
+}
+
+function renderApproval(a) {
+    // ApprovalEvent (from the socket) and /api/approvals items differ only in field names.
+    a = { ...a, tool_name: a.tool_name || a.tool, policy_rule_id: a.policy_rule_id || a.rule_id };
+    const lane = document.getElementById('approvalsLane');
+    const list = document.getElementById('approvalList');
+    if (!lane || !list) return;
+    lane.hidden = false;
+
+    let card = list.querySelector(`[data-approval-id="${CSS.escape(a.approval_id)}"]`);
+    if (!card) {
+        card = document.createElement('div');
+        card.className = 'approval-card';
+        card.dataset.approvalId = a.approval_id;
+        list.prepend(card);
+    }
+    card.dataset.status = a.status;
+
+    const args = Object.entries(a.arguments || {})
+        .map(([k, v]) => `<div class="approval-arg"><span class="arg-path">${escapeHtml(k)}</span> ${escapeHtml(fmtValue(v).slice(0, 300))}</div>`)
+        .join('');
+    const diff = (a.diff || []).map(d => {
+        if (d.change === 'added') return `<div class="diff-row diff-added">+ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.after))}</div>`;
+        if (d.change === 'removed') return `<div class="diff-row diff-removed">- ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))}</div>`;
+        return `<div class="diff-row diff-changed">~ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))} &rarr; ${escapeHtml(fmtValue(d.after))}</div>`;
+    }).join('');
+    const diffHtml = a.diff_from
+        ? `<div class="approval-section"><div class="expand-label">Changed since ${escapeHtml(a.diff_from)}</div>${diff || '<div class="diff-row">no argument changes</div>'}</div>`
+        : '';
+    const expires = a.status === 'pending' && a.expires_at
+        ? `<span class="approval-expiry" data-expires="${Number(a.expires_at)}"></span>` : '';
+    const buttons = a.status === 'pending' ? `
+        <div class="approval-actions">
+            <button class="btn-approve" data-answer="true">Approve</button>
+            <button class="btn-deny" data-answer="false">Deny</button>
+        </div>` : '';
+    const outcome = a.status !== 'pending'
+        ? `<div class="approval-outcome">${a.reason === 'timeout' ? 'No answer in time, denied' : (a.status === 'approved' ? 'Approved' : 'Denied')}${a.resolved_by && a.reason !== 'timeout' ? ' by ' + escapeHtml(a.resolved_by === 'session' ? 'this dashboard session' : a.resolved_by) : ''}${a.note ? ': ' + escapeHtml(a.note) : ''}</div>` : '';
+
+    card.innerHTML = `
+        <div class="approval-head">
+            <span class="approval-status status-${escapeHtml(a.status)}">${approvalStatusLabel(a)}</span>
+            <span class="decision-tool">${escapeHtml(a.tool_name || '')}${a.agent ? ' (' + escapeHtml(a.agent) + ')' : ''}</span>
+            ${expires}
+        </div>
+        <div class="decision-rule">Policy rule: ${escapeHtml(a.policy_rule_id || '')} &middot; ${escapeHtml(a.approval_id)}</div>
+        <div class="approval-section">${args || '<div class="approval-arg">no arguments</div>'}</div>
+        ${diffHtml}
+        ${outcome}
+        ${buttons}`;
+    card.querySelectorAll('button[data-answer]').forEach(btn => {
+        btn.addEventListener('click', () => answerApproval(a.approval_id, btn.dataset.answer === 'true', card));
+    });
+    tickApprovalExpiry();
+
+    const decision = document.querySelector(`.decision-card[data-approval-id="${CSS.escape(a.approval_id)}"] .decision-action`);
+    if (decision && a.status !== 'pending') decision.textContent = approvalStatusLabel(a);
+}
+
+async function answerApproval(id, approve, card) {
+    card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    try {
+        const resp = await fetch(`${BASE_PATH}/api/approvals/${encodeURIComponent(id)}`, {
+            method: 'POST', headers: apiHeaders(), body: JSON.stringify({ approve }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok || resp.status === 409) {
+            renderApproval(data);
+        } else {
+            card.querySelector('.approval-outcome')?.remove();
+            card.insertAdjacentHTML('beforeend', `<div class="approval-outcome approval-error">${escapeHtml(data.detail || data.error || 'HTTP ' + resp.status)}</div>`);
+            card.querySelectorAll('button').forEach(b => { b.disabled = false; });
+        }
+    } catch (e) {
+        card.querySelectorAll('button').forEach(b => { b.disabled = false; });
+    }
+}
+
+function tickApprovalExpiry() {
+    const now = Date.now() / 1000;
+    document.querySelectorAll('.approval-expiry[data-expires]').forEach(el => {
+        const left = Math.max(0, Math.round(Number(el.dataset.expires) - now));
+        el.textContent = left > 0 ? `${left}s left` : 'expiring';
+    });
+}
+setInterval(tickApprovalExpiry, 1000);
+
+async function loadApprovals() {
+    try {
+        const q = IS_APP_SESSION ? `?session=${encodeURIComponent(SESSION_ID)}` : '';
+        const resp = await fetch(`${BASE_PATH}/api/approvals${q}`, { headers: apiHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        (data.approvals || []).forEach(renderApproval);
+    } catch (e) {
+        console.error('Failed to load approvals:', e);
     }
 }
 
@@ -329,6 +462,7 @@ function renderDecisionCard(event) {
     const card = document.createElement('div');
     card.className = `event-card decision-card ${isPending ? 'pending' : (isBlocked ? 'flagged' : 'allowed')}`;
     if (event.decision_id) card.dataset.decisionId = event.decision_id;
+    if (event.approval_id) card.dataset.approvalId = event.approval_id;
     card.dataset.source = event.details?._source || '';
     card.dataset.action = event.action || '';
     card.dataset.threat = event.threat_level || 'none';
@@ -601,6 +735,7 @@ function onAppSelect() {
 // ---- App Management ----
 
 async function loadTargets() {
+    if (IS_APP_SESSION) return;  // API-key sessions have no observed targets
     try {
         const resp = await fetch(`${BASE_PATH}/api/targets`, { headers: apiHeaders() });
         const data = await resp.json();
@@ -930,3 +1065,4 @@ function switchStack(stack) {
 loadTaxonomy();
 connectWebSocket();
 loadTargets();
+loadApprovals();

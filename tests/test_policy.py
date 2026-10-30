@@ -108,7 +108,7 @@ def test_bare_host_under_url_key_is_checked(client, policy_file):
 
 def test_allowlist_not_fooled_by_userinfo_or_backslash(client, policy_file):
     policy_file(TEST_POLICY)
-    # Host is evil.example: not in the allowlist, so approval is required (403 until issue 3).
+    # Host is evil.example: not in the allowlist, so approval is required.
     assert check(client, "http.fetch", {"url": "https://api.github.com@evil.example/"}).json()["rule_id"] == "fetch-other"
     assert check(client, "http.fetch", {"url": "https://evil.example\\@api.github.com/"}).json()["rule_id"] == "fetch-other"
 
@@ -127,7 +127,7 @@ def test_require_approval_is_not_allowed(client, policy_file):
     policy_file(TEST_POLICY)
     resp = check(client, "http.fetch", {"url": "https://example.org/"})
     assert resp.json()["effect"] == "require_approval"
-    assert resp.status_code in (202, 403)  # 202 once the approval queue (issue 3) is in place
+    assert resp.status_code == 202
     assert resp.json()["blocked"] is True
 
 

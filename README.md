@@ -8,7 +8,7 @@ A policy decision point for AI agent tool calls, plus a live dashboard. Agents (
 
 ## What it does
 
-- **Decides** (`POST /api/check`): evaluates a structured tool call `{tool, arguments, agent}` against `policies/default.yaml` and returns allow (200) or deny (403). Your agent runtime must call it before running the tool and honor the answer; GuardianAI does not sit in the call path by itself.
+- **Decides** (`POST /api/check`): evaluates a structured tool call `{tool, arguments, agent}` against `policies/default.yaml` and returns allow (200), deny (403) or pending human approval (202). Your agent runtime must call it before running the tool and honor the answer; GuardianAI does not sit in the call path by itself.
 - **Observes** (guardian-tap): connects to your app's `/ws-observe` endpoint, finds tool calls inside every event it sees (any event type, OpenAI and Anthropic tool-call shapes included) and runs the same policy over them. These decisions are shown as `OBSERVED`/`FLAGGED`; the traffic has already happened.
 
 **Left panel**: live feed of agent activity. **Right panel**: decisions with the policy rule that decided, the detectors that fired, severity, OWASP categories and remediation.
@@ -35,7 +35,7 @@ The policy is a YAML file: `policies/default.yaml` by default, or the path in `G
 
 - Rules are checked in order; the first rule whose `match` holds decides. Nothing matching means `default_effect` (deny in the shipped policy, so unknown tools are refused).
 - `match` can test the tool name (globs), the MCP server, the agent, argument predicates (`host_in`, `host_not_in_private_ranges`, `path_prefix`, `max_length`, `regex`, `equals`, `one_of`, `exists`, with `*` in paths), which detectors fired and at what severity, and `not`/`any` combinations.
-- Effects are `allow`, `deny` and `require_approval`. In this version `require_approval` is refused like a deny (403, `effect: "require_approval"`); there is no approval queue yet.
+- Effects are `allow`, `deny` and `require_approval` (see Approvals below).
 - `untrusted_inputs` names argument paths that carry content the agent did not write; detectors apply their weaker signals only there.
 - `mode: monitor` computes and shows every decision but lets every call through.
 - The file is reloaded on change without a restart. An invalid edit is rejected, the last good policy stays in force, and `GET /api/policy` reports the error. An invalid policy at startup stops the server from starting.
@@ -52,11 +52,31 @@ curl -s -X POST localhost:8000/api/check \
   -d '{"tool": {"name": "http.fetch"}, "arguments": {"url": "http://[::1]:8080/admin"}, "agent": {"id": "researcher"}}'
 ```
 
-The response carries `effect`, `blocked`, `enforced`, `rule_id`, `reasons`, `matched_detectors`, `matches` (each with severity, OWASP ids, evidence paths and `blocking`), both OWASP ids for the decision, and the policy version and sha256. HTTP 200 means allow; 403 means deny or require_approval.
+The response carries `effect`, `blocked`, `enforced`, `rule_id`, `reasons`, `matched_detectors`, `matches` (each with severity, OWASP ids, evidence paths and `blocking`), both OWASP ids for the decision, and the policy version and sha256. HTTP 200 means allow, 403 deny, 202 waiting for a human, 429 too many approvals already waiting (refused).
 
 The older shapes still work: `{"content": "..."}` is checked as the tool `guardian.content` and `{"event": {"type": "...", "data": {...}}}` as `guardian.event.<type>`. Matches below `BLOCK_THRESHOLD` are listed with `"blocking": false`.
 
 **Authentication.** With `GUARDIAN_API_KEYS` unset, `/api/check` is open demo behaviour: sessions come from `X-Session-Id` (at most 1000 are kept, least recently used evicted), and the `agent` in the body is self-reported, so a policy rule on `agent` is a label, not a control. With `GUARDIAN_API_KEYS=billing=<key>,ops=<key>` set, every call needs `Authorization: Bearer <key>` (401 otherwise), the agent identity used for `agent:` rules is the key's name, and decisions go to the dashboard session `app:<name>`, which a browser can only watch with `?token=<that key or an approver key>`. Client session ids starting with `app:` are rejected.
+
+## Approvals
+
+When a rule says `require_approval` (and the policy is in enforce mode), `/api/check` answers 202:
+
+```json
+{"status": "pending", "approval_id": "apr_...", "poll_url": "/api/approvals/apr_...", "expires_at": 1793373576.4, "effect": "require_approval", "rule_id": "approve-deploys", ...}
+```
+
+The caller must not run the tool yet. It polls `GET /api/approvals/{id}?wait=30` (held open up to 60 s until something changes). A human answers on the dashboard's Approvals lane, which shows the arguments, what changed since the previous approval for the same tool, the policy rule and a countdown, or with `POST /api/approvals/{id}` and `{"approve": true, "note": "..."}`. Once the status is `approved`, the caller sends the identical call to `/api/check` again and gets 200.
+
+- **Bound to the exact call.** An approval covers one session, one caller and `sha256` of the tool, server and canonical JSON arguments. Changing any argument opens a new approval; retrying the same call while it is pending joins the existing one.
+- **Single use by default.** An approval lets one identical call through, and that call must come within the rule's timeout after the approval. `approval.grant_ttl_seconds` on a rule lets identical calls through for that window instead.
+- **Fails closed.** No answer within `approval.timeout_seconds` (policy default, or per rule) resolves as `denied` with reason `timeout`. Answering after that returns 409.
+- **Who may answer.** With `GUARDIAN_APPROVER_KEYS` set, only a request with an approver key (`Authorization: Bearer`) can answer. Without approver keys, approvals for API-key sessions (`app:<name>`) cannot be answered at all and time out, so an agent's own key never approves its own call. In open demo mode (no keys) anyone with the session id can answer, which includes the agent itself: a real deployment needs approver keys, or SSO in front of these endpoints. To watch and answer an API-key session in the dashboard, open `/?session=app:<name>&token=<approver key>`.
+- **Storage.** Approvals live in process memory (`backend/approvals/store.py`, behind an `ApprovalStore` interface): they are lost on restart and not shared between processes. At most 100 can wait per session and 10,000 in total; beyond that the call is refused with 429.
+
+Dashboard event streams are bounded (1000 events per browser); a browser that stops reading loses its oldest events.
+
+![Approvals lane](docs/images/approvals-lane.png)
 
 ## Connect Your App
 
@@ -93,6 +113,7 @@ That's it. Your app now exposes a `/ws-observe` endpoint that GuardianAI connect
 - **Generic event classification**: Works with any agent system (WebSocket, SSE, REST JSON)
 - **Health check verification**: Validates guardian-tap installation before connecting
 - **Policy as code**: one YAML file decides, reloaded on change
+- **Human approvals**: Approve/Deny on the dashboard, bound to the exact arguments, fail closed on timeout
 - **Expandable flagged cards**: Click to see OWASP context, remediation steps, and raw event data
 - **App and event filtering**: Filter by connected app or event category
 - **Rolling summary**: Real-time stats with per-app breakdowns
@@ -112,7 +133,8 @@ GuardianAI Server (FastAPI)
     |-- WebSocket tap client (passive observer, decisions are observed only)
     |-- Detectors (backend/guardian/rules.py)
     |-- Policy engine + hot-reloaded YAML policy (backend/policy)
-    |-- POST /api/check (policy decision point: 200 allow, 403 deny)
+    |-- POST /api/check (policy decision point: 200 allow, 403 deny, 202 approval)
+    |-- Approval queue (in memory) + /api/approvals
     |-- Per-session event bus
     |-- Supabase usage logging
     |

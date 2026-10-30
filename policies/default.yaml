@@ -40,7 +40,7 @@
 
 version: 1
 
-# enforce: deny and require_approval stop the call (HTTP 403 / 202).
+# enforce: deny stops the call (HTTP 403); require_approval holds it for a human (HTTP 202).
 # monitor: decisions are computed, logged and shown, but every call is let through.
 mode: enforce
 

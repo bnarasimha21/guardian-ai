@@ -75,6 +75,32 @@ class DecisionEvent(BaseModel):
     approval_id: str = ""
 
 
+class ApprovalEvent(BaseModel):
+    """A human approval changed state: pending, approved, denied or used."""
+    type: str = "approval"
+    timestamp: float = Field(default_factory=time.time)
+    change: str              # pending | approved | denied | used
+    approval_id: str
+    status: str              # pending | approved | denied
+    reason: str = ""
+    note: str = ""
+    tool_name: str = ""
+    server: Optional[str] = None
+    agent: str = ""
+    policy_rule_id: str = ""
+    decision_id: str = ""
+    arguments_sha256: str = ""
+    arguments: dict = Field(default_factory=dict)   # flattened, values truncated
+    diff_from: str = ""
+    diff: list = Field(default_factory=list)        # [{path, change, before?, after?}]
+    created_at: float = 0
+    expires_at: float = 0
+    resolved_at: Optional[float] = None
+    resolved_by: str = ""
+    grant_valid_until: Optional[float] = None
+    uses: int = 0
+
+
 class GuardianSummaryEvent(BaseModel):
     """Rolling summary of guardian evaluation stats."""
     type: str = "guardian_summary"

@@ -10,9 +10,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import auth, netguard
+from backend.approvals import (
+    APPROVED, arguments_sha256, ApprovalCapacityError, ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval,
+)
 from backend.config import settings
 from backend.events.bus import EventBus
-from backend.events.models import AgentActivityEvent, StatusEvent
+from backend.events.models import AgentActivityEvent, ApprovalEvent, StatusEvent
 from backend.guardian.middleware import Guardian
 from backend.guardian.schema import CheckRequest, RequestError, ToolCall, to_tool_call
 from backend.guardian.taxonomy import taxonomy_payload
@@ -34,7 +37,13 @@ async def lifespan(app: FastAPI):
     _policy_store()
     _api_keys()
     _approver_keys()
-    yield
+    store = InMemoryApprovalStore()
+    store.add_listener(_on_approval_change)
+    app.state.approvals = store
+    try:
+        yield
+    finally:
+        await store.close()
 
 
 app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan)
@@ -44,6 +53,43 @@ app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lif
 app.state.resolver = netguard.system_resolve
 app.state.verify_transport = None
 app.state.policy_store = None
+app.state.approvals = None
+
+
+def _approvals() -> ApprovalStore:
+    store = getattr(app.state, "approvals", None)
+    if store is None:
+        store = InMemoryApprovalStore()
+        store.add_listener(_on_approval_change)
+        app.state.approvals = store
+    return store
+
+
+async def _on_approval_change(approval: PendingApproval, change: str) -> None:
+    """Show every approval state change on the session's dashboard."""
+    d = approval.to_dict()
+    await _get_session(approval.session)["bus"].emit(ApprovalEvent(
+        change=change,
+        approval_id=approval.id,
+        status=approval.status,
+        reason=approval.reason,
+        note=approval.note,
+        tool_name=approval.tool,
+        server=approval.server,
+        agent=approval.agent,
+        policy_rule_id=approval.rule_id,
+        decision_id=approval.decision_id,
+        arguments_sha256=approval.arguments_sha256,
+        arguments=approval.arguments_preview,
+        diff_from=approval.diff_from,
+        diff=approval.diff,
+        created_at=approval.created_at,
+        expires_at=approval.expires_at,
+        resolved_at=approval.resolved_at,
+        resolved_by=approval.resolved_by,
+        grant_valid_until=d["grant_valid_until"],
+        uses=approval.uses,
+    ))
 
 
 def _policy_store() -> PolicyStore:
@@ -342,8 +388,10 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
 
     * allow: 200 ``{"effect": "allow", "blocked": false, ...}``
     * deny: 403 ``{"effect": "deny", "blocked": true, "rule_id": ..., "reasons": [...]}``
-    * require_approval: 403 with ``effect: require_approval`` (the caller must
-      not run the tool; see the approvals API)
+    * require_approval: 202 ``{"status": "pending", "approval_id", "poll_url"}``.
+      The caller must not run the tool yet. Poll ``GET /api/approvals/{id}?wait=30``;
+      once it says ``approved``, send the identical call again and it returns
+      200 (a single-use grant unless the rule sets ``grant_ttl_seconds``).
 
     In monitor mode every call gets 200 and ``enforced: false``, with the
     effect the policy would have applied. Legacy ``{"content": ...}`` and
@@ -370,9 +418,16 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
     )
     source = principal or call.agent_name or req.source
     guardian = _get_session(sid)["guardian"]
-    await guardian.record(decision, call, source=source)
 
-    body = {
+    if decision.effect == "require_approval" and decision.enforced:
+        return await _approval_flow(decision, call, sid=sid, principal=principal, source=source, guardian=guardian)
+
+    await guardian.record(decision, call, source=source)
+    return _decision_response(decision, sid=sid, source=source, guardian=guardian)
+
+
+def _decision_body(decision) -> dict:
+    return {
         **decision.to_dict(),
         "threshold": settings.block_threshold,
         "matches": [
@@ -380,7 +435,12 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
             for m in decision.matches
         ],
     }
-    if decision.blocked:
+
+
+def _decision_response(decision, *, sid: str, source: str, guardian: Guardian, extra: dict | None = None,
+                       status_code: int | None = None) -> JSONResponse:
+    body = {**_decision_body(decision), **(extra or {})}
+    if decision.blocked and decision.effect == "deny":
         rule_name, owasp_llm, level, reason = _top_label(decision)
         asyncio.create_task(log_event(
             "threat_blocked",
@@ -393,7 +453,158 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
             total_events_checked=guardian._total_checked,
             total_blocked=guardian._total_blocked,
         ))
-    return JSONResponse(body, status_code=403 if decision.blocked else 200)
+    if status_code is None:
+        status_code = 403 if decision.blocked else 200
+    return JSONResponse(body, status_code=status_code)
+
+
+def _agent_key(call: ToolCall, principal: str | None) -> str:
+    """Who an approval is bound to: the API key name, else the self-reported agent."""
+    return principal or call.agent_id or call.agent_name or ""
+
+
+async def _approval_flow(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
+                         guardian: Guardian) -> JSONResponse:
+    """require_approval in enforce mode: reuse a grant, join a pending approval, or open one."""
+    store = _approvals()
+    agent = _agent_key(call, principal)
+    sha = arguments_sha256(call.name, call.server, call.arguments)
+    existing = await store.find(session=sid, agent=agent, sha256=sha)
+
+    if existing is not None and existing.status == APPROVED and await store.use(existing.id):
+        decision.effect = "allow"
+        decision.reasons.append(f"Approved by {existing.resolved_by or 'an approver'} (approval {existing.id})")
+        await guardian.record(decision, call, source=source, approval_id=existing.id)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, extra={
+            "status": "approved", "approval_id": existing.id, "arguments_sha256": sha,
+            "grant_valid_until": existing.grant_valid_until(),
+        })
+
+    if existing is not None and existing.status == "pending":
+        # Same call retried while a human is still deciding: no second card.
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={
+            "status": "pending", "approval_id": existing.id, "poll_url": f"/api/approvals/{existing.id}",
+            "expires_at": existing.expires_at, "arguments_sha256": sha,
+        })
+
+    settings_ = decision.approval
+    try:
+        approval = await store.create(
+            session=sid, agent=agent, tool=call.name, server=call.server, arguments=call.arguments,
+            decision=decision.to_dict(),
+            timeout_seconds=settings_.timeout_seconds if settings_ else 120,
+            grant_ttl_seconds=settings_.grant_ttl_seconds if settings_ else 0,
+        )
+    except ApprovalCapacityError as exc:
+        decision.effect = "deny"
+        decision.reasons.append(str(exc))
+        await guardian.record(decision, call, source=source)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=429)
+
+    await guardian.record(decision, call, source=source, approval_id=approval.id)
+    return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={
+        "status": "pending", "approval_id": approval.id, "poll_url": f"/api/approvals/{approval.id}",
+        "expires_at": approval.expires_at, "arguments_sha256": sha,
+    })
+
+
+# ---- Approvals ----
+#
+# Who may see and answer an approval:
+# * GUARDIAN_APPROVER_KEYS set: answering needs an approver key
+#   (Authorization: Bearer). Approver keys may also read any approval.
+# * Otherwise, for sessions owned by an API key (app:<name>) nobody can answer,
+#   so those approvals time out as denied. An app's own key never approves its
+#   own calls.
+# * Otherwise (open demo mode) anyone holding the session id may answer. The
+#   agent knows its session id too, so in demo mode an agent could approve
+#   itself: real deployments need GUARDIAN_APPROVER_KEYS, or SSO in front of
+#   these endpoints.
+
+
+def _approver(request: Request) -> str | None:
+    keys = _approver_keys()
+    if not keys:
+        return None
+    return auth.match_key(auth.bearer_token(request.headers.get("authorization")), keys)
+
+
+def _requester_session(request: Request) -> str | None:
+    """The session the caller speaks for: its API key's app session, or X-Session-Id."""
+    token = auth.bearer_token(request.headers.get("authorization"))
+    keys = _api_keys()
+    if keys and token:
+        name = auth.match_key(token, keys)
+        if name is not None:
+            return auth.APP_SESSION_PREFIX + name
+    header = request.headers.get("x-session-id")
+    if header is not None:
+        if header.startswith(auth.APP_SESSION_PREFIX) or len(header) > 200:
+            return None
+        return header
+    return None if keys else "default"
+
+
+async def _load_approval(approval_id: str, request: Request, *, write: bool) -> tuple[PendingApproval, str]:
+    approval = await _approvals().get(approval_id[:100])
+    not_found = HTTPException(status_code=404, detail="No such approval")
+    if approval is None:
+        raise not_found
+    approver = _approver(request)
+    if write:
+        if _approver_keys():
+            if approver is None:
+                raise HTTPException(status_code=401, detail="An approver key is required",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            return approval, approver
+        if approval.session.startswith(auth.APP_SESSION_PREFIX):
+            raise HTTPException(status_code=403,
+                                detail="Approvals for API-key sessions need GUARDIAN_APPROVER_KEYS")
+        if _requester_session(request) != approval.session:
+            raise not_found
+        return approval, "session"
+    if approver is not None:
+        return approval, approver
+    if _requester_session(request) != approval.session:
+        raise not_found
+    return approval, ""
+
+
+class ApprovalAnswer(BaseModel):
+    approve: bool
+    note: str = ""
+
+
+@app.get("/api/approvals")
+async def list_approvals(request: Request, status: str | None = None, session: str | None = None):
+    """Approvals of the caller's session (newest last). Approver keys may name any ``session``."""
+    if session is not None and _approver(request) is not None:
+        sid = session[:200]
+    else:
+        sid = _requester_session(request)
+    if sid is None:
+        raise HTTPException(status_code=401, detail="Identify the session (X-Session-Id or API key)")
+    items = await _approvals().list(session=sid, status=status)
+    return {"approvals": [a.to_dict() for a in items]}
+
+
+@app.get("/api/approvals/{approval_id}")
+async def get_approval(approval_id: str, request: Request, wait: float = 0):
+    """Approval state. ``?wait=N`` (up to 60 s) holds the request until it is resolved."""
+    approval, _ = await _load_approval(approval_id, request, write=False)
+    if wait > 0 and approval.status == "pending":
+        approval = await _approvals().wait(approval.id, min(float(wait), 60.0)) or approval
+    return approval.to_dict()
+
+
+@app.post("/api/approvals/{approval_id}")
+async def answer_approval(approval_id: str, answer: ApprovalAnswer, request: Request):
+    approval, by = await _load_approval(approval_id, request, write=True)
+    try:
+        approval = await _approvals().resolve(approval.id, approve=answer.approve, by=by, note=answer.note)
+    except ApprovalNotPending as exc:
+        return JSONResponse({"error": str(exc), **approval.to_dict()}, status_code=409)
+    return approval.to_dict()
 
 
 @app.get("/api/policy")
