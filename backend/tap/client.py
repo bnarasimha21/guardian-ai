@@ -9,6 +9,8 @@ from typing import Callable, Awaitable
 
 import websockets
 
+from backend.netguard import Resolver, TargetRejected, check_target_url
+
 logger = logging.getLogger(__name__)
 
 # Events that carry meaningful data worth evaluating
@@ -42,6 +44,10 @@ async def observe_agent(
     on_event: Callable[[str, dict], Awaitable[None]],
     on_connect: Callable[[str], Awaitable[None]] | None = None,
     on_disconnect: Callable[[str], Awaitable[None]] | None = None,
+    *,
+    allow_private: bool = False,
+    resolver: Resolver | None = None,
+    on_reject: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """Connect to a target app's observer WebSocket and stream events.
 
@@ -52,12 +58,37 @@ async def observe_agent(
         ws_url: WebSocket URL of the observer endpoint.
         on_event: Async callback(app_name, event_dict) for each event.
         on_disconnect: Async callback(app_name) on disconnect.
+        allow_private: Permit loopback and private addresses (local development).
+        resolver: DNS resolver override (tests).
+        on_reject: Async callback(app_name, message) when the URL is refused by
+            the address check; the observer stops instead of retrying.
+
+    The URL is re-checked before every connection attempt and the connection is
+    pinned to the address that was checked, so a DNS change cannot turn a
+    registered public target into a request to an internal address.
     """
     while True:
         try:
-            logger.info("[%s] Connecting to %s", name, ws_url)
+            target = await check_target_url(ws_url, allow_private=allow_private, resolver=resolver)
+        except TargetRejected as exc:
+            if exc.code == "dns_failed":
+                # Transient: retry like any other connection failure.
+                logger.warning("[%s] %s Retrying in 5s...", name, exc.message)
+                if on_disconnect:
+                    await on_disconnect(name)
+                await asyncio.sleep(5)
+                continue
+            logger.error("[%s] Refusing to observe %s: %s", name, ws_url, exc.message)
+            if on_reject:
+                await on_reject(name, exc.message)
+            return
+        try:
+            logger.info("[%s] Connecting to %s (%s)", name, ws_url, target.pinned_ip)
             async with websockets.connect(
                 ws_url,
+                host=target.pinned_ip,
+                port=target.port,
+                proxy=None,
                 open_timeout=15,
                 close_timeout=5,
                 max_size=2**22,

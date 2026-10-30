@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     port: int = 8000
     # Lowest severity that /api/check refuses: low, medium, high or critical.
     block_threshold: str = "high"
+    # Let /api/targets and /api/targets/verify connect to loopback and private
+    # addresses. Off by default because the hosted demo must never fetch
+    # internal URLs on behalf of a browser; turn it on for local development.
+    allow_private_targets: bool = False
 
     @field_validator("block_threshold", mode="before")
     @classmethod

@@ -125,13 +125,8 @@
                     </div>
                     <h3 class="empty-title">Guardian standing by</h3>
                     <p class="empty-desc">Security decisions will appear here as your connected apps are used.</p>
-                    <div class="empty-rules">
-                        <span class="empty-rule-chip">LLM01 Prompt Injection</span>
-                        <span class="empty-rule-chip">LLM02 Insecure Output</span>
-                        <span class="empty-rule-chip">LLM06 Data Disclosure</span>
-                        <span class="empty-rule-chip">LLM07 Excessive Agency</span>
-                    </div>
-                    <p class="empty-hint">8 rules across OWASP LLM Top 10</p>
+                    <div class="empty-rules" id="ruleChips"></div>
+                    <p class="empty-hint" id="ruleHint">Mapped to OWASP LLM Top 10 (2025) and Agentic Top 10 (2026)</p>
                 </div>
             </div>
         </section>
@@ -228,9 +223,9 @@ attachObserver(app);</div>
     <footer class="footer">
         <span>Powered by guardian-tap</span>
         <span class="footer-sep">|</span>
-        <span>OWASP LLM Top 10 Security Rules</span>
+        <span>OWASP LLM Top 10 (2025) and Agentic Top 10 (2026)</span>
     </footer>
 
-    <script src="static/app.js?v=2"></script>
+    <script src="static/app.js?v=3"></script>
 </body>
 </html>

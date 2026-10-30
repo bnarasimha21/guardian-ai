@@ -1,6 +1,6 @@
 # GuardianAI
 
-Real-time agent defense monitor. Passively observes AI agent tool calls across multiple apps and evaluates them against OWASP LLM Top 10 security rules. Observed traffic is flagged; apps that want enforcement call the `/api/check` endpoint, which blocks content that fails the checks.
+Real-time agent defense monitor. Passively observes AI agent tool calls across multiple apps and evaluates them against regex detectors mapped to the OWASP Top 10 for LLM Applications (2025) and the OWASP Top 10 for Agentic Applications (2026). Observed traffic is flagged; apps that want enforcement call the `/api/check` endpoint, which blocks content that fails the checks.
 
 ## Screenshots
 
@@ -8,7 +8,7 @@ Real-time agent defense monitor. Passively observes AI agent tool calls across m
 
 ## What it does
 
-GuardianAI connects to your AI agent applications via WebSocket and monitors every agent action in real-time. It evaluates tool calls, LLM outputs, and API requests against 8 security rules mapped to the OWASP LLM Top 10.
+GuardianAI connects to your AI agent applications via WebSocket and shows their events in real time. It checks events of known types (tool calls, LLM outputs, agent results) against 8 detector rules mapped to both OWASP lists.
 
 **Left panel**: Live feed of agent activity (queries, planning, generation, evaluation, synthesis)
 
@@ -16,16 +16,16 @@ GuardianAI connects to your AI agent applications via WebSocket and monitors eve
 
 ## Security Rules
 
-| Rule | OWASP | Detects |
-|------|-------|---------|
-| Prompt Injection | LLM01 | Instruction overrides, role hijacking, DAN patterns, guardrail bypass |
-| Sensitive Data Leak | LLM06 | API keys (OpenAI, AWS, GitHub, Slack, DO), JWTs, private keys |
-| Data Exfiltration | LLM06 | webhook.site, ngrok, raw IPs, curl/wget to external URLs |
-| SSRF | LLM06 | localhost, private networks, cloud metadata endpoints |
-| Dangerous Code | LLM02 | rm -rf, reverse shells, eval/exec, privilege escalation |
-| Injection | LLM02 | SQL injection, XSS (script tags, event handlers), command injection |
-| Excessive Agency | LLM07 | Real deployments via terraform/kubectl/docker/aws/gcloud |
-| Eval Manipulation | LLM05 | Anomalous evaluation scores below 2/10 |
+| Rule | OWASP LLM 2025 | OWASP Agentic 2026 | Detects |
+|------|----------------|--------------------|---------|
+| Prompt Injection | LLM01 Prompt Injection | ASI01 Agent Goal Hijack | Instruction overrides, role hijacking, DAN patterns, guardrail bypass |
+| Sensitive Data Leak | LLM02 Sensitive Information Disclosure | ASI03 Identity and Privilege Abuse | API keys (OpenAI, AWS, GitHub, Slack, DO), JWTs, private keys |
+| Data Exfiltration | LLM02 Sensitive Information Disclosure | ASI02 Tool Misuse and Exploitation | webhook.site, ngrok, raw IPs, curl/wget to external URLs |
+| SSRF | LLM05 Improper Output Handling | ASI02 Tool Misuse and Exploitation | localhost, private networks, cloud metadata endpoints |
+| Dangerous Code | LLM05 Improper Output Handling | ASI05 Unexpected Code Execution | rm -rf, reverse shells, eval/exec, privilege escalation |
+| Injection | LLM05 Improper Output Handling | ASI02 Tool Misuse and Exploitation | SQL injection, XSS (script tags, event handlers), command injection |
+| Excessive Agency | LLM06 Excessive Agency | ASI02 Tool Misuse and Exploitation | Real deployments via terraform/kubectl/docker/aws/gcloud |
+| Eval Manipulation | none (anomaly signal) | none | Anomalous evaluation scores below 2/10 |
 
 ## Flagging vs blocking
 
@@ -93,7 +93,7 @@ Your App (FastAPI/Express)
 GuardianAI Server (FastAPI)
     |
     |-- WebSocket tap client (passive observer)
-    |-- Guardian engine (8 OWASP rules)
+    |-- Guardian engine (8 detector rules)
     |-- POST /api/check (enforcing: 403 when blocked)
     |-- Per-session event bus
     |-- Supabase usage logging
@@ -112,7 +112,21 @@ pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open http://localhost:8000 and click "Connect App" to get started.
+Open http://localhost:8000 and click "Connect App" to get started. To observe an
+app running on your own machine (`ws://localhost:...`), start GuardianAI with
+`ALLOW_PRIVATE_TARGETS=true`; by default it refuses to connect to loopback,
+private, link-local and cloud metadata addresses.
+
+## Tests
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite runs offline: DNS, outbound HTTP and Supabase are replaced in
+`tests/conftest.py`.
 
 ## Environment Variables
 
@@ -120,6 +134,7 @@ Open http://localhost:8000 and click "Connect App" to get started.
 HOST=0.0.0.0
 PORT=8000
 BLOCK_THRESHOLD=high                              # lowest severity /api/check blocks: low, medium, high, critical
+ALLOW_PRIVATE_TARGETS=false                       # let targets point at loopback/private addresses (local dev only)
 SUPABASE_URL=https://your-project.supabase.co    # optional, for usage logging
 SUPABASE_ANON_KEY=your-anon-key                   # optional, for usage logging
 ```

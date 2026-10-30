@@ -7,6 +7,7 @@ from backend.events.models import SEVERITY_ORDER, DecisionAction, DecisionEvent,
 
 from .models import ThreatMatch
 from .rules import ALL_RULES, ThreatRule
+from .taxonomy import agentic_label, llm_label
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +16,6 @@ logger = logging.getLogger(__name__)
 MAX_TRACKED_SOURCES = 100
 OTHER_SOURCE = "other"
 
-OWASP_LABELS = {
-    "LLM01": "Prompt Injection",
-    "LLM02": "Insecure Output Handling",
-    "LLM05": "Supply Chain Vulnerabilities",
-    "LLM06": "Sensitive Information Disclosure",
-    "LLM07": "Excessive Agency",
-}
 
 
 class Guardian:
@@ -90,7 +84,6 @@ class Guardian:
                     app_stats["by_rule"][match.rule_name] = app_stats["by_rule"].get(match.rule_name, 0) + 1
                     app_stats["by_severity"][match.threat_level.value] = app_stats["by_severity"].get(match.threat_level.value, 0) + 1
 
-                owasp_label = OWASP_LABELS.get(match.owasp_id, "")
                 await self.event_bus.emit(
                     DecisionEvent(
                         event_type=event_type,
@@ -100,8 +93,11 @@ class Guardian:
                         rule_name=match.rule_name,
                         reason=match.reason,
                         threat_level=match.threat_level,
-                        owasp_id=match.owasp_id,
-                        owasp_label=owasp_label,
+                        owasp_id=match.owasp_llm,
+                        owasp_label=llm_label(match.owasp_llm),
+                        owasp_llm=match.owasp_llm,
+                        owasp_agentic=match.owasp_agentic,
+                        owasp_agentic_label=agentic_label(match.owasp_agentic),
                         details=_safe_details(data),
                     )
                 )

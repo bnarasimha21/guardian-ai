@@ -12,6 +12,8 @@ from backend.config import settings
 from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, StatusEvent
 from backend.guardian.middleware import Guardian, is_blocking
+from backend.guardian.taxonomy import taxonomy_payload
+from backend import netguard
 from backend.targets import session_store
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
 from backend.usage_logger import log_event
@@ -20,6 +22,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor")
+
+# Outbound hooks. Tests replace these to run offline: the resolver maps hostnames
+# to addresses, and the transport answers the verify health check.
+app.state.resolver = netguard.system_resolve
+app.state.verify_transport = None
 
 # Per-session state: event bus, guardian, observer tasks
 _sessions: dict[str, dict] = {}
@@ -134,11 +141,11 @@ def _make_event_handler(session_id: str):
                     session_id=session_id,
                     app_name=app_name,
                     rule_name=match.rule_name,
-                    owasp_id=match.owasp_id,
+                    owasp_id=match.owasp_llm,
                     threat_level=match.threat_level.value,
                     reason=match.reason,
                     total_events_checked=guardian._total_checked,
-                    total_blocked=guardian._total_flagged,
+                    total_blocked=guardian._total_blocked,
                 ))
 
     return on_agent_event
@@ -165,9 +172,18 @@ def _start_observer(session_id: str, name: str, ws_url: str) -> None:
         await bus.emit(StatusEvent(status="target_disconnected", message=f"{app_name} disconnected"))
         asyncio.create_task(log_event("app_disconnected", session_id=session_id, app_name=app_name))
 
+    async def on_reject(app_name: str, message: str):
+        session_store.set_status(session_id, app_name, "rejected")
+        await bus.emit(StatusEvent(status="target_rejected", message=f"{app_name}: {message}"))
+
     async def _observe():
         session_store.set_status(session_id, name, "connecting")
-        await observe_agent(name, ws_url, on_event, on_connect, on_disconnect)
+        await observe_agent(
+            name, ws_url, on_event, on_connect, on_disconnect,
+            allow_private=settings.allow_private_targets,
+            resolver=app.state.resolver,
+            on_reject=on_reject,
+        )
 
     observers[name] = asyncio.create_task(_observe())
     logger.info("[session=%s] Observer started for %s", session_id[:8], name)
@@ -205,6 +221,12 @@ async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(No
     sid = x_session_id or "default"
     if session_store.get(sid, req.name):
         return JSONResponse({"error": f"Target '{req.name}' already exists"}, status_code=409)
+    try:
+        await netguard.check_target_url(
+            req.ws_url, allow_private=settings.allow_private_targets, resolver=app.state.resolver,
+        )
+    except netguard.TargetRejected as exc:
+        return JSONResponse({"error": exc.message, "code": exc.code}, status_code=400)
     target = session_store.add(sid, req.name, req.ws_url)
     _start_observer(sid, target.name, target.ws_url)
     return {"status": "added", "target": {"name": target.name, "ws_url": target.ws_url}}
@@ -266,28 +288,67 @@ async def check_content(req: CheckRequest, x_session_id: str | None = Header(Non
         "blocked": bool(blocking),
         "threshold": settings.block_threshold,
         "matches": [
-            {"rule": m.rule_name, "owasp_id": m.owasp_id, "threat_level": m.threat_level.value,
-             "reason": m.reason, "blocking": m in blocking}
+            {**m.to_dict(), "blocking": m in blocking}
             for m in matches
         ],
     }
+    if blocking:
+        top = blocking[0]
+        asyncio.create_task(log_event(
+            "threat_blocked",
+            session_id=sid,
+            app_name=req.source,
+            rule_name=top.rule_name,
+            owasp_id=top.owasp_llm,
+            threat_level=top.threat_level.value,
+            reason=top.reason,
+            total_events_checked=guardian._total_checked,
+            total_blocked=guardian._total_blocked,
+        ))
     return JSONResponse(body, status_code=403 if blocking else 200)
+
+
+@app.get("/api/taxonomy")
+async def taxonomy():
+    """OWASP LLM Top 10 (2025) and Agentic Top 10 (2026) labels, plus the rule mapping."""
+    return taxonomy_payload()
 
 
 @app.post("/api/targets/verify")
 async def verify_target(body: dict):
-    """Verify a target app has guardian-tap installed and is reachable."""
-    import httpx
+    """Verify a target app has guardian-tap installed and is reachable.
 
-    ws_url = body.get("ws_url", "")
-    if not ws_url:
+    The URL comes from an unauthenticated browser, so it is checked before any
+    request is made: ws/wss only, every resolved address must be public (unless
+    ALLOW_PRIVATE_TARGETS is set), redirects are refused, and both the health
+    check and the WebSocket handshake connect to the address that was checked.
+    """
+    import httpx
+    import websockets
+
+    ws_url = body.get("ws_url", "") if isinstance(body, dict) else ""
+    if not ws_url or not isinstance(ws_url, str):
         return JSONResponse({"error": "No URL provided"}, status_code=400)
 
-    health_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    try:
+        target = await netguard.check_target_url(
+            ws_url, allow_private=settings.allow_private_targets, resolver=app.state.resolver,
+        )
+    except netguard.TargetRejected as exc:
+        return {"status": "error", "code": exc.code, "message": exc.message}
+
+    request_kwargs: dict = {"headers": {"Host": target.host_header}}
+    if target.secure:
+        # TLS SNI and certificate verification use the real hostname even
+        # though the TCP connection goes to the pinned address.
+        request_kwargs["extensions"] = {"sni_hostname": target.host}
 
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(health_url)
+        async with httpx.AsyncClient(
+            timeout=10, follow_redirects=False, trust_env=False,
+            transport=app.state.verify_transport,
+        ) as client:
+            resp = await client.get(target.pinned_http_url(), **request_kwargs)
     except httpx.ConnectError:
         return {"status": "error", "code": "app_unreachable",
                 "message": "Cannot reach the app. Check that the URL is correct and the app is deployed."}
@@ -296,6 +357,11 @@ async def verify_target(body: dict):
                 "message": "The app took too long to respond. It may be starting up. Try again in a minute."}
     except Exception as e:
         return {"status": "error", "code": "connection_error", "message": f"Connection error: {e}"}
+
+    if resp.is_redirect:
+        return {"status": "error", "code": "redirect_refused",
+                "message": f"The app answered with a redirect (HTTP {resp.status_code}). GuardianAI does not follow "
+                           "redirects; register the final URL instead."}
 
     if resp.status_code == 404:
         return {"status": "error", "code": "guardian_tap_not_installed",
@@ -311,7 +377,7 @@ async def verify_target(body: dict):
         return {"status": "error", "code": "invalid_response",
                 "message": "The /ws-observe endpoint exists but did not return valid JSON. It may be conflicting with another route in your app."}
 
-    if not data.get("guardian_tap"):
+    if not isinstance(data, dict) or not data.get("guardian_tap"):
         return {"status": "error", "code": "not_guardian_tap",
                 "message": "The /ws-observe endpoint exists but is not a guardian-tap endpoint. It may be conflicting with another route in your app."}
 
@@ -320,8 +386,9 @@ async def verify_target(body: dict):
                 "message": "guardian-tap is installed, but WebSocket support is missing. For Python apps, run: pip install websockets (or add 'websockets' to requirements.txt) and redeploy."}
 
     try:
-        import websockets
-        async with websockets.connect(ws_url, open_timeout=5) as ws:
+        async with websockets.connect(
+            target.url, open_timeout=5, host=target.pinned_ip, port=target.port, proxy=None,
+        ) as ws:
             await ws.close()
     except Exception as e:
         return {"status": "error", "code": "websocket_failed",

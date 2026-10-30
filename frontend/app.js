@@ -24,6 +24,41 @@ function apiHeaders() {
     return { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID };
 }
 
+// ---- OWASP taxonomy (served by /api/taxonomy, never hard-coded here) ----
+
+let TAXONOMY = { owasp_llm: { items: {} }, owasp_agentic: { items: {} }, rules: {} };
+
+async function loadTaxonomy() {
+    try {
+        const resp = await fetch(`${BASE_PATH}/api/taxonomy`);
+        TAXONOMY = await resp.json();
+        renderRuleChips();
+    } catch (e) {
+        console.error('Failed to load taxonomy:', e);
+    }
+}
+
+function renderRuleChips() {
+    const wrap = document.getElementById('ruleChips');
+    if (!wrap) return;
+    const rules = Object.entries(TAXONOMY.rules || {}).filter(([, r]) => r.owasp_llm || r.owasp_agentic);
+    const seen = new Set();
+    const chips = [];
+    rules.forEach(([, r]) => {
+        const key = r.owasp_llm;
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        const label = TAXONOMY.owasp_llm.items[key]?.label || '';
+        chips.push(`<span class="empty-rule-chip">${escapeHtml(key)} ${escapeHtml(label)}</span>`);
+    });
+    wrap.innerHTML = chips.join('');
+    const hint = document.getElementById('ruleHint');
+    if (hint) {
+        const agentic = new Set(rules.map(([, r]) => r.owasp_agentic).filter(Boolean));
+        hint.textContent = `${rules.length} detectors mapped to ${seen.size} OWASP LLM 2025 and ${agentic.size} Agentic 2026 categories`;
+    }
+}
+
 // ---- WebSocket Connection ----
 
 function connectWebSocket() {
@@ -322,10 +357,14 @@ function renderDecisionCard(event) {
         threatHtml = '<span class="threat-level none">SAFE</span>';
     }
 
-    // OWASP badge
+    // OWASP badges: LLM Top 10 (2025) and Agentic Top 10 (2026)
     let owaspHtml = '';
-    if (event.owasp_id) {
-        owaspHtml = `<span class="owasp-badge" title="${escapeHtml(event.owasp_label || '')}">${escapeHtml(event.owasp_id)}</span>`;
+    const llmId = event.owasp_llm || event.owasp_id || '';
+    if (llmId) {
+        owaspHtml += `<span class="owasp-badge" title="${escapeHtml(owaspLabel('owasp_llm', llmId))}">${escapeHtml(llmId)}</span>`;
+    }
+    if (event.owasp_agentic) {
+        owaspHtml += `<span class="owasp-badge" title="${escapeHtml(owaspLabel('owasp_agentic', event.owasp_agentic))}">${escapeHtml(event.owasp_agentic)}</span>`;
     }
 
     // Rule name
@@ -359,8 +398,14 @@ function renderDecisionCard(event) {
     // Build expandable detail panel for flagged cards
     let expandHtml = '';
     if (isBlocked) {
-        const owaspInfo = getOwaspInfo(event.owasp_id);
         const remediation = getRemediation(event.rule_name);
+        const owaspSections = [['owasp_llm', llmId], ['owasp_agentic', event.owasp_agentic]]
+            .filter(([kind, id]) => id && getOwaspInfo(kind, id))
+            .map(([kind, id]) => `
+            <div class="expand-section">
+                <div class="expand-label">OWASP ${escapeHtml(id)}: ${escapeHtml(owaspLabel(kind, id))}</div>
+                <div class="expand-text">${escapeHtml(getOwaspInfo(kind, id))}</div>
+            </div>`).join('');
 
         expandHtml = `
         <div class="decision-expand" style="display:none">
@@ -368,14 +413,10 @@ function renderDecisionCard(event) {
                 <div class="expand-label">What happened</div>
                 <div class="expand-text">${escapeHtml(event.reason || '')}</div>
             </div>
-            ${owaspInfo ? `
-            <div class="expand-section">
-                <div class="expand-label">OWASP ${escapeHtml(event.owasp_id)}: ${escapeHtml(event.owasp_label || '')}</div>
-                <div class="expand-text">${owaspInfo}</div>
-            </div>` : ''}
+            ${owaspSections}
             <div class="expand-section">
                 <div class="expand-label">How to fix</div>
-                <div class="expand-text">${remediation}</div>
+                <div class="expand-text">${escapeHtml(remediation)}</div>
             </div>
             ${detailsHtml ? `
             <div class="expand-section">
@@ -457,7 +498,9 @@ function addTimelineNode(isBlocked) {
 
 function updateCounter(id, value) {
     const el = document.getElementById(id);
+    if (!el) return;
     const num = el.querySelector('.counter-num');
+    if (!num) return;
     num.textContent = value;
     num.style.transform = 'scale(1.3)';
     setTimeout(() => { num.style.transform = 'scale(1)'; }, 200);
@@ -681,6 +724,11 @@ function renderVerifyError(data) {
         'connection_error': 'Check the URL and your network connection.',
         'missing_fields': 'Enter both an app name and URL.',
         'register_failed': 'The app was verified but registration failed. Try again.',
+        'blocked_address': 'GuardianAI only connects to public addresses. For a local app, run GuardianAI yourself with <code>ALLOW_PRIVATE_TARGETS=true</code>.',
+        'invalid_scheme': 'Use an http(s) app URL; GuardianAI connects to its /ws-observe WebSocket.',
+        'invalid_url': 'Check the URL. Credentials in the URL are not supported.',
+        'dns_failed': 'The hostname did not resolve. Check for typos.',
+        'redirect_refused': 'Register the final URL your app redirects to (for example with or without www).',
     };
 
     const fix = fixes[data.code] || 'Check the URL and try again.';
@@ -813,29 +861,17 @@ function toggleExpand(headerEl) {
     if (arrow) arrow.textContent = isOpen ? '\u25BE' : '\u25B4';
 }
 
-function getOwaspInfo(id) {
-    const info = {
-        'LLM01': 'An attacker manipulates the LLM through crafted inputs, causing it to execute unintended actions. This can bypass safety measures, produce harmful outputs, or leak sensitive information.',
-        'LLM02': 'When an LLM generates output that is not properly validated or sanitized before being passed to downstream systems. This can lead to XSS, SQL injection, or command injection in connected components.',
-        'LLM05': 'Vulnerabilities in the supply chain of LLM components (training data, models, plugins) that can be exploited to manipulate model behavior or introduce backdoors.',
-        'LLM06': 'The LLM may reveal confidential information, proprietary algorithms, API keys, or other sensitive data through its responses. This can happen when sensitive data appears in training data or user prompts.',
-        'LLM07': 'An LLM-based system is granted excessive capabilities (file access, code execution, API calls) beyond what is needed, and an attacker exploits this to perform unauthorized actions.',
-    };
-    return info[id] || '';
+function owaspLabel(kind, id) {
+    return TAXONOMY[kind]?.items?.[id]?.label || '';
+}
+
+function getOwaspInfo(kind, id) {
+    return TAXONOMY[kind]?.items?.[id]?.description || '';
 }
 
 function getRemediation(ruleName) {
-    const fixes = {
-        'prompt_injection': 'Sanitize user inputs before passing to the LLM. Use input validation, system prompt hardening, and output filtering. Consider using a separate LLM call to detect injection attempts before processing.',
-        'sensitive_data_leak': 'Never include real credentials, API keys, or tokens in LLM prompts. Use placeholder values in examples. Add output scanning to redact patterns like sk-*, AKIA*, private keys before returning responses to users.',
-        'data_exfiltration': 'Block or allowlist outbound URLs that the agent can access. Never allow agents to send data to arbitrary external endpoints. Use egress filtering and monitor outbound connections.',
-        'ssrf': 'Validate and sanitize all URLs before making requests. Block access to internal/private IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x, localhost). Use URL allowlists for permitted external services.',
-        'dangerous_code': 'Run agent-generated code in sandboxed environments with restricted permissions. Never execute code with elevated privileges. Disable dangerous functions (eval, exec, os.system) in the execution environment.',
-        'injection': 'Use parameterized queries for database access. Sanitize all LLM outputs before rendering in HTML or passing to command interpreters. Apply Content Security Policy headers.',
-        'excessive_agency': 'Follow the principle of least privilege. Only grant agents the minimum permissions needed for their task. Require human approval for high-impact actions (deployments, deletions, infrastructure changes).',
-        'eval_manipulation': 'Monitor evaluation scores for anomalies. Validate that agent outputs meet quality thresholds. Use independent evaluation (separate LLM or rule-based checks) to verify results.',
-    };
-    return fixes[ruleName] || 'Review the flagged content and ensure your agent follows security best practices.';
+    return TAXONOMY.rules?.[ruleName]?.remediation
+        || 'Review the flagged content and the policy rule that matched it.';
 }
 
 // ---- Activity filter ----
@@ -866,5 +902,6 @@ function switchStack(stack) {
 }
 
 // ---- Init ----
+loadTaxonomy();
 connectWebSocket();
 loadTargets();

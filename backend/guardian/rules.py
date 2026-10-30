@@ -2,7 +2,7 @@
 
 Generic rules that work with ANY agent system. Rules inspect event data
 by shape (text content, URLs, patterns) not by specific event type names.
-Each rule maps to an OWASP LLM Top 10 category for professional reporting.
+OWASP mappings (LLM Top 10 2025 and Agentic Top 10 2026) live in taxonomy.py.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ class ThreatRule(ABC):
 
     name: str
     description: str
-    owasp_id: str = ""  # OWASP LLM Top 10 mapping
 
     @abstractmethod
     def check(self, event: dict) -> list[ThreatMatch]:
@@ -49,11 +48,10 @@ def _extract_all_text(data: dict, max_depth: int = 3) -> str:
 
 class PromptInjectionRule(ThreatRule):
     """Detects prompt injection patterns in any text content.
-    OWASP LLM01: Prompt Injection."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "prompt_injection"
     description = "Prompt injection attempt detected"
-    owasp_id = "LLM01"
 
     PATTERNS = [
         (r"ignore\s+(all\s+)?previous\s+instructions", "instruction override"),
@@ -84,18 +82,16 @@ class PromptInjectionRule(ThreatRule):
                     reason=f"Prompt injection: {desc}",
                     threat_level=ThreatLevel.CRITICAL,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class SensitiveDataLeakRule(ThreatRule):
     """Detects API keys, secrets, or credentials in any event content.
-    OWASP LLM06: Sensitive Information Disclosure."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "sensitive_data_leak"
     description = "Sensitive data exposed in agent output"
-    owasp_id = "LLM06"
 
     PATTERNS = [
         (r"sk-[a-zA-Z0-9]{20,}", "OpenAI API key (sk-*)"),
@@ -126,18 +122,16 @@ class SensitiveDataLeakRule(ThreatRule):
                     reason=f"Sensitive data leak: {desc}",
                     threat_level=ThreatLevel.HIGH,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class DataExfiltrationRule(ThreatRule):
     """Detects attempts to send data to suspicious external endpoints.
-    OWASP LLM06: Sensitive Information Disclosure."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "data_exfiltration"
     description = "Data exfiltration attempt via external endpoint"
-    owasp_id = "LLM06"
 
     PATTERNS = [
         (r"webhook\.site", "webhook.site exfil endpoint"),
@@ -165,18 +159,16 @@ class DataExfiltrationRule(ThreatRule):
                     reason=f"Data exfiltration risk: {desc}",
                     threat_level=ThreatLevel.CRITICAL,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class SSRFRule(ThreatRule):
     """Detects Server-Side Request Forgery patterns.
-    OWASP LLM06: Sensitive Information Disclosure."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "ssrf"
     description = "Server-Side Request Forgery attempt"
-    owasp_id = "LLM06"
 
     PATTERNS = [
         (r"https?://localhost[:/]", "localhost access"),
@@ -201,18 +193,16 @@ class SSRFRule(ThreatRule):
                     reason=f"SSRF attempt: {desc}",
                     threat_level=ThreatLevel.HIGH,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class DangerousCodeRule(ThreatRule):
     """Detects dangerous commands, code execution, and system access.
-    OWASP LLM02: Insecure Output Handling."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "dangerous_code"
     description = "Dangerous command or code execution pattern"
-    owasp_id = "LLM02"
 
     PATTERNS = [
         (r"\brm\s+(-rf|-fr|--recursive)", "destructive file deletion"),
@@ -244,18 +234,16 @@ class DangerousCodeRule(ThreatRule):
                     reason=f"Dangerous operation: {desc}",
                     threat_level=ThreatLevel.HIGH,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class InjectionRule(ThreatRule):
     """Detects SQL injection, XSS, and command injection patterns in outputs.
-    OWASP LLM02: Insecure Output Handling."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "injection"
     description = "Injection pattern detected in agent output"
-    owasp_id = "LLM02"
 
     PATTERNS = [
         # SQL injection
@@ -286,18 +274,16 @@ class InjectionRule(ThreatRule):
                     reason=f"Injection pattern: {desc}",
                     threat_level=ThreatLevel.HIGH,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class UnauthorizedScopeRule(ThreatRule):
     """Detects when an agent drifts outside expected scope.
-    OWASP LLM07: Excessive Agency."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "excessive_agency"
     description = "Agent action exceeds expected scope"
-    owasp_id = "LLM07"
 
     PATTERNS = [
         (r"(?:execute|deploy|provision|create)\s+(?:the\s+)?(?:server|droplet|instance|cluster)", "real deployment attempt"),
@@ -322,18 +308,16 @@ class UnauthorizedScopeRule(ThreatRule):
                     reason=f"Scope violation: {desc}",
                     threat_level=ThreatLevel.MEDIUM,
                     matched_pattern=pattern,
-                    owasp_id=self.owasp_id,
                 ))
         return matches
 
 
 class EvaluationManipulationRule(ThreatRule):
     """Detects anomalous evaluation scores.
-    OWASP LLM05: Supply Chain Vulnerabilities (manipulated training/eval)."""
+    OWASP mapping: see taxonomy.py."""
 
     name = "eval_manipulation"
     description = "Anomalous evaluation score detected"
-    owasp_id = "LLM05"
 
     def check(self, event: dict) -> list[ThreatMatch]:
         data = event.get("data", {})
@@ -348,7 +332,6 @@ class EvaluationManipulationRule(ThreatRule):
                 reason=f"Critically low score ({score}/10), possible adversarial input",
                 threat_level=ThreatLevel.MEDIUM,
                 matched_pattern=f"score={score}",
-                owasp_id=self.owasp_id,
             )]
 
         return []

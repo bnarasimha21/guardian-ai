@@ -51,8 +51,11 @@ class DecisionEvent(BaseModel):
     rule_name: Optional[str] = None
     reason: Optional[str] = None
     threat_level: ThreatLevel = ThreatLevel.NONE
-    owasp_id: str = ""       # e.g., "LLM01"
-    owasp_label: str = ""    # e.g., "Prompt Injection"
+    owasp_id: str = ""       # alias of owasp_llm, kept for older clients
+    owasp_label: str = ""    # label of owasp_llm, e.g. "Prompt Injection"
+    owasp_llm: str = ""      # OWASP Top 10 for LLM Applications 2025, e.g. "LLM01"
+    owasp_agentic: str = ""  # OWASP Top 10 for Agentic Applications 2026, e.g. "ASI01"
+    owasp_agentic_label: str = ""
     details: dict = Field(default_factory=dict)
 
 
