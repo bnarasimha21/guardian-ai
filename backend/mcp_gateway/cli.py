@@ -2,7 +2,7 @@
 
     guardian-mcp --config gateway.yaml                 # serve MCP on stdin/stdout
     guardian-mcp --config gateway.yaml pins list
-    guardian-mcp --config gateway.yaml pins approve files.read_file 3f2a9c1d
+    guardian-mcp --config gateway.yaml pins approve files.read_file <the 64-character hash pins list shows>
     guardian-mcp --config gateway.yaml pins forget files.read_file
 
 stdout carries the MCP protocol, so everything else (logs, the dashboard's
@@ -42,9 +42,9 @@ def _parser() -> argparse.ArgumentParser:
     pins = sub.add_parser("pins", help="list or approve pinned tool definitions")
     pins_sub = pins.add_subparsers(dest="pins_command", required=True)
     pins_sub.add_parser("list", help="show every pin, changed ones first")
-    approve = pins_sub.add_parser("approve", help="accept the changed definition of <server.tool> <sha-prefix>")
+    approve = pins_sub.add_parser("approve", help="accept the changed definition of <server.tool> <sha256>")
     approve.add_argument("name")
-    approve.add_argument("sha_prefix", nargs="?", default="", help="start of the new hash shown by `pins list` (8+ hex characters)")
+    approve.add_argument("sha256", nargs="?", default="", help="the whole new hash shown by `pins list` (64 hex characters)")
     forget = pins_sub.add_parser("forget", help="drop the pin for <server.tool> (re-pinned on next listing)")
     forget.add_argument("name")
     return p
@@ -64,12 +64,12 @@ def _pins_command(cfg: GatewayConfig, args: argparse.Namespace) -> int:
                 for line in store.diff(name).splitlines():
                     print(f"    {line}")
                 print(f"    to accept it: guardian-mcp --config {args.config} pins approve {name} "
-                      f"{pin['pending_sha256'][:12]}")
+                      f"{pin['pending_sha256']}")
             else:
                 print(f"ok       {name}  {pin['sha256'][:12]}")
         return 0
     if args.pins_command == "approve":
-        pin = store.approve(args.name, args.sha_prefix)
+        pin = store.approve(args.name, args.sha256)
         print(f"approved {args.name}: now pinned to {pin['sha256'][:12]} "
               f"(was {pin.get('previous_sha256', '')[:12]})")
         return 0

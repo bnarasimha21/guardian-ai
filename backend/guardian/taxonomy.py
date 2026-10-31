@@ -170,7 +170,7 @@ RULES: dict[str, RuleInfo] = {
     "tool_definition_changed": RuleInfo(
         "tool_definition_changed", "Tool definition changed after approval", "LLM03", "ASI04",
         "The tool changed since it was pinned. Review the new definition, then re-approve it with "
-        "`guardian-mcp pins approve <server.tool>`.",
+        "`guardian-mcp pins approve <server.tool> <sha256>`.",
     ),
     "policy": RuleInfo(
         "policy", "Policy decision", "LLM06", "ASI02",

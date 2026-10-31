@@ -138,10 +138,10 @@ What happens to each request:
 
   ```bash
   guardian-mcp --config gateway.yaml pins list
-  guardian-mcp --config gateway.yaml pins approve files.deploy 3f2a9c1d4e5b   # the new hash `pins list` shows
+  guardian-mcp --config gateway.yaml pins approve files.deploy <hash>   # the whole new hash `pins list` shows
   ```
 
-  `pins list` shows each changed definition as a unified diff against the pinned one, and the approve command with its hash. Approving needs at least the first 8 hex characters of that hash, so a definition that changes again after you read the diff is not approved by accident.
+  `pins list` shows each changed definition as a unified diff against the pinned one, and the approve command with its hash. Approving needs the whole 64-character hash, so a definition that changes again after you read the diff is not approved, by accident or by an upstream that searched for a second definition with the same short prefix.
 
 - **Monitor mode** (`mode: monitor` in the policy): nothing is blocked or hidden; decisions are still recorded and attached to results.
 

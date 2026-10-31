@@ -4,11 +4,13 @@ The first time the gateway sees a clean tool it records a SHA-256 of the
 definition (name, title, description, input and output schema, annotations).
 If a later listing returns a different hash, the tool is hidden and the new
 hash is kept as ``pending_sha256`` until an operator approves it with
-``guardian-mcp --config gateway.yaml pins approve <server.tool> <sha-prefix>``.
+``guardian-mcp --config gateway.yaml pins approve <server.tool> <sha256>``.
 
-Approval names the hash being approved, so a definition that changes again
-between ``pins list`` (where the operator read the diff) and ``pins approve``
-is not accepted by mistake. The pinned and pending definitions are stored in
+Approval names the full hash being approved, so a definition that changes
+again between ``pins list`` (where the operator read the diff) and ``pins
+approve`` is not accepted by mistake. A prefix is not enough: an upstream can
+search for a second definition whose hash starts with the same 8 or 12 hex
+characters in minutes. The pinned and pending definitions are stored in
 full so ``pins list`` can show what changed.
 
 The file is plain JSON, written atomically (temp file and rename). Two gateway
@@ -28,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 FORMAT_VERSION = 1
-MIN_PREFIX = 8  # hex characters of the pending hash that `approve` must quote
+SHA256_HEX = 64  # `approve` must quote the whole pending hash
 
 
 def definition_sha256(definition: dict[str, Any]) -> str:
@@ -132,16 +134,16 @@ class PinStore:
         return "\n".join(difflib.unified_diff(lines(old), lines(new), f"pinned {pin['sha256'][:12]}",
                                                f"now {pin['pending_sha256'][:12]}", lineterm=""))
 
-    def approve(self, name: str, sha_prefix: str) -> dict[str, Any]:
+    def approve(self, name: str, sha256: str) -> dict[str, Any]:
         """Accept the pending definition of ``name`` as the new pin.
 
-        ``sha_prefix`` must be the start (at least MIN_PREFIX hex characters)
-        of the pending hash the operator reviewed; if the definition changed
-        again since, the pending hash differs and nothing is approved.
+        ``sha256`` must be the whole pending hash the operator reviewed; if
+        the definition changed again since, the pending hash differs and
+        nothing is approved.
         """
-        prefix = (sha_prefix or "").strip().lower()
-        if len(prefix) < MIN_PREFIX or any(c not in "0123456789abcdef" for c in prefix):
-            raise PinError(f"give at least {MIN_PREFIX} hex characters of the new hash shown by `pins list`")
+        wanted = (sha256 or "").strip().lower()
+        if len(wanted) != SHA256_HEX or any(c not in "0123456789abcdef" for c in wanted):
+            raise PinError(f"give the whole new hash ({SHA256_HEX} hex characters) shown by `pins list`")
         self.reload()
         pin = self._pins.get(name)
         if pin is None:
@@ -149,8 +151,8 @@ class PinStore:
         pending = pin.get("pending_sha256")
         if not pending:
             raise PinError(f"{name!r} has no changed definition waiting for approval")
-        if not pending.startswith(prefix):
-            raise PinError(f"{name!r} is now waiting on {pending[:12]}, not {prefix}: the definition changed "
+        if pending != wanted:
+            raise PinError(f"{name!r} is now waiting on {pending[:12]}, not {wanted[:12]}: the definition changed "
                            "again; run `pins list` and review it before approving")
         pin["previous_sha256"] = pin["sha256"]
         pin["sha256"] = pin.pop("pending_sha256")

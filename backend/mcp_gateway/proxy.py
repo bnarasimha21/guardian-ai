@@ -584,7 +584,7 @@ class Gateway:
                 old = (pin or {}).get("sha256", "")
                 reason = (f"The definition of {policy_name} changed since it was pinned "
                           f"({old[:12]} -> {sha[:12]}); hidden until an operator runs "
-                          f"`guardian-mcp pins approve {policy_name} {sha[:12]}`")
+                          f"`guardian-mcp pins approve {policy_name} {sha}`")
                 decision = self._synthetic(loaded, call, rule="tool_definition_changed", reason=reason,
                                            level=ThreatLevel.HIGH)
                 await self._report_once(decision, call, sha)
