@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -21,8 +21,9 @@ SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
 
 class DecisionAction(str, Enum):
     ALLOWED = "allowed"
-    FLAGGED = "flagged"
-    BLOCKED = "blocked"
+    FLAGGED = "flagged"            # seen, not stopped (observer tap, monitor mode, allow with signals)
+    BLOCKED = "blocked"            # refused by an enforcing check
+    REQUIRE_APPROVAL = "require_approval"  # held until a human approves or it times out
 
 
 # -- Events sent from Guardian to frontend --
@@ -38,6 +39,9 @@ class AgentActivityEvent(BaseModel):
     task_id: str = ""        # subtask id if applicable
     summary: str = ""        # human-readable summary of what happened
     data: dict = Field(default_factory=dict)  # raw event data
+    # True when the event type is one GuardianAI knows how to summarise. Only a
+    # display hint: every event is evaluated regardless.
+    known_type: bool = True
 
 
 class DecisionEvent(BaseModel):
@@ -51,9 +55,52 @@ class DecisionEvent(BaseModel):
     rule_name: Optional[str] = None
     reason: Optional[str] = None
     threat_level: ThreatLevel = ThreatLevel.NONE
-    owasp_id: str = ""       # e.g., "LLM01"
-    owasp_label: str = ""    # e.g., "Prompt Injection"
+    owasp_id: str = ""       # alias of owasp_llm, kept for older clients
+    owasp_label: str = ""    # label of owasp_llm, e.g. "Prompt Injection"
+    owasp_llm: str = ""      # OWASP Top 10 for LLM Applications 2025, e.g. "LLM01"
+    owasp_agentic: str = ""  # OWASP Top 10 for Agentic Applications 2026, e.g. "ASI01"
+    owasp_agentic_label: str = ""
     details: dict = Field(default_factory=dict)
+    # Policy decision fields
+    decision_id: str = ""
+    phase: str = "call"
+    effect: str = ""         # allow | deny | require_approval (call); allow | warn | redact | deny (result)
+    enforced: bool = False
+    observed: bool = False   # came from the passive tap, so it could not be enforced
+    mode: str = ""
+    policy_rule_id: str = ""
+    tool_name: str = ""
+    reasons: list[str] = Field(default_factory=list)
+    matched_detectors: list[str] = Field(default_factory=list)
+    approval_id: str = ""
+
+
+class ApprovalEvent(BaseModel):
+    """A human approval changed state: pending, approved, denied or used."""
+    type: str = "approval"
+    timestamp: float = Field(default_factory=time.time)
+    change: str              # pending | approved | denied | used
+    approval_id: str
+    status: str              # pending | approved | denied
+    reason: str = ""
+    note: str = ""
+    tool_name: str = ""
+    server: Optional[str] = None
+    agent: str = ""
+    policy_rule_id: str = ""
+    decision_id: str = ""
+    arguments_sha256: str = ""
+    arguments: dict = Field(default_factory=dict)   # flattened, values truncated
+    diff_from: str = ""
+    diff: list = Field(default_factory=list)        # [{path, change, before?, after?}]
+    preview_truncated: bool = False   # arguments shown in part: no one-click approve
+    diff_truncated: bool = False
+    created_at: float = 0
+    expires_at: float = 0
+    resolved_at: Optional[float] = None
+    resolved_by: str = ""
+    grant_valid_until: Optional[float] = None
+    uses: int = 0
 
 
 class GuardianSummaryEvent(BaseModel):

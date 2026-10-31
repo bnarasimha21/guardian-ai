@@ -1,25 +1,250 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
+import re
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse as _JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from backend import auth, netguard
+from backend.approvals import ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval
+from backend.approvals.flow import DENIED_RECENTLY, GRANTED, REFUSED, WAITING, queue_for_approval
 from backend.config import settings
 from backend.events.bus import EventBus
-from backend.events.models import AgentActivityEvent, StatusEvent
-from backend.guardian.middleware import Guardian, is_blocking
+from backend.events.models import AgentActivityEvent, ApprovalEvent, StatusEvent
+from backend.guardian.middleware import Guardian
+from backend.guardian.schema import CheckRequest, RequestError, ToolCall, to_tool_call
+from backend.guardian.rules import default_rules
+from backend.guardian.taxonomy import taxonomy_payload
+from backend.policy import engine as policy_engine
+from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
 from backend.targets import session_store
+from backend import telemetry as otel
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
+from backend.tap.extract import extract_tool_calls, has_content, synthetic_event_call
 from backend.usage_logger import log_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor")
+
+class JSONResponse(_JSONResponse):
+    """JSON with non-ASCII escaped. Responses echo caller text (agent names,
+    argument paths in evidence), and a lone surrogate in it cannot be encoded
+    as UTF-8: the stock renderer turned such a request into a 500."""
+
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=True, allow_nan=False, indent=None,
+                          separators=(",", ":")).encode("ascii")
+
+
+_TOKEN_IN_URL = re.compile(r"(?i)([?&]token=)[^&\s\"']*")
+
+
+class _ScrubTokens(logging.Filter):
+    """Mask ``token=`` query values in log lines.
+
+    Browsers cannot set headers on a WebSocket, so the dashboard passes its key
+    as ``/ws/events?token=...``, and uvicorn logs the request line with it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Scrub the format string and each argument in place. Formatters such
+        # as uvicorn's AccessFormatter unpack record.args themselves, so the
+        # arguments must keep their shape.
+        if isinstance(record.msg, str):
+            record.msg = _scrub(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_scrub(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: _scrub(v) if isinstance(v, str) else v for k, v in record.args.items()}
+        return True
+
+
+def _scrub(text: str) -> str:
+    return _TOKEN_IN_URL.sub(r"\1[REDACTED]", text) if "token=" in text.lower() else text
+
+
+_SCRUB = _ScrubTokens()
+
+
+def _install_log_scrub() -> None:
+    """Idempotent. Called at import and again at startup, after uvicorn has
+    configured its loggers."""
+    for name in ("uvicorn.access", "uvicorn.error"):
+        log = logging.getLogger(name)
+        if _SCRUB not in log.filters:
+            log.addFilter(_SCRUB)
+
+
+_install_log_scrub()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Fail at startup, not on the first request, if the policy file or the key
+    # configuration is broken, or a GUARDIAN_MODEL_DETECTORS entry cannot load.
+    _install_log_scrub()
+    default_rules()
+    _policy_store()
+    _api_keys()
+    _approver_keys()
+    otel.setup_from_env()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+    store = InMemoryApprovalStore()
+    store.add_listener(_on_approval_change)
+    _telemetry().watch_approvals(store)
+    app.state.approvals = store
+    try:
+        yield
+    finally:
+        await store.close()
+        otel.force_flush()
+
+
+app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan,
+              default_response_class=JSONResponse)
+
+
+# The dashboard renders text that agents and tools chose (agent names, tool
+# output, reasons). It escapes all of it, and this policy is the backstop: no
+# inline script, no script from anywhere but /static, no framing, no plugins.
+# Inline style attributes stay allowed (the cards colour badges with them).
+# Applied to the page and its static files only, so /docs keeps working.
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+])
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        response.headers["X-Frame-Options"] = "DENY"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # A dashboard URL may carry ?session=app:...; never send it to another site.
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's own handler echoes the input with the stock renderer.
+    # _finite: the echoed input may hold NaN or Infinity, which this
+    # renderer refuses (a 500 instead of the 422).
+    return JSONResponse({"detail": _finite(jsonable_encoder(exc.errors()))}, status_code=422)
+
+# Outbound hooks. Tests replace these to run offline: the resolver maps hostnames
+# to addresses, and the transport answers the verify health check.
+app.state.resolver = netguard.system_resolve
+app.state.verify_transport = None
+app.state.policy_store = None
+app.state.approvals = None
+# Tracing. None means the process-wide one from backend.telemetry (a no-op
+# unless an OTLP endpoint is configured); tests put an in-memory one here.
+app.state.telemetry = None
+
+
+def _telemetry() -> otel.Telemetry:
+    return getattr(app.state, "telemetry", None) or otel.get_telemetry()
+
+
+def _approvals() -> ApprovalStore:
+    store = getattr(app.state, "approvals", None)
+    if store is None:
+        store = InMemoryApprovalStore()
+        store.add_listener(_on_approval_change)
+        app.state.approvals = store
+    _telemetry().watch_approvals(store)
+    return store
+
+
+async def _on_approval_change(approval: PendingApproval, change: str) -> None:
+    """Show every approval state change on the session's dashboard."""
+    d = approval.to_dict()
+    await _get_session(approval.session)["bus"].emit(ApprovalEvent(
+        change=change,
+        approval_id=approval.id,
+        status=approval.status,
+        reason=approval.reason,
+        note=approval.note,
+        tool_name=approval.tool,
+        server=approval.server,
+        agent=approval.agent,
+        policy_rule_id=approval.rule_id,
+        decision_id=approval.decision_id,
+        arguments_sha256=approval.arguments_sha256,
+        arguments=approval.arguments_preview,
+        diff_from=approval.diff_from,
+        diff=approval.diff,
+        preview_truncated=approval.preview_truncated,
+        diff_truncated=approval.diff_truncated,
+        created_at=approval.created_at,
+        expires_at=approval.expires_at,
+        resolved_at=approval.resolved_at,
+        resolved_by=approval.resolved_by,
+        grant_valid_until=d["grant_valid_until"],
+        uses=approval.uses,
+    ))
+
+
+def _policy_store() -> PolicyStore:
+    """The policy store for the configured file (recreated if the setting changes)."""
+    store = getattr(app.state, "policy_store", None)
+    wanted = resolve_policy_path(settings.guardian_policy_file)
+    if store is None or store.path != wanted:
+        store = PolicyStore(wanted)
+        app.state.policy_store = store
+    return store
+
+
+def _api_keys() -> dict[str, str]:
+    return auth.parse_keys(settings.guardian_api_keys, env_name="GUARDIAN_API_KEYS")
+
+
+def _approver_keys() -> dict[str, str]:
+    return auth.parse_keys(settings.guardian_approver_keys, env_name="GUARDIAN_APPROVER_KEYS")
+
+
+def _require_a_key(request: Request) -> None:
+    """With API or approver keys configured, a valid key of either kind is
+    required (401 otherwise). Without keys this is open demo behaviour."""
+    if _api_keys() or _approver_keys():
+        token = auth.bearer_token(request.headers.get("authorization"))
+        if auth.match_key(token, _api_keys()) is None and auth.match_key(token, _approver_keys()) is None:
+            raise HTTPException(status_code=401, detail="A valid API or approver key is required",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+
+def _client_sid(value: str | None) -> str:
+    """A session id chosen by the client. The app: namespace belongs to API keys."""
+    sid = value or "default"
+    if sid.startswith(auth.APP_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail="Session ids starting with 'app:' are reserved for API-key callers")
+    if len(sid) > 200:
+        raise HTTPException(status_code=400, detail="Session id too long")
+    return sid
 
 # Per-session state: event bus, guardian, observer tasks
 _sessions: dict[str, dict] = {}
@@ -27,6 +252,7 @@ _sessions: dict[str, dict] = {}
 # Cap on live sessions (ids come from unauthenticated X-Session-Id / ?session= values:
 # without a cap, a client could grow memory by sending endless new ids). At the cap the
 # least recently used session is evicted, preferring one with no subscribers or observers.
+# A watched API-key session is never evicted (see _protected).
 MAX_SESSIONS = 1000
 
 SKIP_EVENTS = {
@@ -35,22 +261,37 @@ SKIP_EVENTS = {
 }
 
 
-def _evict_session() -> None:
-    """Drop one session to make room: the least recently used idle one, else the LRU."""
+def _protected(sid: str, sess: dict) -> bool:
+    """An API-key session someone is watching. Never evicted: a flood of new
+    unauthenticated ids must not cut the operator's dashboard off. There is at
+    most one per configured key, so this cannot hold the cap open forever."""
+    return sid.startswith(auth.APP_SESSION_PREFIX) and sess["bus"].subscriber_count > 0
+
+
+def _evict_session() -> bool:
+    """Drop one session to make room: the least recently used idle one, else the
+    least recently used unprotected one. False when every session is protected."""
     victim = None
+    fallback = None
     for sid, sess in _sessions.items():  # dict order is least to most recently used
+        if _protected(sid, sess):
+            continue
         idle = sess["bus"].subscriber_count == 0 and not any(
             not t.done() for t in sess["observers"].values()
         )
         if idle:
             victim = sid
             break
+        if fallback is None:
+            fallback = sid
+    victim = victim or fallback
     if victim is None:
-        victim = next(iter(_sessions))
+        return False
     for task in _sessions[victim]["observers"].values():
         task.cancel()
     del _sessions[victim]
     logger.info("Evicted session %s (cap %d)", victim[:8], MAX_SESSIONS)
+    return True
 
 
 def _get_session(session_id: str) -> dict:
@@ -62,8 +303,8 @@ def _get_session(session_id: str) -> dict:
     if session_id in _sessions:
         _sessions[session_id] = _sessions.pop(session_id)  # move to the MRU end
     else:
-        while len(_sessions) >= MAX_SESSIONS:
-            _evict_session()
+        while len(_sessions) >= MAX_SESSIONS and _evict_session():
+            pass
         bus = EventBus()
         _sessions[session_id] = {
             "bus": bus,
@@ -108,37 +349,59 @@ def _make_event_handler(session_id: str):
 
     async def on_agent_event(app_name: str, event: dict):
         event_type = event.get("type", "unknown")
-        data = event.get("data", {})
+        if not isinstance(event_type, str):
+            event_type = "unknown"
+        raw_data = event.get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
         elapsed = event.get("elapsed", 0)
+        if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
+            elapsed = 0
 
         if event_type in SKIP_EVENTS:
             return
 
+        agent = data.get("agent", data.get("name", ""))
+        task_id = data.get("task_id", data.get("id", ""))
         await bus.emit(
             AgentActivityEvent(
                 event_type=event_type,
                 elapsed=elapsed,
-                agent=data.get("agent", data.get("name", "")),
-                task_id=data.get("task_id", data.get("id", "")),
+                agent=agent if isinstance(agent, str) else str(agent),
+                task_id=task_id if isinstance(task_id, str) else str(task_id),
                 summary=_summarize_event(event),
                 data={**data, "_source": app_name},
+                known_type=event_type in ACTIONABLE_EVENTS,
             )
         )
 
-        if event_type in ACTIONABLE_EVENTS:
-            enriched = {**event, "data": {**data, "_source": app_name}}
-            matches = await guardian.evaluate(enriched)
-            for match in matches:
+        # Every event is evaluated, whatever its type. Tool-call shapes become
+        # tool calls; the rest of the event is checked as guardian.event.<type>.
+        calls, remainder = extract_tool_calls(event, app_name=app_name)
+        if not calls or has_content(remainder):
+            calls.append(synthetic_event_call(event, remainder, app_name=app_name))
+        try:
+            loaded = _policy_store().get()
+        except PolicyError as exc:
+            logger.error("No policy available, observed event not evaluated: %s", exc)
+            return
+        for call in calls:
+            # Off the event loop: a model detector can take seconds to score.
+            decision = await run_in_threadpool(policy_engine.evaluate, loaded, call,
+                                               block_threshold=settings.block_threshold)
+            # The tap cannot stop anything: record what the policy would have done.
+            decision.enforced = False
+            await guardian.record(decision, call, source=app_name, observed=True)
+            for match in decision.matches:
                 asyncio.create_task(log_event(
                     "threat_flagged",
                     session_id=session_id,
                     app_name=app_name,
                     rule_name=match.rule_name,
-                    owasp_id=match.owasp_id,
+                    owasp_id=match.owasp_llm,
                     threat_level=match.threat_level.value,
                     reason=match.reason,
                     total_events_checked=guardian._total_checked,
-                    total_blocked=guardian._total_flagged,
+                    total_blocked=guardian._total_blocked,
                 ))
 
     return on_agent_event
@@ -165,16 +428,27 @@ def _start_observer(session_id: str, name: str, ws_url: str) -> None:
         await bus.emit(StatusEvent(status="target_disconnected", message=f"{app_name} disconnected"))
         asyncio.create_task(log_event("app_disconnected", session_id=session_id, app_name=app_name))
 
+    async def on_reject(app_name: str, message: str):
+        session_store.set_status(session_id, app_name, "rejected")
+        await bus.emit(StatusEvent(status="target_rejected", message=f"{app_name}: {message}"))
+
     async def _observe():
         session_store.set_status(session_id, name, "connecting")
-        await observe_agent(name, ws_url, on_event, on_connect, on_disconnect)
+        await observe_agent(
+            name, ws_url, on_event, on_connect, on_disconnect,
+            allow_private=settings.allow_private_targets,
+            resolver=app.state.resolver,
+            on_reject=on_reject,
+        )
 
     observers[name] = asyncio.create_task(_observe())
     logger.info("[session=%s] Observer started for %s", session_id[:8], name)
 
 
 def _stop_observer(session_id: str, name: str) -> None:
-    session = _get_session(session_id)
+    session = _sessions.get(session_id)  # never create a session just to stop nothing
+    if session is None:
+        return
     observers = session["observers"]
     if name in observers:
         observers[name].cancel()
@@ -196,23 +470,29 @@ class AddTargetRequest(BaseModel):
     ws_url: str
 
 
-def _get_sid(x_session_id: str | None = Header(None)) -> str:
-    return x_session_id or "default"
-
-
 @app.post("/api/targets")
-async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+async def add_target(req: AddTargetRequest, request: Request, x_session_id: str | None = Header(None)):
+    # With keys on, adding or removing targets needs a key: each new session id
+    # makes server state (and a targets file), and the table is capped.
+    _require_a_key(request)
+    sid = _client_sid(x_session_id)
     if session_store.get(sid, req.name):
         return JSONResponse({"error": f"Target '{req.name}' already exists"}, status_code=409)
+    try:
+        await netguard.check_target_url(
+            req.ws_url, allow_private=settings.allow_private_targets, resolver=app.state.resolver,
+        )
+    except netguard.TargetRejected as exc:
+        return JSONResponse({"error": exc.message, "code": exc.code}, status_code=400)
     target = session_store.add(sid, req.name, req.ws_url)
     _start_observer(sid, target.name, target.ws_url)
     return {"status": "added", "target": {"name": target.name, "ws_url": target.ws_url}}
 
 
 @app.delete("/api/targets/{name}")
-async def remove_target(name: str, x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+async def remove_target(name: str, request: Request, x_session_id: str | None = Header(None)):
+    _require_a_key(request)
+    sid = _client_sid(x_session_id)
     _stop_observer(sid, name)
     if session_store.remove(sid, name):
         return {"status": "removed", "name": name}
@@ -221,7 +501,7 @@ async def remove_target(name: str, x_session_id: str | None = Header(None)):
 
 @app.get("/api/targets")
 async def list_targets(x_session_id: str | None = Header(None)):
-    sid = x_session_id or "default"
+    sid = _client_sid(x_session_id)
     targets = [
         {"name": t.name, "ws_url": t.ws_url, "status": t.status}
         for t in session_store.list_all(sid)
@@ -229,65 +509,335 @@ async def list_targets(x_session_id: str | None = Header(None)):
     return {"targets": targets}
 
 
-class CheckRequest(BaseModel):
-    content: str | None = None
-    event: dict | None = None
-    source: str = "api-check"
+def _authenticate(request: Request) -> str | None:
+    """API-key principal for /api/check, or None when keys are not configured."""
+    keys = _api_keys()
+    if not keys:
+        return None
+    name = auth.match_key(auth.bearer_token(request.headers.get("authorization")), keys)
+    if name is None:
+        raise HTTPException(
+            status_code=401, detail="A valid API key is required (Authorization: Bearer <key>)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return name
+
+
+def _top_label(decision) -> tuple[str, str, str, str]:
+    top = decision.top_match
+    if top is not None and decision.deciding_detectors:
+        return top.rule_name, top.owasp_llm, top.threat_level.value, top.reason
+    return "policy", decision.owasp_llm, "high" if decision.effect == "deny" else "medium", decision.reasons[0]
 
 
 @app.post("/api/check")
-async def check_content(req: CheckRequest, x_session_id: str | None = Header(None)):
-    """Enforcing check. Returns 200 {"blocked": false} when clean, or 403 with
-    {"blocked": true, ...} when a rule at or above BLOCK_THRESHOLD matches.
+async def check_content(req: CheckRequest, request: Request, x_session_id: str | None = Header(None)):
+    """Policy decision point for a tool call.
 
-    The passive tap cannot stop traffic, so apps that want blocking call this
-    before acting on content (a tool call, an LLM output, a URL to fetch).
-    Pass either `content` (plain text) or `event` ({"type": ..., "data": {...}}).
+    Send ``{"tool": {"name": ...}, "arguments": {...}, "agent": {...}}``. The
+    detectors run over the arguments, then the policy file decides:
+
+    * allow: 200 ``{"effect": "allow", "blocked": false, ...}``
+    * deny: 403 ``{"effect": "deny", "blocked": true, "rule_id": ..., "reasons": [...]}``
+    * require_approval: 202 ``{"status": "pending", "approval_id", "poll_url"}``.
+      The caller must not run the tool yet. Poll ``GET /api/approvals/{id}?wait=30``;
+      once it says ``approved``, send the identical call again and it returns
+      200 (a single-use grant unless the rule sets ``grant_ttl_seconds``).
+
+    In monitor mode every call gets 200 and ``enforced: false``, with the
+    effect the policy would have applied. Legacy ``{"content": ...}`` and
+    ``{"event": ...}`` bodies are wrapped as ``guardian.content`` and
+    ``guardian.event.<type>`` tool calls.
     """
-    if req.event is None and req.content is None:
-        return JSONResponse({"error": "Provide 'content' or 'event'"}, status_code=400)
-    if req.event is not None:
-        ev_type = req.event.get("type", "tool_call")
-        ev_data = req.event.get("data")
-        if not isinstance(ev_type, str):
-            return JSONResponse({"error": "event.type must be a string"}, status_code=400)
-        if ev_data is not None and not isinstance(ev_data, dict):
-            return JSONResponse({"error": "event.data must be an object"}, status_code=400)
-    sid = x_session_id or "default"
-    guardian = _get_session(sid)["guardian"]
-    if req.event is not None:
-        event = {"type": ev_type, "data": dict(ev_data or {})}
+    principal = _authenticate(request)
+    if principal is not None:
+        sid = auth.APP_SESSION_PREFIX + principal
     else:
-        event = {"type": "tool_call", "data": {"content": req.content}}
-    event["data"]["_source"] = req.source
-    matches = await guardian.evaluate(event, enforce=True, block_threshold=settings.block_threshold)
-    blocking = [m for m in matches if is_blocking(m, settings.block_threshold)]
-    body = {
-        "blocked": bool(blocking),
+        sid = _client_sid(x_session_id or req.session_id)
+    try:
+        call = to_tool_call(req)
+    except RequestError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    try:
+        loaded = _policy_store().get()
+    except PolicyError as exc:
+        logger.error("Policy unavailable: %s", exc)
+        return JSONResponse({"error": "Policy unavailable; refusing to decide", "blocked": True}, status_code=503)
+
+    with _telemetry().check_span(call, headers=request.headers, trace_context=req.trace_context,
+                                 principal=principal) as span:
+        # Off the event loop: a model detector can take seconds to score, and
+        # the dashboard, other checks and approvals must keep moving meanwhile.
+        decision = await run_in_threadpool(
+            policy_engine.evaluate, loaded, call, principal=principal, block_threshold=settings.block_threshold,
+        )
+        source = principal or call.agent_name or req.source
+        guardian = _get_session(sid)["guardian"]
+
+        if decision.effect == "require_approval" and decision.enforced:
+            return await _approval_flow(decision, call, sid=sid, principal=principal, source=source,
+                                        guardian=guardian, span=span)
+
+        await guardian.record(decision, call, source=source)
+        response = _decision_response(decision, sid=sid, source=source, guardian=guardian)
+        span.decided(decision, call=call, status_code=response.status_code)
+        return response
+
+
+def _decision_body(decision) -> dict:
+    return {
+        **decision.to_dict(),
         "threshold": settings.block_threshold,
         "matches": [
-            {"rule": m.rule_name, "owasp_id": m.owasp_id, "threat_level": m.threat_level.value,
-             "reason": m.reason, "blocking": m in blocking}
-            for m in matches
+            {**m.to_dict(), "blocking": decision.blocked and m.rule_name in decision.deciding_detectors}
+            for m in decision.matches
         ],
     }
-    return JSONResponse(body, status_code=403 if blocking else 200)
+
+
+def _decision_response(decision, *, sid: str, source: str, guardian: Guardian, extra: dict | None = None,
+                       status_code: int | None = None) -> JSONResponse:
+    body = {**_decision_body(decision), **(extra or {})}
+    if decision.blocked and decision.effect == "deny":
+        rule_name, owasp_llm, level, reason = _top_label(decision)
+        asyncio.create_task(log_event(
+            "threat_blocked",
+            session_id=sid,
+            app_name=source,
+            rule_name=rule_name,
+            owasp_id=owasp_llm,
+            threat_level=level,
+            reason=reason,
+            total_events_checked=guardian._total_checked,
+            total_blocked=guardian._total_blocked,
+        ))
+    if status_code is None:
+        status_code = 403 if decision.blocked else 200
+    return JSONResponse(body, status_code=status_code)
+
+
+def _agent_key(call: ToolCall, principal: str | None) -> str:
+    """Who an approval is bound to: the API key name, else the self-reported agent."""
+    return principal or call.agent_id or call.agent_name or ""
+
+
+async def _approval_flow(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
+                         guardian: Guardian, span: otel.CheckSpan) -> JSONResponse:
+    """require_approval in enforce mode: reuse a grant, join a pending approval, or open one."""
+    response = await _approval_response(decision, call, sid=sid, principal=principal, source=source,
+                                        guardian=guardian)
+    body = json.loads(response.body)
+    span.decided(decision, call=call, approval_id=body.get("approval_id", ""),
+                 approval_status=body.get("status", ""), status_code=response.status_code)
+    return response
+
+
+async def _approval_response(decision, call: ToolCall, *, sid: str, principal: str | None, source: str,
+                             guardian: Guardian) -> JSONResponse:
+    outcome = await queue_for_approval(_approvals(), decision, call, session=sid, agent=_agent_key(call, principal))
+    approval, sha = outcome.approval, outcome.arguments_sha256
+
+    if outcome.status == GRANTED:
+        decision.effect = "allow"
+        decision.reasons.append(f"Approved by {approval.resolved_by or 'an approver'} (approval {approval.id})")
+        await guardian.record(decision, call, source=source, approval_id=approval.id)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, extra={
+            "status": "approved", "approval_id": approval.id, "arguments_sha256": sha,
+            "grant_valid_until": approval.grant_valid_until(),
+        })
+
+    if outcome.status == WAITING:
+        # Same call retried while a human is still deciding: no second card.
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={
+            "status": "pending", "approval_id": approval.id, "poll_url": f"/api/approvals/{approval.id}",
+            "expires_at": approval.expires_at, "arguments_sha256": sha,
+        })
+
+    if outcome.status == REFUSED:
+        decision.effect = "deny"
+        decision.reasons.append(outcome.error)
+        await guardian.record(decision, call, source=source)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=429)
+
+    if outcome.status == DENIED_RECENTLY:
+        # A person just said no to this exact call; retrying it does not ask again.
+        decision.effect = "deny"
+        decision.reasons.append(outcome.error)
+        await guardian.record(decision, call, source=source, approval_id=approval.id)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=403, extra={
+            "status": "denied", "approval_id": approval.id, "arguments_sha256": sha,
+        })
+
+    await guardian.record(decision, call, source=source, approval_id=approval.id)
+    return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={
+        "status": "pending", "approval_id": approval.id, "poll_url": f"/api/approvals/{approval.id}",
+        "expires_at": approval.expires_at, "arguments_sha256": sha,
+    })
+
+
+# ---- Approvals ----
+#
+# Who may see and answer an approval:
+# * GUARDIAN_APPROVER_KEYS set: answering needs an approver key
+#   (Authorization: Bearer). Approver keys may also read any approval.
+# * Otherwise, for sessions owned by an API key (app:<name>) nobody can answer,
+#   so those approvals time out as denied. An app's own key never approves its
+#   own calls.
+# * Otherwise (open demo mode) anyone holding the session id may answer. The
+#   agent knows its session id too, so in demo mode an agent could approve
+#   itself: real deployments need GUARDIAN_APPROVER_KEYS, or SSO in front of
+#   these endpoints.
+
+
+def _approver(request: Request) -> str | None:
+    keys = _approver_keys()
+    if not keys:
+        return None
+    return auth.match_key(auth.bearer_token(request.headers.get("authorization")), keys)
+
+
+def _requester_session(request: Request) -> str | None:
+    """The session the caller speaks for: its API key's app session, or X-Session-Id."""
+    token = auth.bearer_token(request.headers.get("authorization"))
+    keys = _api_keys()
+    if keys and token:
+        name = auth.match_key(token, keys)
+        if name is not None:
+            return auth.APP_SESSION_PREFIX + name
+    header = request.headers.get("x-session-id")
+    if header is not None:
+        if header.startswith(auth.APP_SESSION_PREFIX) or len(header) > 200:
+            return None
+        return header
+    return None if keys else "default"
+
+
+async def _load_approval(approval_id: str, request: Request, *, write: bool) -> tuple[PendingApproval, str]:
+    approval = await _approvals().get(approval_id[:100])
+    not_found = HTTPException(status_code=404, detail="No such approval")
+    if approval is None:
+        raise not_found
+    approver = _approver(request)
+    if write:
+        if _approver_keys():
+            if approver is None:
+                raise HTTPException(status_code=401, detail="An approver key is required",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            return approval, approver
+        if approval.session.startswith(auth.APP_SESSION_PREFIX):
+            raise HTTPException(status_code=403,
+                                detail="Approvals for API-key sessions need GUARDIAN_APPROVER_KEYS")
+        if _requester_session(request) != approval.session:
+            raise not_found
+        return approval, "session"
+    if approver is not None:
+        return approval, approver
+    if _requester_session(request) != approval.session:
+        raise not_found
+    return approval, ""
+
+
+class ApprovalAnswer(BaseModel):
+    approve: bool
+    note: str = ""
+
+
+@app.get("/api/approvals")
+async def list_approvals(request: Request, status: str | None = None, session: str | None = None):
+    """Approvals of the caller's session (newest last). Approver keys may name any ``session``."""
+    if session is not None and _approver(request) is not None:
+        sid = session[:200]
+    else:
+        sid = _requester_session(request)
+    if sid is None:
+        raise HTTPException(status_code=401, detail="Identify the session (X-Session-Id or API key)")
+    items = await _approvals().list(session=sid, status=status)
+    return {"approvals": [a.to_dict() for a in items]}
+
+
+@app.get("/api/approvals/{approval_id}")
+async def get_approval(approval_id: str, request: Request, wait: float = 0):
+    """Approval state. ``?wait=N`` (up to 60 s) holds the request until it is resolved."""
+    approval, _ = await _load_approval(approval_id, request, write=False)
+    if wait > 0 and approval.status == "pending":
+        approval = await _approvals().wait(approval.id, min(float(wait), 60.0)) or approval
+    return approval.to_dict()
+
+
+@app.post("/api/approvals/{approval_id}")
+async def answer_approval(approval_id: str, answer: ApprovalAnswer, request: Request):
+    approval, by = await _load_approval(approval_id, request, write=True)
+    try:
+        approval = await _approvals().resolve(approval.id, approve=answer.approve, by=by, note=answer.note)
+    except ApprovalNotPending as exc:
+        return JSONResponse({"error": str(exc), **approval.to_dict()}, status_code=409)
+    return approval.to_dict()
+
+
+@app.get("/api/policy")
+async def policy_info(request: Request):
+    """Which policy is in force: file name, hash, mode, rule ids, and whether a reload failed.
+
+    With API or approver keys configured, a valid key of either kind is
+    required: the rule ids and descriptions say what is allowed and how to
+    reach it. The absolute path and the parse error stay in the server log.
+    """
+    _require_a_key(request)
+    store = _policy_store()
+    loaded = store.get()
+    return {
+        "file": Path(loaded.path).name,
+        "sha256": loaded.sha256,
+        "version": loaded.policy.version,
+        "mode": loaded.policy.mode,
+        "default_effect": loaded.policy.default_effect,
+        "rules": [{"id": r.id, "phase": r.phase, "effect": r.effect, "description": r.description}
+                  for r in loaded.policy.rules],
+        "reload_failed": store.last_error is not None,
+    }
+
+
+@app.get("/api/taxonomy")
+async def taxonomy():
+    """OWASP LLM Top 10 (2025) and Agentic Top 10 (2026) labels, plus the rule mapping."""
+    return taxonomy_payload()
 
 
 @app.post("/api/targets/verify")
 async def verify_target(body: dict):
-    """Verify a target app has guardian-tap installed and is reachable."""
-    import httpx
+    """Verify a target app has guardian-tap installed and is reachable.
 
-    ws_url = body.get("ws_url", "")
-    if not ws_url:
+    The URL comes from an unauthenticated browser, so it is checked before any
+    request is made: ws/wss only, every resolved address must be public (unless
+    ALLOW_PRIVATE_TARGETS is set), redirects are refused, and both the health
+    check and the WebSocket handshake connect to the address that was checked.
+    """
+    import httpx
+    import websockets
+
+    ws_url = body.get("ws_url", "") if isinstance(body, dict) else ""
+    if not ws_url or not isinstance(ws_url, str):
         return JSONResponse({"error": "No URL provided"}, status_code=400)
 
-    health_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    try:
+        target = await netguard.check_target_url(
+            ws_url, allow_private=settings.allow_private_targets, resolver=app.state.resolver,
+        )
+    except netguard.TargetRejected as exc:
+        return {"status": "error", "code": exc.code, "message": exc.message}
+
+    request_kwargs: dict = {"headers": {"Host": target.host_header}}
+    if target.secure:
+        # TLS SNI and certificate verification use the real hostname even
+        # though the TCP connection goes to the pinned address.
+        request_kwargs["extensions"] = {"sni_hostname": target.host}
 
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(health_url)
+        async with httpx.AsyncClient(
+            timeout=10, follow_redirects=False, trust_env=False,
+            transport=app.state.verify_transport,
+        ) as client:
+            resp = await client.get(target.pinned_http_url(), **request_kwargs)
     except httpx.ConnectError:
         return {"status": "error", "code": "app_unreachable",
                 "message": "Cannot reach the app. Check that the URL is correct and the app is deployed."}
@@ -296,6 +846,11 @@ async def verify_target(body: dict):
                 "message": "The app took too long to respond. It may be starting up. Try again in a minute."}
     except Exception as e:
         return {"status": "error", "code": "connection_error", "message": f"Connection error: {e}"}
+
+    if resp.is_redirect:
+        return {"status": "error", "code": "redirect_refused",
+                "message": f"The app answered with a redirect (HTTP {resp.status_code}). GuardianAI does not follow "
+                           "redirects; register the final URL instead."}
 
     if resp.status_code == 404:
         return {"status": "error", "code": "guardian_tap_not_installed",
@@ -311,7 +866,7 @@ async def verify_target(body: dict):
         return {"status": "error", "code": "invalid_response",
                 "message": "The /ws-observe endpoint exists but did not return valid JSON. It may be conflicting with another route in your app."}
 
-    if not data.get("guardian_tap"):
+    if not isinstance(data, dict) or not data.get("guardian_tap"):
         return {"status": "error", "code": "not_guardian_tap",
                 "message": "The /ws-observe endpoint exists but is not a guardian-tap endpoint. It may be conflicting with another route in your app."}
 
@@ -320,8 +875,9 @@ async def verify_target(body: dict):
                 "message": "guardian-tap is installed, but WebSocket support is missing. For Python apps, run: pip install websockets (or add 'websockets' to requirements.txt) and redeploy."}
 
     try:
-        import websockets
-        async with websockets.connect(ws_url, open_timeout=5) as ws:
+        async with websockets.connect(
+            target.url, open_timeout=5, host=target.pinned_ip, port=target.port, proxy=None,
+        ) as ws:
             await ws.close()
     except Exception as e:
         return {"status": "error", "code": "websocket_failed",
@@ -341,12 +897,58 @@ async def index():
     return FileResponse("frontend/index.html")
 
 
+def _finite(value):
+    """Copy of value with NaN and Infinity floats replaced by their names."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
+def _ws_frame(event) -> str:
+    # ensure_ascii: text is sent escaped, so nothing in an event can fail the
+    # UTF-8 encode of the frame (send_json does not escape). allow_nan=False:
+    # json.dumps would otherwise write a bare NaN, which JSON.parse rejects,
+    # so the dashboard would drop the event and every one after it in the frame.
+    data = event.model_dump()
+    try:
+        return json.dumps(data, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(data), separators=(",", ":"), allow_nan=False)
+
+
 @app.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket):
     await websocket.accept()
 
-    # Get session ID from query param
-    sid = websocket.query_params.get("session", "default")
+    # Get session ID from query param. Sessions bound to an API key need that
+    # key (or an approver key) as ?token=.
+    sid = websocket.query_params.get("session", "default")[:200]
+    if sid.startswith(auth.APP_SESSION_PREFIX):
+        token = websocket.query_params.get("token")
+        owner = sid[len(auth.APP_SESSION_PREFIX):]
+        app_key = _api_keys().get(owner)
+        # Only sessions of configured keys exist; an approver key may watch any
+        # of them but cannot make up new app: ids (each would be a session
+        # that is never evicted while watched).
+        ok = app_key is not None and (
+            auth.match_key(token, {owner: app_key}) == owner
+            or auth.match_key(token, _approver_keys()) is not None)
+        if not ok:
+            await websocket.close(code=1008)
+            return
+    elif sid not in _sessions and (_api_keys() or _approver_keys()):
+        # With keys on, an unauthenticated socket may watch a session that
+        # exists but not create one: otherwise anyone could fill the session
+        # table with new ids and push real sessions out.
+        token = websocket.query_params.get("token")
+        if token is None or (auth.match_key(token, _api_keys()) is None
+                             and auth.match_key(token, _approver_keys()) is None):
+            await websocket.close(code=1008)
+            return
     session = _get_session(sid)
     bus = session["bus"]
 
@@ -361,13 +963,35 @@ async def websocket_events(websocket: WebSocket):
     ))
 
     queue = bus.subscribe()
+
+    async def pump() -> None:
+        try:
+            while True:
+                event = await queue.get()
+                await websocket.send_text(_ws_frame(event))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Close rather than leave a live but silent socket: the dashboard
+            # reconnects on close. The client's close reply ends the loop below.
+            logger.warning("dashboard socket for %s closed after a failed send: %s", sid, type(exc).__name__)
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+
+    # Send from a task and listen here, so a closed tab (or a server shutdown)
+    # ends the handler at once instead of on the next event that fails to send.
+    sender = asyncio.create_task(pump())
     try:
         while True:
-            event = await queue.get()
-            await websocket.send_json(event.model_dump())
-    except WebSocketDisconnect:
-        bus.unsubscribe(queue)
-    except Exception:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        sender.cancel()
         bus.unsubscribe(queue)
 
 

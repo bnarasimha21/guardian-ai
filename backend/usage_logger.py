@@ -1,15 +1,34 @@
-"""Log usage to Supabase for analytics. Non-blocking, fails silently."""
+"""Optional usage analytics to Supabase.
 
-import os
+Off unless ``GUARDIAN_USAGE_LOGGING`` is true and ``SUPABASE_URL`` and
+``SUPABASE_ANON_KEY`` are set. The rows include session ids, IP addresses and
+user agents, so keep the table unreadable by the anon role (see
+create_table.sql). Decisions are traced with OpenTelemetry instead (see
+backend/telemetry.py); this logger is a side channel for the hosted demo.
+
+Calls are fire-and-forget: a failure is logged as a warning and never affects
+a decision.
+"""
+
 import logging
+import os
 
 import httpx
+
+from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 TABLE = "guardian_ai_usage"
+
+# Tests replace this with an httpx.MockTransport.
+transport: httpx.AsyncBaseTransport | None = None
+
+
+def enabled() -> bool:
+    return bool(settings.guardian_usage_logging and SUPABASE_URL and SUPABASE_KEY)
 
 
 async def log_event(
@@ -26,8 +45,8 @@ async def log_event(
     user_agent: str = "",
     ip_address: str = "",
 ):
-    """Log a usage event to Supabase. Non-blocking, fails silently."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    """Insert one usage row, if usage logging is enabled."""
+    if not enabled():
         return
 
     row = {
@@ -46,8 +65,8 @@ async def log_event(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(
+        async with httpx.AsyncClient(timeout=5, transport=transport) as client:
+            resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/{TABLE}",
                 json=row,
                 headers={
@@ -57,5 +76,7 @@ async def log_event(
                     "Prefer": "return=minimal",
                 },
             )
-    except Exception:
-        pass
+        if resp.status_code >= 400:
+            logger.warning("usage log rejected by Supabase: HTTP %s", resp.status_code)
+    except Exception as exc:
+        logger.warning("usage log to Supabase failed: %s", type(exc).__name__)

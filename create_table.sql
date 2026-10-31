@@ -17,16 +17,21 @@ CREATE TABLE IF NOT EXISTS guardian_ai_usage (
     ip_address TEXT
 );
 
--- Enable Row Level Security but allow inserts from anon
+-- Row Level Security: the anon key (shipped to the server, and public in the
+-- hosted demo) may insert rows but never read them. Rows hold session ids, IP
+-- addresses, user agents and block reasons. Read them in the Supabase
+-- dashboard or with the service role key, which bypasses RLS.
 ALTER TABLE guardian_ai_usage ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Allow anonymous inserts" ON guardian_ai_usage;
 CREATE POLICY "Allow anonymous inserts" ON guardian_ai_usage
     FOR INSERT TO anon WITH CHECK (true);
 
-CREATE POLICY "Allow anonymous reads" ON guardian_ai_usage
-    FOR SELECT TO anon USING (true);
+-- Older versions of this script let anon read every row. Remove that policy
+-- if it exists.
+DROP POLICY IF EXISTS "Allow anonymous reads" ON guardian_ai_usage;
 
 -- Indexes
-CREATE INDEX idx_guardian_usage_created_at ON guardian_ai_usage(created_at DESC);
-CREATE INDEX idx_guardian_usage_session ON guardian_ai_usage(session_id);
-CREATE INDEX idx_guardian_usage_event_type ON guardian_ai_usage(event_type);
+CREATE INDEX IF NOT EXISTS idx_guardian_usage_created_at ON guardian_ai_usage(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_guardian_usage_session ON guardian_ai_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_guardian_usage_event_type ON guardian_ai_usage(event_type);

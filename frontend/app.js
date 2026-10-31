@@ -18,17 +18,87 @@ function getSessionId() {
     }
     return sid;
 }
-const SESSION_ID = getSessionId();
+// ?session=app:<name>#token=<key> watches the session of an API-key caller.
+// The token is an approver key (or that app's key); it is kept for this tab
+// only. The fragment is never sent to the server, so the key stays out of
+// access logs and proxies; ?token= is still read for old links. Either way it
+// is removed from the address bar and history as soon as it is read.
+const URL_PARAMS = new URLSearchParams(location.search);
+const HASH_PARAMS = new URLSearchParams(location.hash.replace(/^#/, ''));
+// Read the token raw: URLSearchParams turns '+' into a space, which breaks
+// base64 keys. Only %XX escapes are decoded.
+function rawParam(query, name) {
+    for (const part of query.replace(/^[?#]/, '').split('&')) {
+        const eq = part.indexOf('=');
+        if (eq > 0 && part.slice(0, eq) === name) {
+            try { return decodeURIComponent(part.slice(eq + 1)); } catch { return part.slice(eq + 1); }
+        }
+    }
+    return null;
+}
+const URL_TOKEN = rawParam(location.hash, 'token') || rawParam(location.search, 'token');
+if (URL_TOKEN) sessionStorage.setItem('guardian_token', URL_TOKEN);
+if (URL_PARAMS.has('token') || HASH_PARAMS.has('token')) {
+    URL_PARAMS.delete('token');
+    HASH_PARAMS.delete('token');
+    history.replaceState(null, '', location.pathname
+        + (URL_PARAMS.toString() ? '?' + URL_PARAMS : '')
+        + (HASH_PARAMS.toString() ? '#' + HASH_PARAMS : ''));
+}
+const AUTH_TOKEN = sessionStorage.getItem('guardian_token') || '';
+const SESSION_ID = URL_PARAMS.get('session') || getSessionId();
+const IS_APP_SESSION = SESSION_ID.startsWith('app:');
 
 function apiHeaders() {
-    return { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID };
+    const h = { 'Content-Type': 'application/json' };
+    // app:* sessions are chosen by the API key, never by the header.
+    if (!IS_APP_SESSION) h['X-Session-Id'] = SESSION_ID;
+    if (AUTH_TOKEN) h['Authorization'] = `Bearer ${AUTH_TOKEN}`;
+    return h;
+}
+
+// ---- OWASP taxonomy (served by /api/taxonomy, never hard-coded here) ----
+
+let TAXONOMY = { owasp_llm: { items: {} }, owasp_agentic: { items: {} }, rules: {} };
+
+async function loadTaxonomy() {
+    try {
+        const resp = await fetch(`${BASE_PATH}/api/taxonomy`);
+        TAXONOMY = await resp.json();
+        renderRuleChips();
+    } catch (e) {
+        console.error('Failed to load taxonomy:', e);
+    }
+}
+
+function renderRuleChips() {
+    const wrap = document.getElementById('ruleChips');
+    if (!wrap) return;
+    const rules = Object.entries(TAXONOMY.rules || {}).filter(([, r]) => r.owasp_llm || r.owasp_agentic);
+    const seen = new Set();
+    const chips = [];
+    rules.forEach(([, r]) => {
+        const key = r.owasp_llm;
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        const label = TAXONOMY.owasp_llm.items[key]?.label || '';
+        chips.push(`<span class="empty-rule-chip">${escapeHtml(key)} ${escapeHtml(label)}</span>`);
+    });
+    wrap.innerHTML = chips.join('');
+    const hint = document.getElementById('ruleHint');
+    if (hint) {
+        const agentic = new Set(rules.map(([, r]) => r.owasp_agentic).filter(Boolean));
+        hint.textContent = `${rules.length} detectors mapped to ${seen.size} OWASP LLM 2025 and ${agentic.size} Agentic 2026 categories`;
+    }
 }
 
 // ---- WebSocket Connection ----
 
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events?session=${SESSION_ID}`);
+    const q = new URLSearchParams({ session: SESSION_ID });
+    if (AUTH_TOKEN) q.set('token', AUTH_TOKEN);
+    ws = new WebSocket(`${protocol}//${location.host}${BASE_PATH}/ws/events?${q}`);
 
     ws.onopen = () => console.log('[Guardian] Connected to event stream');
 
@@ -61,6 +131,130 @@ function handleEvent(event) {
         case 'status':
             updateStatus(event);
             break;
+        case 'approval':
+            renderApproval(event);
+            break;
+    }
+}
+
+// ---- Approvals lane ----
+// One card per approval. Pending cards have Approve / Deny; resolved cards
+// keep their outcome so the history stays visible.
+
+function approvalStatusLabel(a) {
+    if (a.status === 'pending') return 'WAITING';
+    if (a.status === 'approved') return Number(a.uses) > 0 ? `APPROVED, USED ${Number(a.uses)}x` : 'APPROVED';
+    if (a.reason === 'timeout') return 'DENIED (TIMEOUT)';
+    return 'DENIED';
+}
+
+function fmtValue(v) {
+    return typeof v === 'string' ? v : JSON.stringify(v);
+}
+
+function renderApproval(a) {
+    // ApprovalEvent (from the socket) and /api/approvals items differ only in field names.
+    a = { ...a, tool_name: a.tool_name || a.tool, policy_rule_id: a.policy_rule_id || a.rule_id };
+    const lane = document.getElementById('approvalsLane');
+    const list = document.getElementById('approvalList');
+    if (!lane || !list) return;
+    lane.hidden = false;
+
+    let card = list.querySelector(`[data-approval-id="${CSS.escape(a.approval_id)}"]`);
+    if (!card) {
+        card = document.createElement('div');
+        card.className = 'approval-card';
+        card.dataset.approvalId = a.approval_id;
+        list.prepend(card);
+    }
+    card.dataset.status = a.status;
+
+    const args = Object.entries(a.arguments || {})
+        .map(([k, v]) => `<div class="approval-arg"><span class="arg-path">${escapeHtml(k)}</span> ${escapeHtml(fmtValue(v))}</div>`)
+        .join('');
+    const diff = (a.diff || []).map(d => {
+        if (d.change === 'added') return `<div class="diff-row diff-added">+ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.after))}</div>`;
+        if (d.change === 'removed') return `<div class="diff-row diff-removed">- ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))}</div>`;
+        const beyond = d.beyond_preview ? ' (differs after the part shown)' : '';
+        return `<div class="diff-row diff-changed">~ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))} &rarr; ${escapeHtml(fmtValue(d.after))}${beyond}</div>`;
+    }).join('') + (a.diff_truncated ? '<div class="diff-row">more changes not listed</div>' : '');
+    const diffHtml = a.diff_from
+        ? `<div class="approval-section"><div class="expand-label">Changed since ${escapeHtml(a.diff_from)}</div>${diff || '<div class="diff-row">no argument changes</div>'}</div>`
+        : '';
+    const expires = a.status === 'pending' && a.expires_at
+        ? `<span class="approval-expiry" data-expires="${Number(a.expires_at)}"></span>` : '';
+    // A preview or change list cut short means the approver cannot see the
+    // whole call, so the dashboard offers Deny only; approving it is a
+    // deliberate API call.
+    const incomplete = a.preview_truncated || a.diff_truncated;
+    const cut = incomplete
+        ? `<div class="approval-outcome approval-error">${a.preview_truncated ? 'The arguments are too large to show in full.' : 'Too many arguments changed to list them all.'} Approve is disabled here; review the full call and answer through POST /api/approvals/${escapeHtml(a.approval_id)}.</div>` : '';
+    const buttons = a.status === 'pending' ? `
+        ${cut}
+        <div class="approval-actions">
+            ${incomplete ? '' : '<button class="btn-approve" data-answer="true">Approve</button>'}
+            <button class="btn-deny" data-answer="false">Deny</button>
+        </div>` : '';
+    const outcome = a.status !== 'pending'
+        ? `<div class="approval-outcome">${a.reason === 'timeout' ? 'No answer in time, denied' : (a.status === 'approved' ? 'Approved' : 'Denied')}${a.resolved_by && a.reason !== 'timeout' ? ' by ' + escapeHtml(a.resolved_by === 'session' ? 'this dashboard session' : a.resolved_by) : ''}${a.note ? ': ' + escapeHtml(a.note) : ''}</div>` : '';
+
+    card.innerHTML = `
+        <div class="approval-head">
+            <span class="approval-status status-${escapeAttr(a.status)}">${approvalStatusLabel(a)}</span>
+            <span class="decision-tool">${escapeHtml(a.tool_name || '')}${a.agent ? ' (' + escapeHtml(a.agent) + ')' : ''}</span>
+            ${expires}
+        </div>
+        <div class="decision-rule">Policy rule: ${escapeHtml(a.policy_rule_id || '')} &middot; ${escapeHtml(a.approval_id)}</div>
+        <div class="approval-section">${args || '<div class="approval-arg">no arguments</div>'}</div>
+        ${diffHtml}
+        ${outcome}
+        ${buttons}`;
+    card.querySelectorAll('button[data-answer]').forEach(btn => {
+        btn.addEventListener('click', () => answerApproval(a.approval_id, btn.dataset.answer === 'true', card));
+    });
+    tickApprovalExpiry();
+
+    const decision = document.querySelector(`.decision-card[data-approval-id="${CSS.escape(a.approval_id)}"] .decision-action`);
+    if (decision && a.status !== 'pending') decision.textContent = approvalStatusLabel(a);
+}
+
+async function answerApproval(id, approve, card) {
+    card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    try {
+        const resp = await fetch(`${BASE_PATH}/api/approvals/${encodeURIComponent(id)}`, {
+            method: 'POST', headers: apiHeaders(), body: JSON.stringify({ approve }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok || resp.status === 409) {
+            renderApproval(data);
+        } else {
+            card.querySelector('.approval-outcome')?.remove();
+            card.insertAdjacentHTML('beforeend', `<div class="approval-outcome approval-error">${escapeHtml(data.detail || data.error || 'HTTP ' + resp.status)}</div>`);
+            card.querySelectorAll('button').forEach(b => { b.disabled = false; });
+        }
+    } catch (e) {
+        card.querySelectorAll('button').forEach(b => { b.disabled = false; });
+    }
+}
+
+function tickApprovalExpiry() {
+    const now = Date.now() / 1000;
+    document.querySelectorAll('.approval-expiry[data-expires]').forEach(el => {
+        const left = Math.max(0, Math.round(Number(el.dataset.expires) - now));
+        el.textContent = left > 0 ? `${left}s left` : 'expiring';
+    });
+}
+setInterval(tickApprovalExpiry, 1000);
+
+async function loadApprovals() {
+    try {
+        const q = IS_APP_SESSION ? `?session=${encodeURIComponent(SESSION_ID)}` : '';
+        const resp = await fetch(`${BASE_PATH}/api/approvals${q}`, { headers: apiHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        (data.approvals || []).forEach(renderApproval);
+    } catch (e) {
+        console.error('Failed to load approvals:', e);
     }
 }
 
@@ -73,8 +267,8 @@ function renderActivityCard(event) {
 
     const card = document.createElement('div');
     const data = event.data || {};
-    const elapsed = `<span class="elapsed-badge">${event.elapsed.toFixed(1)}s</span>`;
-    const taskTag = event.task_id ? `<span class="task-tag">${event.task_id}</span>` : '';
+    const elapsed = `<span class="elapsed-badge">${Number(event.elapsed || 0).toFixed(1)}s</span>`;
+    const taskTag = event.task_id ? `<span class="task-tag">${escapeHtml(String(event.task_id))}</span>` : '';
     const label = formatEventType(event.event_type);
     const category = classifyEvent(event);
 
@@ -111,12 +305,12 @@ function renderActivityCard(event) {
         }
 
         case 'agent': {
-            const agentName = (event.agent || data.agent || data.name || 'agent').toUpperCase();
+            const agentName = String(event.agent || data.agent || data.name || 'agent').toUpperCase();
             card.className = `event-card agent-start-card`;
             card.style.borderLeftColor = agentColor(agentName);
             body = `
                 <div class="agent-start-row">
-                    ${iconSvg('zap')}<span class="agent-name" style="color:${agentColor(agentName)}">${agentName}</span>${source}${taskTag}${elapsed}
+                    ${iconSvg('zap')}<span class="agent-name" style="color:${agentColor(agentName)}">${escapeHtml(agentName)}</span>${source}${taskTag}${elapsed}
                 </div>`;
             break;
         }
@@ -132,7 +326,7 @@ function renderActivityCard(event) {
             body = `
                 <div class="card-header">${iconSvg('bar-chart')}<span class="card-title">${label}</span>${source}${taskTag}${elapsed}</div>
                 <div class="eval-row">
-                    <span class="eval-score ${scoreClass}">${score}${typeof score === 'number' ? '/10' : ''}</span>
+                    <span class="eval-score ${scoreClass}">${escapeHtml(String(score))}${typeof score === 'number' ? '/10' : ''}</span>
                     ${passHtml}
                 </div>
                 ${strengths.length ? `<div class="eval-list eval-strengths">${strengths.map(s => '<span>+ ' + escapeHtml(String(s).substring(0, 80)) + '</span>').join('')}</div>` : ''}
@@ -280,7 +474,7 @@ function getEventBadgeClass(eventType) {
 }
 
 function formatEventType(eventType) {
-    return eventType.replace(/_/g, ' ');
+    return escapeHtml(String(eventType ?? '').replace(/_/g, ' '));
 }
 
 // ---- Render: Guardian Decisions (Right Panel) ----
@@ -289,9 +483,12 @@ function renderDecisionCard(event) {
     hideEmpty('decisionEmpty');
     const list = document.getElementById('decisionList');
 
-    const isBlocked = event.action === 'flagged' || event.action === 'blocked';
+    const isPending = event.action === 'require_approval';
+    const isBlocked = event.action === 'flagged' || event.action === 'blocked' || isPending;
     const card = document.createElement('div');
-    card.className = `event-card decision-card ${isBlocked ? 'flagged' : 'allowed'}`;
+    card.className = `event-card decision-card ${isPending ? 'pending' : (isBlocked ? 'flagged' : 'allowed')}`;
+    if (event.decision_id) card.dataset.decisionId = event.decision_id;
+    if (event.approval_id) card.dataset.approvalId = event.approval_id;
     card.dataset.source = event.details?._source || '';
     card.dataset.action = event.action || '';
     card.dataset.threat = event.threat_level || 'none';
@@ -311,27 +508,53 @@ function renderDecisionCard(event) {
         ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
         : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';
 
-    const iconClass = isBlocked ? 'flagged-icon' : 'allowed-icon';
-    const actionClass = isBlocked ? 'flagged-text' : 'allowed-text';
+    const iconClass = isPending ? 'pending-icon' : (isBlocked ? 'flagged-icon' : 'allowed-icon');
+    const actionClass = isPending ? 'pending-text' : (isBlocked ? 'flagged-text' : 'allowed-text');
+    const actionLabel = isPending ? 'NEEDS APPROVAL' : escapeHtml(String(event.action || '').toUpperCase());
+
+    // Where the decision was made: observed on the passive tap (cannot stop
+    // anything), monitor mode (enforcement off) or enforced inline.
+    let modeHtml = '';
+    if (event.observed) {
+        modeHtml = '<span class="mode-badge observed" title="Seen on the observer tap. The tap is a copy of the traffic and cannot stop the call.">OBSERVED</span>';
+    } else if (event.mode === 'monitor') {
+        modeHtml = '<span class="mode-badge observed" title="Policy is in monitor mode: the call was let through.">MONITOR</span>';
+    } else if (event.enforced) {
+        modeHtml = '<span class="mode-badge enforced" title="Decided inline by the policy engine.">ENFORCED</span>';
+    }
+    const effectHtml = event.effect && event.effect !== 'allow'
+        ? `<span class="mode-badge effect">policy: ${escapeHtml(event.effect)}</span>` : '';
 
     // Threat level badge
     let threatHtml = '';
     if (event.threat_level && event.threat_level !== 'none') {
-        threatHtml = `<span class="threat-level ${event.threat_level}">${event.threat_level.toUpperCase()}</span>`;
+        const level = String(event.threat_level);
+        threatHtml = `<span class="threat-level ${escapeAttr(level)}">${escapeHtml(level.toUpperCase())}</span>`;
     } else if (!isBlocked) {
         threatHtml = '<span class="threat-level none">SAFE</span>';
     }
 
-    // OWASP badge
+    // OWASP badges: LLM Top 10 (2025) and Agentic Top 10 (2026)
     let owaspHtml = '';
-    if (event.owasp_id) {
-        owaspHtml = `<span class="owasp-badge" title="${escapeHtml(event.owasp_label || '')}">${escapeHtml(event.owasp_id)}</span>`;
+    const llmId = event.owasp_llm || event.owasp_id || '';
+    if (llmId) {
+        owaspHtml += `<span class="owasp-badge" title="${escapeAttr(owaspLabel('owasp_llm', llmId))}">${escapeHtml(llmId)}</span>`;
+    }
+    if (event.owasp_agentic) {
+        owaspHtml += `<span class="owasp-badge" title="${escapeAttr(owaspLabel('owasp_agentic', event.owasp_agentic))}">${escapeHtml(event.owasp_agentic)}</span>`;
     }
 
     // Rule name
     let ruleHtml = '';
-    if (event.rule_name) {
-        ruleHtml = `<div class="decision-rule">Rule: ${escapeHtml(event.rule_name)}</div>`;
+    if (event.policy_rule_id || event.rule_name) {
+        const parts = [];
+        if (event.policy_rule_id) parts.push(`Policy rule: ${escapeHtml(event.policy_rule_id)}`);
+        if (event.matched_detectors && event.matched_detectors.length) {
+            parts.push(`Detectors: ${escapeHtml(event.matched_detectors.join(', '))}`);
+        } else if (event.rule_name && !event.policy_rule_id) {
+            parts.push(`Rule: ${escapeHtml(event.rule_name)}`);
+        }
+        ruleHtml = `<div class="decision-rule">${parts.join(' &middot; ')}</div>`;
     }
 
     // Reason
@@ -344,8 +567,9 @@ function renderDecisionCard(event) {
     const srcName = event.details?._source || '';
     const srcHtml = srcName ? `<span class="source-badge" style="background:${sourceColor(srcName)}">${escapeHtml(srcName)}</span>` : '';
 
-    const eventLabel = formatEventType(event.event_type);
-    const agentLabel = event.agent ? ` (${event.agent})` : '';
+    const eventLabel = event.tool_name && !String(event.tool_name).startsWith('guardian.')
+        ? escapeHtml(event.tool_name) : formatEventType(event.event_type);
+    const agentLabel = event.agent ? ` (${escapeHtml(event.agent)})` : '';
 
     // Details (exclude _source from display)
     let detailsHtml = '';
@@ -359,8 +583,14 @@ function renderDecisionCard(event) {
     // Build expandable detail panel for flagged cards
     let expandHtml = '';
     if (isBlocked) {
-        const owaspInfo = getOwaspInfo(event.owasp_id);
         const remediation = getRemediation(event.rule_name);
+        const owaspSections = [['owasp_llm', llmId], ['owasp_agentic', event.owasp_agentic]]
+            .filter(([kind, id]) => id && getOwaspInfo(kind, id))
+            .map(([kind, id]) => `
+            <div class="expand-section">
+                <div class="expand-label">OWASP ${escapeHtml(id)}: ${escapeHtml(owaspLabel(kind, id))}</div>
+                <div class="expand-text">${escapeHtml(getOwaspInfo(kind, id))}</div>
+            </div>`).join('');
 
         expandHtml = `
         <div class="decision-expand" style="display:none">
@@ -368,14 +598,10 @@ function renderDecisionCard(event) {
                 <div class="expand-label">What happened</div>
                 <div class="expand-text">${escapeHtml(event.reason || '')}</div>
             </div>
-            ${owaspInfo ? `
-            <div class="expand-section">
-                <div class="expand-label">OWASP ${escapeHtml(event.owasp_id)}: ${escapeHtml(event.owasp_label || '')}</div>
-                <div class="expand-text">${owaspInfo}</div>
-            </div>` : ''}
+            ${owaspSections}
             <div class="expand-section">
                 <div class="expand-label">How to fix</div>
-                <div class="expand-text">${remediation}</div>
+                <div class="expand-text">${escapeHtml(remediation)}</div>
             </div>
             ${detailsHtml ? `
             <div class="expand-section">
@@ -386,21 +612,25 @@ function renderDecisionCard(event) {
     }
 
     card.innerHTML = `
-        <div class="decision-header ${isBlocked ? 'clickable' : ''}" ${isBlocked ? 'onclick="toggleExpand(this)"' : ''}>
+        <div class="decision-header ${isBlocked ? 'clickable' : ''}">
             <div class="decision-icon ${iconClass}">${decisionIcon}</div>
-            <span class="decision-action ${actionClass}">${event.action.toUpperCase()}</span>
+            <span class="decision-action ${actionClass}">${actionLabel}</span>
             ${srcHtml}
             <span class="decision-tool">${eventLabel}${agentLabel}</span>
             ${isBlocked ? '<span class="expand-arrow">&#9662;</span>' : ''}
         </div>
         <div class="decision-badges">
-            ${threatHtml}${owaspHtml}
+            ${threatHtml}${modeHtml}${effectHtml}${owaspHtml}
         </div>
         ${reasonHtml}
         ${ruleHtml}
         ${expandHtml}
     `;
 
+    if (isBlocked) {
+        const header = card.querySelector('.decision-header');
+        if (header) header.addEventListener('click', () => toggleExpand(header));
+    }
     list.appendChild(card);
     scrollToBottom(list);
 
@@ -457,16 +687,25 @@ function addTimelineNode(isBlocked) {
 
 function updateCounter(id, value) {
     const el = document.getElementById(id);
+    if (!el) return;
     const num = el.querySelector('.counter-num');
+    if (!num) return;
     num.textContent = value;
     num.style.transform = 'scale(1.3)';
     setTimeout(() => { num.style.transform = 'scale(1)'; }, 200);
 }
 
+// Text from events, approvals and targets is untrusted (an agent names itself,
+// a tool returns any string). Escape it for both text and quoted attributes.
 function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(str ?? '').replace(/[&<>"']/g, c => map[c]);
+}
+
+// Kept as its own name for attribute contexts; values reach handlers through
+// data-* attributes, never through inline JS strings.
+function escapeAttr(str) {
+    return escapeHtml(str);
 }
 
 function scrollToBottom(el) {
@@ -534,6 +773,7 @@ function onAppSelect() {
 // ---- App Management ----
 
 async function loadTargets() {
+    if (IS_APP_SESSION) return;  // API-key sessions have no observed targets
     try {
         const resp = await fetch(`${BASE_PATH}/api/targets`, { headers: apiHeaders() });
         const data = await resp.json();
@@ -566,10 +806,10 @@ function updateAppsList(targets) {
     }
     list.innerHTML = targets.map(t => `
         <div class="app-item">
-            <span class="app-status-dot ${t.status}"></span>
+            <span class="app-status-dot ${escapeAttr(t.status)}"></span>
             <span class="app-item-name">${escapeHtml(t.name)}</span>
             <span class="app-item-url">${escapeHtml(t.ws_url)}</span>
-            <button class="app-remove-btn" onclick="removeApp('${escapeHtml(t.name)}')" title="Disconnect">&times;</button>
+            <button class="app-remove-btn" data-name="${escapeAttr(t.name)}" title="Disconnect">&times;</button>
         </div>
     `).join('');
 }
@@ -681,6 +921,11 @@ function renderVerifyError(data) {
         'connection_error': 'Check the URL and your network connection.',
         'missing_fields': 'Enter both an app name and URL.',
         'register_failed': 'The app was verified but registration failed. Try again.',
+        'blocked_address': 'GuardianAI only connects to public addresses. For a local app, run GuardianAI yourself with <code>ALLOW_PRIVATE_TARGETS=true</code>.',
+        'invalid_scheme': 'Use an http(s) app URL; GuardianAI connects to its /ws-observe WebSocket.',
+        'invalid_url': 'Check the URL. Credentials in the URL are not supported.',
+        'dns_failed': 'The hostname did not resolve. Check for typos.',
+        'redirect_refused': 'Register the final URL your app redirects to (for example with or without www).',
     };
 
     const fix = fixes[data.code] || 'Check the URL and try again.';
@@ -734,27 +979,27 @@ function renderSummary() {
     let checked, flagged, allowed, blocked, byRule, bySeverity;
     if (selectedApp !== '__all' && event.per_app && event.per_app[selectedApp]) {
         const appStats = event.per_app[selectedApp];
-        checked = appStats.checked || 0;
-        flagged = appStats.flagged || 0;
-        allowed = appStats.allowed || 0;
-        blocked = appStats.blocked || 0;
+        checked = Number(appStats.checked) || 0;
+        flagged = Number(appStats.flagged) || 0;
+        allowed = Number(appStats.allowed) || 0;
+        blocked = Number(appStats.blocked) || 0;
         byRule = appStats.by_rule || {};
         bySeverity = appStats.by_severity || {};
     } else {
-        checked = event.total_checked || 0;
-        flagged = event.total_flagged || 0;
-        allowed = event.total_allowed || 0;
-        blocked = event.total_blocked || 0;
+        checked = Number(event.total_checked) || 0;
+        flagged = Number(event.total_flagged) || 0;
+        allowed = Number(event.total_allowed) || 0;
+        blocked = Number(event.total_blocked) || 0;
         byRule = event.by_rule || {};
         bySeverity = event.by_severity || {};
     }
 
     const ruleChips = Object.entries(byRule).map(([rule, count]) =>
-        `<span class="summary-chip summary-chip-flagged">${escapeHtml(rule)}: ${count}</span>`
+        `<span class="summary-chip summary-chip-flagged">${escapeHtml(rule)}: ${Number(count) || 0}</span>`
     ).join('');
 
     const sevChips = Object.entries(bySeverity).map(([sev, count]) =>
-        `<span class="summary-chip severity-${sev}">${sev.toUpperCase()}: ${count}</span>`
+        `<span class="summary-chip severity-${escapeAttr(sev)}">${escapeHtml(String(sev).toUpperCase())}: ${Number(count) || 0}</span>`
     ).join('');
 
     const statusClass = flagged > 0 ? 'summary-warning' : 'summary-clean';
@@ -794,7 +1039,8 @@ function filterDecisions() {
 
 function matchesDecisionFilter(card, filter) {
     if (filter === '__all') return true;
-    if (filter === 'flagged') return card.dataset.action === 'flagged' || card.dataset.action === 'blocked';
+    if (filter === 'flagged') return ['flagged', 'blocked', 'require_approval'].includes(card.dataset.action);
+    if (filter === 'require_approval') return card.dataset.action === 'require_approval';
     if (filter === 'allowed') return card.dataset.action === 'allowed';
     // critical, high, medium
     return card.dataset.threat === filter;
@@ -813,29 +1059,17 @@ function toggleExpand(headerEl) {
     if (arrow) arrow.textContent = isOpen ? '\u25BE' : '\u25B4';
 }
 
-function getOwaspInfo(id) {
-    const info = {
-        'LLM01': 'An attacker manipulates the LLM through crafted inputs, causing it to execute unintended actions. This can bypass safety measures, produce harmful outputs, or leak sensitive information.',
-        'LLM02': 'When an LLM generates output that is not properly validated or sanitized before being passed to downstream systems. This can lead to XSS, SQL injection, or command injection in connected components.',
-        'LLM05': 'Vulnerabilities in the supply chain of LLM components (training data, models, plugins) that can be exploited to manipulate model behavior or introduce backdoors.',
-        'LLM06': 'The LLM may reveal confidential information, proprietary algorithms, API keys, or other sensitive data through its responses. This can happen when sensitive data appears in training data or user prompts.',
-        'LLM07': 'An LLM-based system is granted excessive capabilities (file access, code execution, API calls) beyond what is needed, and an attacker exploits this to perform unauthorized actions.',
-    };
-    return info[id] || '';
+function owaspLabel(kind, id) {
+    return TAXONOMY[kind]?.items?.[id]?.label || '';
+}
+
+function getOwaspInfo(kind, id) {
+    return TAXONOMY[kind]?.items?.[id]?.description || '';
 }
 
 function getRemediation(ruleName) {
-    const fixes = {
-        'prompt_injection': 'Sanitize user inputs before passing to the LLM. Use input validation, system prompt hardening, and output filtering. Consider using a separate LLM call to detect injection attempts before processing.',
-        'sensitive_data_leak': 'Never include real credentials, API keys, or tokens in LLM prompts. Use placeholder values in examples. Add output scanning to redact patterns like sk-*, AKIA*, private keys before returning responses to users.',
-        'data_exfiltration': 'Block or allowlist outbound URLs that the agent can access. Never allow agents to send data to arbitrary external endpoints. Use egress filtering and monitor outbound connections.',
-        'ssrf': 'Validate and sanitize all URLs before making requests. Block access to internal/private IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x, localhost). Use URL allowlists for permitted external services.',
-        'dangerous_code': 'Run agent-generated code in sandboxed environments with restricted permissions. Never execute code with elevated privileges. Disable dangerous functions (eval, exec, os.system) in the execution environment.',
-        'injection': 'Use parameterized queries for database access. Sanitize all LLM outputs before rendering in HTML or passing to command interpreters. Apply Content Security Policy headers.',
-        'excessive_agency': 'Follow the principle of least privilege. Only grant agents the minimum permissions needed for their task. Require human approval for high-impact actions (deployments, deletions, infrastructure changes).',
-        'eval_manipulation': 'Monitor evaluation scores for anomalies. Validate that agent outputs meet quality thresholds. Use independent evaluation (separate LLM or rule-based checks) to verify results.',
-    };
-    return fixes[ruleName] || 'Review the flagged content and ensure your agent follows security best practices.';
+    return TAXONOMY.rules?.[ruleName]?.remediation
+        || 'Review the flagged content and the policy rule that matched it.';
 }
 
 // ---- Activity filter ----
@@ -856,7 +1090,7 @@ function filterActivity() {
 function switchStack(stack) {
     // Toggle tab active state
     document.querySelectorAll('.stack-tab').forEach(t => t.classList.remove('active'));
-    document.querySelector(`.stack-tab[onclick="switchStack('${stack}')"]`).classList.add('active');
+    document.querySelector(`.stack-tab[data-stack="${CSS.escape(stack)}"]`)?.classList.add('active');
 
     // Toggle content visibility
     document.getElementById('stack-python').style.display = stack === 'python' ? '' : 'none';
@@ -865,6 +1099,34 @@ function switchStack(stack) {
     document.getElementById('code-node').style.display = stack === 'node' ? '' : 'none';
 }
 
+// ---- Wiring ----
+// No inline handlers: the page's Content-Security-Policy allows scripts from
+// static/ only, so every listener is attached here.
+
+function on(id, type, handler) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener(type, handler);
+}
+
+function wireUi() {
+    on('appSelect', 'change', onAppSelect);
+    on('activityFilter', 'change', filterActivity);
+    on('decisionFilter', 'change', filterDecisions);
+    on('connectBtn', 'click', connectApp);
+    on('addModal', 'click', closeAddModal);
+    document.querySelectorAll('[data-open-modal]').forEach(b => b.addEventListener('click', openAddModal));
+    document.querySelectorAll('.modal-close').forEach(b => b.addEventListener('click', () => closeAddModal()));
+    document.querySelectorAll('.stack-tab[data-stack]').forEach(b =>
+        b.addEventListener('click', () => switchStack(b.dataset.stack)));
+    on('appsList', 'click', e => {
+        const btn = e.target.closest('.app-remove-btn');
+        if (btn) removeApp(btn.dataset.name);
+    });
+}
+
 // ---- Init ----
+wireUi();
+loadTaxonomy();
 connectWebSocket();
 loadTargets();
+loadApprovals();

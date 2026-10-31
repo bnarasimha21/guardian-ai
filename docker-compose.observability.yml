@@ -1,0 +1,26 @@
+# Local trace viewing for GuardianAI. Not started by the tests.
+#
+#   docker compose -f docker-compose.observability.yml up -d
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 python server.py
+#   open http://localhost:16686   (Jaeger UI, service "guardian-ai")
+#
+# GuardianAI sends OTLP over HTTP to the collector on 4318; the collector
+# forwards to Jaeger over OTLP gRPC.
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.111.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"

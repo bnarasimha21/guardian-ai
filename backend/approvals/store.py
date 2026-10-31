@@ -1,0 +1,580 @@
+"""Pending human approvals for ``require_approval`` decisions.
+
+An approval is bound to one exact call: ``sha256`` of the tool name, server and
+canonical JSON arguments, plus the session and the caller. A call that differs
+in any argument needs its own approval.
+
+Lifecycle::
+
+    pending --approve--> approved --(used once, or reused until grant TTL)--> spent
+           \\--deny-----> denied
+            \\--timeout--> denied (reason "timeout")   fail closed
+
+``ApprovalStore`` is the interface; ``InMemoryApprovalStore`` keeps everything
+in process memory (lost on restart, one process only). A SQLite or Redis
+implementation can replace it behind the same methods.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import math
+import re
+import secrets
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
+
+PENDING = "pending"
+APPROVED = "approved"
+DENIED = "denied"
+
+MAX_APPROVALS = 10_000
+MAX_PENDING_PER_SESSION = 100
+# Resolved approvals are kept this long after they stop mattering, so a poller
+# that comes back late still gets an answer, then pruned.
+RETAIN_SECONDS = 3600
+MAX_PREVIEW_PATHS = 200
+MAX_PREVIEW_CHARS = 500
+NOT_SHOWN = "(not in the preview)"
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+class ApprovalError(Exception):
+    pass
+
+
+class ApprovalNotPending(ApprovalError):
+    """The approval was already resolved (or timed out)."""
+
+
+class ApprovalCapacityError(ApprovalError):
+    """Too many approvals held; the call is refused rather than queued."""
+
+
+def arguments_sha256(tool: str, server: str | None, arguments: Any) -> str:
+    """Hash of the exact call. Key order does not matter; any value change does."""
+    canonical = json.dumps(
+        {"tool": tool, "server": server, "arguments": arguments},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
+    )
+    # surrogatepass: a lone surrogate in an argument is still hashed (to its
+    # own distinct bytes) instead of raising.
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _display(value: Any) -> Any:
+    """``value`` as something JSON can carry: NaN and infinities become text,
+    lone surrogates become U+FFFD. The preview is for people, not the hash."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2 ** 53:
+        # A browser parses JSON numbers as doubles: 9007199254740993 would show
+        # as ...992 and a 400-digit integer as null. As text it shows exactly.
+        return str(value)
+    if isinstance(value, str):
+        return _SURROGATE.sub("\ufffd", value)
+    return value
+
+
+def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
+    """{dotted.path: scalar} for display; long strings are cut."""
+    return preview(value, limit)[0]
+
+
+def preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any], bool]:
+    """``flatten`` plus whether anything was left out or cut short."""
+    out, truncated, _ = _preview(value, limit)
+    return out, truncated
+
+
+def _preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any], bool, dict[str, str]]:
+    """The preview, whether it was cut, and {exact path: label shown}. The
+    label map lets the diff read each path's own value even when two paths
+    got similar labels."""
+    out: dict[str, Any] = {}
+    labels: dict[str, str] = {}
+    truncated = False
+    stack: list[tuple[str, list, Any]] = [("", [], value)]
+    while stack:
+        if len(out) >= limit:
+            truncated = True
+            break
+        path, exact, v = stack.pop()
+        if isinstance(v, dict) and v:
+            for k in reversed(list(v.keys())):
+                stack.append((f"{path}.{k}" if path else str(k), exact + [str(k)], v[k]))
+        elif isinstance(v, list) and v:
+            for i in range(len(v) - 1, -1, -1):
+                stack.append((f"{path}.{i}" if path else str(i), exact + [i], v[i]))
+        else:
+            if isinstance(v, str) and len(v) > MAX_PREVIEW_CHARS:
+                v = v[:MAX_PREVIEW_CHARS] + "..."
+                truncated = True
+            elif not isinstance(v, (str, int, float, bool, type(None))):
+                text = str(v)
+                truncated = truncated or len(text) > MAX_PREVIEW_CHARS
+                v = text[:MAX_PREVIEW_CHARS]
+            key = path or "$"
+            if len(key) > MAX_PREVIEW_CHARS:
+                key = key[:MAX_PREVIEW_CHARS] + "..."
+                truncated = True
+            key = _display(key)
+            # Cutting, U+FFFD and dotted keys ({"a.b": 1} vs {"a": {"b": 1}})
+            # can give two arguments the same label. Neither may hide the other
+            # from the approver, so a repeat gets a numbered suffix.
+            if key in out:
+                n = 2
+                while f"{key} [{n}]" in out:
+                    n += 1
+                key = f"{key} [{n}]"
+            out[key] = _display(v)
+            labels[json.dumps(exact, ensure_ascii=False)] = key
+    return out, truncated, labels
+
+
+def _digest(value: Any) -> str:
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+
+
+def fingerprint(value: Any, labels: dict[str, str] | None = None) -> dict[str, tuple[str, str, bool]]:
+    """Every leaf of the full arguments: {exact path: (label, value hash, shown)}.
+
+    ``labels`` is the preview's {exact path: label}; a path in it is shown,
+    under that label. Any other path gets its dotted name and is not shown.
+
+    The preview is cut (MAX_PREVIEW_PATHS paths, MAX_PREVIEW_CHARS characters),
+    so diffing previews misses a change past the cut. The fingerprint has no
+    cut: the path key is the JSON list of keys and indexes (so {"a.b": 1} and
+    {"a": {"b": 1}} differ), and the value is hashed, so it stays small however
+    long the value. The scanner refuses arguments over its node limit before
+    any approval is opened, which bounds its size.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    stack: list[tuple[list, Any]] = [([], value)]
+    while stack:
+        path, v = stack.pop()
+        if isinstance(v, dict) and v:
+            for k in v:
+                stack.append((path + [str(k)], v[k]))
+        elif isinstance(v, list) and v:
+            for i, item in enumerate(v):
+                stack.append((path + [i], item))
+        else:
+            exact = json.dumps(path, ensure_ascii=False)
+            if labels is not None and exact in labels:
+                out[exact] = (labels[exact], _digest(v), True)
+                continue
+            label = ".".join(str(p) for p in path) or "$"
+            if len(label) > MAX_PREVIEW_CHARS:
+                label = label[:MAX_PREVIEW_CHARS] + "..."
+            out[exact] = (_display(label), _digest(v), False)
+    return out
+
+
+def diff(before: dict[str, Any], after: dict[str, Any],
+         before_fp: dict[str, tuple[str, str, bool]] | None = None,
+         after_fp: dict[str, tuple[str, str, bool]] | None = None,
+         limit: int = MAX_PREVIEW_PATHS) -> tuple[list[dict], bool]:
+    """Changed, added and removed paths between two argument sets, and whether
+    the list was cut at ``limit`` rows.
+
+    With fingerprints, every path of the full arguments is compared, and the
+    values shown come from the previews. A row whose shown values look equal
+    (the difference is past the cut) carries ``"beyond_preview": true``.
+    Without them, the previews are compared (older callers).
+    """
+    changes: list[dict] = []
+    if before_fp is None or after_fp is None:
+        for path in sorted(set(before) | set(after)):
+            if path not in before:
+                changes.append({"path": path, "change": "added", "after": after[path]})
+            elif path not in after:
+                changes.append({"path": path, "change": "removed", "before": before[path]})
+            elif before[path] != after[path]:
+                changes.append({"path": path, "change": "changed", "before": before[path], "after": after[path]})
+        return changes[:limit], len(changes) > limit
+    cut = False
+    for exact in sorted(set(before_fp) | set(after_fp)):
+        b, a = before_fp.get(exact), after_fp.get(exact)
+        if b is not None and a is not None and b[1] == a[1]:
+            continue
+        if len(changes) >= limit:
+            cut = True
+            break
+        label = (a or b)[0]
+        # Each side's value is read by that side's own label for this exact
+        # path, and only if the path was shown: a dotted label can equal the
+        # label of a different path.
+        shown_before = before.get(b[0], NOT_SHOWN) if b is not None and b[2] else NOT_SHOWN
+        shown_after = after.get(a[0], NOT_SHOWN) if a is not None and a[2] else NOT_SHOWN
+        if b is None:
+            row = {"path": label, "change": "added", "after": shown_after}
+        elif a is None:
+            row = {"path": label, "change": "removed", "before": shown_before}
+        else:
+            row = {"path": label, "change": "changed", "before": shown_before, "after": shown_after}
+            if row["before"] == row["after"]:
+                row["beyond_preview"] = True
+        changes.append(row)
+    return changes, cut
+
+
+@dataclass
+class PendingApproval:
+    id: str
+    session: str
+    agent: str
+    tool: str
+    server: str | None
+    arguments_sha256: str
+    arguments_preview: dict[str, Any]
+    decision: dict
+    created_at: float
+    expires_at: float
+    timeout_seconds: float
+    grant_ttl_seconds: float
+    status: str = PENDING
+    reason: str = ""
+    note: str = ""
+    resolved_by: str = ""
+    resolved_at: float | None = None
+    uses: int = 0
+    diff_from: str = ""
+    diff: list[dict] = field(default_factory=list)
+    # The preview (or the diff) leaves part of the arguments out: the
+    # dashboard will not offer one-click approval for what it cannot show.
+    preview_truncated: bool = False
+    diff_truncated: bool = False
+    arguments_fingerprint: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def rule_id(self) -> str:
+        return str(self.decision.get("rule_id", ""))
+
+    @property
+    def decision_id(self) -> str:
+        return str(self.decision.get("decision_id", ""))
+
+    def grant_valid_until(self) -> float | None:
+        """Until when this approval lets an identical call through (None = not at all)."""
+        if self.status != APPROVED or self.resolved_at is None:
+            return None
+        if self.grant_ttl_seconds > 0:
+            return self.resolved_at + self.grant_ttl_seconds
+        # Single use: one identical call, which must arrive within the
+        # approval timeout after the human said yes.
+        if self.uses >= 1:
+            return None
+        return self.resolved_at + self.timeout_seconds
+
+    def usable(self, now: float | None = None) -> bool:
+        until = self.grant_valid_until()
+        return until is not None and (now if now is not None else time.time()) < until
+
+    def to_dict(self) -> dict:
+        return {
+            "approval_id": self.id,
+            "status": self.status,
+            "reason": self.reason,
+            "note": self.note,
+            "tool": self.tool,
+            "server": self.server,
+            "agent": self.agent,
+            "rule_id": self.rule_id,
+            "decision_id": self.decision_id,
+            "arguments_sha256": self.arguments_sha256,
+            "arguments": self.arguments_preview,
+            "diff_from": self.diff_from,
+            "diff": self.diff,
+            "preview_truncated": self.preview_truncated,
+            "diff_truncated": self.diff_truncated,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "resolved_at": self.resolved_at,
+            "resolved_by": self.resolved_by,
+            "grant_ttl_seconds": self.grant_ttl_seconds,
+            "grant_valid_until": self.grant_valid_until(),
+            "uses": self.uses,
+        }
+
+
+# change is one of: "pending", "approved", "denied", "used"
+Listener = Callable[[PendingApproval, str], Awaitable[None]]
+
+
+class ApprovalStore(ABC):
+    """Interface for approval storage. All methods run on the event loop."""
+
+    def __init__(self) -> None:
+        self._listeners: list[Listener] = []
+
+    def add_listener(self, listener: Listener) -> None:
+        self._listeners.append(listener)
+
+    async def _notify(self, approval: PendingApproval, change: str) -> None:
+        for listener in list(self._listeners):
+            try:
+                await listener(approval, change)
+            except Exception:  # a broken listener must not undo a decision
+                import logging
+                logging.getLogger(__name__).exception("approval listener failed")
+
+    @abstractmethod
+    async def create(self, *, session: str, agent: str, tool: str, server: str | None, arguments: Any,
+                     decision: dict, timeout_seconds: float, grant_ttl_seconds: float) -> PendingApproval: ...
+
+    @abstractmethod
+    async def get(self, approval_id: str) -> PendingApproval | None: ...
+
+    @abstractmethod
+    async def resolve(self, approval_id: str, *, approve: bool, by: str, note: str = "",
+                      reason: str = "") -> PendingApproval: ...
+
+    @abstractmethod
+    async def wait(self, approval_id: str, timeout: float) -> PendingApproval | None:
+        """Return once the approval is no longer pending, or after ``timeout``."""
+
+    @abstractmethod
+    async def find(self, *, session: str, agent: str, sha256: str) -> PendingApproval | None:
+        """A pending approval or a usable grant for exactly this call, if any."""
+
+    @abstractmethod
+    async def use(self, approval_id: str) -> bool:
+        """Spend the grant for one call. False if it is no longer usable."""
+
+    @abstractmethod
+    async def list(self, *, session: str, status: str | None = None) -> list[PendingApproval]: ...
+
+    @abstractmethod
+    async def find_or_create(self, *, session: str, agent: str, tool: str, server: str | None, arguments: Any,
+                             decision: dict, timeout_seconds: float, grant_ttl_seconds: float,
+                             deny_cooldown_seconds: float = 0) -> tuple[str, PendingApproval]:
+        """In one step: consume a usable grant for this exact call ("granted"),
+        or report the one already waiting ("waiting"), or report a person's
+        denial of it within deny_cooldown_seconds ("denied_recently"), or open
+        one ("created").
+        Raises ApprovalCapacityError when a new one cannot be opened. Atomic, so
+        two identical calls arriving together open one approval, and a
+        single-use grant lets exactly one of them through."""
+
+    async def close(self) -> None:
+        """Cancel timers. Pending approvals stay pending."""
+
+
+class InMemoryApprovalStore(ApprovalStore):
+    def __init__(self, *, max_approvals: int = MAX_APPROVALS,
+                 max_pending_per_session: int = MAX_PENDING_PER_SESSION,
+                 clock: Callable[[], float] = time.time) -> None:
+        super().__init__()
+        self._items: dict[str, PendingApproval] = {}
+        self._events: dict[str, asyncio.Event] = {}
+        self._timers: dict[str, asyncio.TimerHandle] = {}
+        self._lock = asyncio.Lock()
+        self.max_approvals = max_approvals
+        self.max_pending_per_session = max_pending_per_session
+        self._clock = clock
+
+    # -- internals -----------------------------------------------------------
+
+    def _prune(self, now: float) -> None:
+        stale = []
+        for a in self._items.values():
+            if a.status == PENDING:
+                continue
+            until = a.grant_valid_until() or a.resolved_at or a.created_at
+            if now - until > RETAIN_SECONDS:
+                stale.append(a.id)
+        for aid in stale:
+            self._drop(aid)
+        if len(self._items) >= self.max_approvals:
+            # Oldest resolved first; pending approvals are never dropped.
+            resolved = sorted((a for a in self._items.values() if a.status != PENDING),
+                              key=lambda a: a.resolved_at or a.created_at)
+            for a in resolved[: len(self._items) - self.max_approvals + 1]:
+                self._drop(a.id)
+
+    def _drop(self, aid: str) -> None:
+        self._items.pop(aid, None)
+        self._events.pop(aid, None)
+        timer = self._timers.pop(aid, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _arm_timer(self, approval: PendingApproval) -> None:
+        loop = asyncio.get_running_loop()
+        delay = max(0.0, approval.expires_at - self._clock())
+        self._timers[approval.id] = loop.call_later(
+            delay, lambda: asyncio.ensure_future(self._expire(approval.id)),
+        )
+
+    async def _expire(self, aid: str) -> None:
+        try:
+            await self.resolve(aid, approve=False, by="guardian", reason="timeout")
+        except (ApprovalNotPending, KeyError):
+            pass
+
+    async def _expire_if_due(self, approval: PendingApproval) -> None:
+        if approval.status == PENDING and self._clock() >= approval.expires_at:
+            await self._expire(approval.id)
+
+    # -- interface -----------------------------------------------------------
+
+    def _create_locked(self, *, session, agent, tool, server, arguments, decision,
+                       timeout_seconds, grant_ttl_seconds) -> PendingApproval:
+        now = self._clock()
+        self._prune(now)
+        if len(self._items) >= self.max_approvals:
+            raise ApprovalCapacityError("Too many approvals are waiting; refusing the call")
+        pending_here = sum(1 for a in self._items.values() if a.session == session and a.status == PENDING)
+        if pending_here >= self.max_pending_per_session:
+            raise ApprovalCapacityError(
+                f"This session already has {pending_here} approvals waiting; refusing the call")
+        shown, truncated, labels = _preview(arguments)
+        prints = fingerprint(arguments, labels)
+        sha = arguments_sha256(tool, server, arguments)
+        # Diff against the most recent earlier approval for the same tool in
+        # this session (for example: A was approved, now B changes one field).
+        previous = max(
+            (a for a in self._items.values()
+             if a.session == session and a.tool == tool and a.server == server and a.arguments_sha256 != sha),
+            key=lambda a: a.created_at, default=None,
+        )
+        changes, diff_cut = (diff(previous.arguments_preview, shown, previous.arguments_fingerprint, prints)
+                             if previous else ([], False))
+        approval = PendingApproval(
+            id="apr_" + secrets.token_urlsafe(12),
+            session=session, agent=agent, tool=tool, server=server,
+            arguments_sha256=sha, arguments_preview=shown, decision=decision,
+            created_at=now, expires_at=now + timeout_seconds,
+            timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds,
+            diff_from=previous.id if previous else "",
+            diff=changes, preview_truncated=truncated, diff_truncated=diff_cut,
+            arguments_fingerprint=prints,
+        )
+        self._items[approval.id] = approval
+        self._events[approval.id] = asyncio.Event()
+        self._arm_timer(approval)
+        return approval
+
+    async def create(self, *, session, agent, tool, server, arguments, decision,
+                     timeout_seconds, grant_ttl_seconds) -> PendingApproval:
+        async with self._lock:
+            approval = self._create_locked(
+                session=session, agent=agent, tool=tool, server=server, arguments=arguments, decision=decision,
+                timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds)
+        await self._notify(approval, PENDING)
+        return approval
+
+    async def find_or_create(self, *, session, agent, tool, server, arguments, decision,
+                             timeout_seconds, grant_ttl_seconds, deny_cooldown_seconds=0):
+        sha = arguments_sha256(tool, server, arguments)
+        # Expiry resolves through resolve(), which takes the lock, so do it first.
+        for a in [a for a in self._items.values()
+                  if a.session == session and a.agent == agent and a.arguments_sha256 == sha]:
+            await self._expire_if_due(a)
+        async with self._lock:
+            now = self._clock()
+            mine = [a for a in self._items.values()
+                    if a.session == session and a.agent == agent and a.arguments_sha256 == sha]
+            waiting = next((a for a in mine if a.status == PENDING and now < a.expires_at), None)
+            granted = max((a for a in mine if a.usable(now)), key=lambda a: a.resolved_at or 0, default=None)
+            if waiting is not None:
+                return "waiting", waiting
+            denied = max((a for a in mine if a.status == DENIED and a.reason != "timeout"
+                          and a.resolved_at is not None and now < a.resolved_at + deny_cooldown_seconds),
+                         key=lambda a: a.resolved_at, default=None)
+            if granted is None and denied is not None:
+                return "denied_recently", denied
+            if granted is not None:
+                granted.uses += 1
+                outcome, approval = "granted", granted
+            else:
+                approval = self._create_locked(
+                    session=session, agent=agent, tool=tool, server=server, arguments=arguments,
+                    decision=decision, timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds)
+                outcome = "created"
+        await self._notify(approval, "used" if outcome == "granted" else PENDING)
+        return outcome, approval
+
+    async def get(self, approval_id: str) -> PendingApproval | None:
+        approval = self._items.get(approval_id)
+        if approval is not None:
+            await self._expire_if_due(approval)
+        return approval
+
+    async def resolve(self, approval_id, *, approve, by, note="", reason=""):
+        async with self._lock:
+            approval = self._items.get(approval_id)
+            if approval is None:
+                raise KeyError(approval_id)
+            if approval.status != PENDING:
+                raise ApprovalNotPending(f"Approval {approval_id} is already {approval.status}")
+            now = self._clock()
+            if approve and now >= approval.expires_at:
+                # Too late: the timeout already decided, even if the timer has not fired yet.
+                approve, by, reason, note = False, "guardian", "timeout", ""
+            approval.status = APPROVED if approve else DENIED
+            approval.reason = reason or ("approved" if approve else "denied by approver")
+            approval.note = (note or "")[:1000]
+            approval.resolved_by = (by or "")[:200]
+            approval.resolved_at = now
+            timer = self._timers.pop(approval_id, None)
+            if timer is not None:
+                timer.cancel()
+            self._events[approval_id].set()
+        await self._notify(approval, approval.status)
+        return approval
+
+    async def wait(self, approval_id, timeout):
+        approval = await self.get(approval_id)
+        if approval is None or approval.status != PENDING or timeout <= 0:
+            return approval
+        event = self._events.get(approval_id)
+        if event is not None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=min(timeout, max(0.0, approval.expires_at - self._clock()) + 1))
+            except asyncio.TimeoutError:
+                pass
+        return await self.get(approval_id)
+
+    async def find(self, *, session, agent, sha256):
+        now = self._clock()
+        best = None
+        for a in list(self._items.values()):
+            if a.session != session or a.agent != agent or a.arguments_sha256 != sha256:
+                continue
+            await self._expire_if_due(a)
+            if a.status == PENDING:
+                return a
+            if a.usable(now) and (best is None or (a.resolved_at or 0) > (best.resolved_at or 0)):
+                best = a
+        return best
+
+    async def use(self, approval_id):
+        async with self._lock:
+            approval = self._items.get(approval_id)
+            if approval is None or not approval.usable(self._clock()):
+                return False
+            approval.uses += 1
+        await self._notify(approval, "used")
+        return True
+
+    async def list(self, *, session, status=None):
+        out = []
+        for a in list(self._items.values()):
+            if a.session != session:
+                continue
+            await self._expire_if_due(a)
+            if status is None or a.status == status:
+                out.append(a)
+        return sorted(out, key=lambda a: a.created_at)
+
+    async def close(self) -> None:
+        for timer in self._timers.values():
+            timer.cancel()
+        self._timers.clear()
