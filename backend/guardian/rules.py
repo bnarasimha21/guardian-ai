@@ -79,9 +79,10 @@ class ScanInput:
 # bidi controls, variation selectors including the Mongolian ones, Hangul
 # fillers, musical formatting, the U+E0000 block) except the tag characters
 # U+E0020 to U+E007E, which are spelled out below. U+FFFD goes too: it is what
-# a lossy decode leaves where a byte was, and a client may drop it.
+# a lossy decode leaves where a byte was, and a client may drop it. So does
+# NUL, which is what UTF-16 text read as UTF-8 has between its letters.
 _INVISIBLE = re.compile(
-    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+    "[\x00\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
     "\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\ufffd"
     "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
     "\U000e0000-\U000e001f\U000e007f-\U000e0fff]")
@@ -131,12 +132,17 @@ def _readable(raw: bytes) -> str | None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
-    if printable < 0.95 * len(text):
+    # Judged on the normalised form, so text hidden in tag characters or
+    # split by invisibles is not mistaken for binary noise.
+    probe = normalise_text(text)
+    if not probe:
+        return None
+    printable = sum(1 for ch in probe if ch.isprintable() or ch in "\n\r\t")
+    if printable < 0.95 * len(probe):
         return None
     # Mostly letters, digits and spaces: ordinary text or a command, not binary noise.
-    plain = sum(1 for ch in text if ch.isalnum() or ch in " \n\t./:-_")
-    return text if plain >= 0.7 * len(text) else None
+    plain = sum(1 for ch in probe if ch.isalnum() or ch in " \n\t./:-_")
+    return text if plain >= 0.7 * len(probe) else None
 
 
 class TooManyDecodes(ValueError):
@@ -176,25 +182,23 @@ def text_variants(text: str) -> list[str]:
     Raises TooManyDecodes (see decode_base64_runs).
     """
     variants: list[str] = []
+
+    def add_normalised(s: str) -> None:
+        # Padded and, when there is a tag run, tight: see normalise_text.
+        for form in (normalise_text(s), *((normalise_text(s, pad_tags=False),) if _TAG_RUN.search(s) else ())):
+            if form != s and form not in variants:
+                variants.append(form)
+
     norm = normalise_text(text)
-    if norm != text:
-        variants.append(norm)
-    if _TAG_RUN.search(text):
-        tight = normalise_text(text, pad_tags=False)
-        if tight not in (norm, text):
-            variants.append(tight)
+    add_normalised(text)
     if _PERCENT_ESCAPE.search(norm):
         decoded = unquote(norm)
         if decoded != norm:
             variants.append(decoded)
-            again = normalise_text(decoded)
-            if again != decoded:
-                variants.append(again)
+            add_normalised(decoded)
     for decoded in decode_base64_runs(norm):
         variants.append(decoded)
-        again = normalise_text(decoded)
-        if again != decoded:
-            variants.append(again)
+        add_normalised(decoded)
     return variants
 
 
