@@ -292,3 +292,17 @@ def test_held_calls_cannot_grow_memory_through_long_names(client, policy_file):
     assert resp.status_code == 202
     preview = client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()["arguments"]
     assert all(len(path) <= 503 for path in preview)
+
+
+def test_argument_labels_that_collide_do_not_hide_a_value(client, policy_file):
+    """Two arguments whose preview labels come out the same (cut at 500
+    characters, or a dotted key against a nested one) both reach the approver."""
+    policy_file(POLICY)
+    h = {"X-Session-Id": "colliding-labels"}
+    args = {"x" * 500 + "_danger": "rm -rf /prod", "x" * 500 + "_safe": "hello",
+            "a.b": "dotted", "a": {"b": "nested"}}
+    resp = client.post("/api/check", json={"tool": DEPLOY["tool"], "arguments": args}, headers=h)
+    assert resp.status_code == 202
+    preview = client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()["arguments"]
+    values = sorted(str(v) for v in preview.values())
+    assert values == ["dotted", "hello", "nested", "rm -rf /prod"]

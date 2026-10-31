@@ -95,7 +95,16 @@ def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
             key = path or "$"
             if len(key) > MAX_PREVIEW_CHARS:
                 key = key[:MAX_PREVIEW_CHARS] + "..."
-            out[_display(key)] = _display(v)
+            key = _display(key)
+            # Cutting, U+FFFD and dotted keys ({"a.b": 1} vs {"a": {"b": 1}})
+            # can give two arguments the same label. Neither may hide the other
+            # from the approver, so a repeat gets a numbered suffix.
+            if key in out:
+                n = 2
+                while f"{key} [{n}]" in out:
+                    n += 1
+                key = f"{key} [{n}]"
+            out[key] = _display(v)
     return out
 
 
