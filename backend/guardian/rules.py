@@ -450,11 +450,13 @@ C, H, M, L = ThreatLevel.CRITICAL, ThreatLevel.HIGH, ThreatLevel.MEDIUM, ThreatL
 # ~/.ssh/id_ed25519); after a verb that reads or sends them, in text the agent
 # did not write, they are a tool-poisoning instruction.
 _CREDENTIAL_PATH = (
-    r"(?:\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)\w*|authorized_keys|known_hosts|config)\b"
-    r"|\.aws/(?:credentials|config)\b|\.config/gcloud\b|\.azure/\w|\.kube/config\b"
+    # Private keys only: id_rsa.pub, known_hosts, ~/.ssh/config and ~/.aws/config are not
+    # secrets, and setup docs tell people to copy and edit them all the time.
+    r"(?:\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)\w*(?!\.pub\b)|authorized_keys)\b"
+    r"|\.aws/credentials\b|\.config/gcloud\b|\.azure/\w|\.kube/config\b"
     r"|\.docker/config\.json|\.netrc\b|\.npmrc\b|\.pypirc\b|\.git-credentials\b"
     r"|\.gnupg/|(?:\.cursor|\.claude|claude_desktop_config)[\w./-]*mcp\w*\.json|/etc/(?:shadow|sudoers)\b"
-    r"|\bid_(?:rsa|ed25519)\b)"
+    r"|\bid_(?:rsa|ed25519)\b(?!\.pub\b))"
 )
 
 
