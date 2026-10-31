@@ -74,12 +74,17 @@ class ScanInput:
 # Normalisation
 # ---------------------------------------------------------------------------
 
-# Invisible characters used to split keywords: zero-width, joiners, word
-# joiner, invisible operators, BOM, soft hyphen, bidi embeddings and isolates.
-# Variation selectors (U+FE00 to U+FE0F and U+E0100 to U+E01EF) and the tag
-# characters that are not printable ASCII (U+E0000 to U+E001F, U+E007F) go too.
-_INVISIBLE = re.compile("[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
-                        "\ufe00-\ufe0f\U000e0000-\U000e001f\U000e007f\U000e0100-\U000e01ef]")
+# Characters that render as nothing and so can split a keyword: every Unicode
+# Default_Ignorable_Code_Point (zero-width and joiner characters, soft hyphen,
+# bidi controls, variation selectors including the Mongolian ones, Hangul
+# fillers, musical formatting, the U+E0000 block) except the tag characters
+# U+E0020 to U+E007E, which are spelled out below. U+FFFD goes too: it is what
+# a lossy decode leaves where a byte was, and a client may drop it.
+_INVISIBLE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\ufffd"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0000-\U000e001f\U000e007f-\U000e0fff]")
 # Unicode tag characters U+E0020 to U+E007E shadow printable ASCII and render
 # as nothing, so a sentence can be hidden in them ("ASCII smuggling"). A run
 # of them is spelled out as the ASCII it shadows, set off by spaces.
@@ -87,7 +92,11 @@ _TAG_RUN = re.compile("[\U000e0020-\U000e007e]+")
 
 
 def _untag(m: re.Match) -> str:
-    return " " + "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0)) + " "
+    return " " + _untag_tight(m) + " "
+
+
+def _untag_tight(m: re.Match) -> str:
+    return "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0))
 # Look-alike letters that NFKC leaves alone (Cyrillic and Greek), folded to Latin.
 _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c", "\u0443": "y",
@@ -103,10 +112,16 @@ _BASE64_RUN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-
 MAX_DECODES_PER_FIELD = 8
 
 
-def normalise_text(text: str) -> str:
-    """Tag characters spelled out, NFKC, invisible characters removed, look-alike letters folded to Latin."""
-    text = _TAG_RUN.sub(_untag, text)
-    return unicodedata.normalize("NFKC", _INVISIBLE.sub("", text)).translate(_CONFUSABLES)
+def normalise_text(text: str, *, pad_tags: bool = True) -> str:
+    """Invisible characters removed, tag characters spelled out, NFKC, look-alike letters folded to Latin.
+
+    Invisibles go first, so one between each tag character cannot break the
+    run apart. A tag run is set off by spaces (hidden text after a visible
+    word); ``pad_tags=False`` joins it to its neighbours instead (a word split
+    between visible and tag characters). text_variants scans both.
+    """
+    text = _TAG_RUN.sub(_untag if pad_tags else _untag_tight, _INVISIBLE.sub("", text))
+    return unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
 
 
 def _readable(raw: bytes) -> str | None:
@@ -164,6 +179,10 @@ def text_variants(text: str) -> list[str]:
     norm = normalise_text(text)
     if norm != text:
         variants.append(norm)
+    if _TAG_RUN.search(text):
+        tight = normalise_text(text, pad_tags=False)
+        if tight not in (norm, text):
+            variants.append(tight)
     if _PERCENT_ESCAPE.search(norm):
         decoded = unquote(norm)
         if decoded != norm:
