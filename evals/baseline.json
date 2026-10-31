@@ -1,6 +1,7 @@
 {
-  "benign_blocked_rate": 0.0194,
-  "benign_flagged_rate": 0.0291,
+  "attack_stopped_rate": 0.7448,
+  "benign_blocked_rate": 0.0192,
+  "benign_flagged_rate": 0.0288,
   "critical_rule_recall": {
     "dangerous_code": 0.8421,
     "data_exfiltration": 0.75,

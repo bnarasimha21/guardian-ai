@@ -418,8 +418,9 @@ class RegexRule(ThreatRule):
 C, H, M, L = ThreatLevel.CRITICAL, ThreatLevel.HIGH, ThreatLevel.MEDIUM, ThreatLevel.LOW
 
 
-# Files that hold credentials. A tool description or output that names one is
-# a tool-poisoning signal; together with a verb that reads or sends it, a strong one.
+# Files that hold credentials. Named alone they are ordinary (docs mention
+# ~/.ssh/id_ed25519); after a verb that reads or sends them, in text the agent
+# did not write, they are a tool-poisoning instruction.
 _CREDENTIAL_PATH = (
     r"(?:\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)\w*|authorized_keys|known_hosts|config)\b"
     r"|\.aws/(?:credentials|config)\b|\.config/gcloud\b|\.azure/\w|\.kube/config\b"
@@ -480,7 +481,6 @@ class PromptInjectionRule(RegexRule):
           "instruction to hide an action from the user", H, untrusted_only=True),
         P(r"\b(?:read|cat|open|load|include|pass|send|attach|upload|copy|fetch|get)\b.{0,160}?" + _CREDENTIAL_PATH,
           "instruction to read a credential file", H, untrusted_only=True, flags=re.IGNORECASE | re.DOTALL),
-        P(_CREDENTIAL_PATH, "credential file path in untrusted content", M, untrusted_only=True),
         P(r"<\s*/?\s*important\s*>", "<IMPORTANT> tag in untrusted content", M, untrusted_only=True),
     ]
 

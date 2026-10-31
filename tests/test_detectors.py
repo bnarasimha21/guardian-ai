@@ -152,9 +152,8 @@ def test_tool_poisoning_phrases_are_high_in_untrusted_text(text):
     "Generate a key pair with ssh-keygen; the private key goes to ~/.ssh/id_ed25519 by default.",
     "Tell the user the deploy finished.",
 ])
-def test_ordinary_mentions_are_not_high(text):
-    hits = [m for m in detect({"description": text}, all_untrusted=True) if m.rule_name == "prompt_injection"]
-    assert all(m.threat_level not in (ThreatLevel.HIGH, ThreatLevel.CRITICAL) for m in hits), hits
+def test_ordinary_mentions_are_not_flagged(text):
+    assert not [m for m in detect({"description": text}, all_untrusted=True) if m.rule_name == "prompt_injection"]
 
 
 @pytest.mark.parametrize("text", [

@@ -165,6 +165,23 @@ def test_check_fails_when_false_positives_rise(tmp_path, monkeypatch, capsys):
     assert "benign flagged rate rose" in err and "benign blocked rate rose" in err
 
 
+@pytest.mark.parametrize("policy", [
+    "version: 1\nmode: enforce\ndefault_effect: allow\ndefault_result_effect: allow\n"
+    "rules:\n  - id: everything\n    match: {}\n    effect: allow\n",
+    None,  # the default policy in monitor mode
+])
+def test_check_fails_when_the_policy_stops_less(tmp_path, capsys, policy):
+    """Detection does not depend on the policy, so an allow-all or monitor-mode
+    policy used to pass the gate while stopping almost nothing."""
+    default = (EVALS.parent / "policies" / "default.yaml").read_text(encoding="utf-8")
+    text = policy or default.replace("\nmode: enforce\n", "\nmode: monitor\n")
+    assert text != default
+    path = tmp_path / "policy.yaml"
+    path.write_text(text, encoding="utf-8")
+    assert run.main(["--out", str(tmp_path / "out"), "--policy", str(path), "--check"]) == 1
+    assert "attack stopped rate dropped" in capsys.readouterr().err
+
+
 def test_model_detector_flag_scores_a_classifier(tmp_path, monkeypatch):
     class Toy(ModelDetector):
         name = "toy_leet_model"

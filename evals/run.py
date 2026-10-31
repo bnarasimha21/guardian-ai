@@ -32,8 +32,11 @@ Metrics, per detector rule R:
 
 Decision level: an attack is "detected" when any of its expected rules fired
 and "stopped" when the outcome was not a plain allow (call: deny or
-require_approval; result: deny or redact; definitions: hidden). A benign
-record is "flagged" when any detector fired and "blocked" when it was stopped.
+require_approval; result: deny or redact; definitions: hidden) AND the policy
+enforces it (a monitor-mode policy stops nothing). A benign record is
+"flagged" when any detector fired and "blocked" when it was stopped. The CI
+gate checks the stopped rate too, so a policy that allows everything, or runs
+in monitor mode, fails --check even though detection is unchanged.
 """
 
 from __future__ import annotations
@@ -190,14 +193,14 @@ def run_record(rec: dict, loaded, block_threshold: str, pin_dir: Path) -> Outcom
         out.fired = sorted({m.rule_name for m in d.matches})
         out.top_rule, out.top_owasp_llm, out.top_owasp_agentic = _top(d.matches)
         out.effect, out.rule_id = d.effect, d.rule_id
-        out.stopped = d.effect in ("deny", "require_approval")
+        out.stopped = d.enforced and d.effect in ("deny", "require_approval")
         out.by_detector = out.stopped and bool(d.deciding_detectors)
     elif phase == "result":
         d = engine.evaluate(loaded, call, phase="result", result=args, block_threshold=block_threshold)
         out.fired = sorted({m.rule_name for m in d.matches})
         out.top_rule, out.top_owasp_llm, out.top_owasp_agentic = _top(d.matches)
         out.effect, out.rule_id = d.effect, d.rule_id
-        out.stopped = d.effect in ("deny", "redact")
+        out.stopped = d.enforced and d.effect in ("deny", "redact")
         out.by_detector = out.stopped
     elif phase == "tool_definition":
         verdict, poisoned = screen_definition(loaded, call, args, block_threshold)
@@ -211,7 +214,7 @@ def run_record(rec: dict, loaded, block_threshold: str, pin_dir: Path) -> Outcom
         out.fired = sorted(fired)
         out.effect = "hidden" if poisoned else "listed"
         out.rule_id = "tool_poisoning" if poisoned else verdict.rule_id
-        out.stopped = out.by_detector = poisoned
+        out.stopped = out.by_detector = poisoned and verdict.enforced
     else:  # tool_definition_change: pin "before", then list "after"
         pins = PinStore(pin_dir / f"{rec['id']}.json")
         pins.check(rec["tool"], definition_sha256(args["before"]))
@@ -222,7 +225,7 @@ def run_record(rec: dict, loaded, block_threshold: str, pin_dir: Path) -> Outcom
             out.top_owasp_llm, out.top_owasp_agentic = owasp_for_rule("tool_definition_changed")
         out.effect = "hidden" if changed else "listed"
         out.rule_id = "pin" if changed else "match"
-        out.stopped = out.by_detector = changed
+        out.stopped = out.by_detector = changed and loaded.policy.mode == "enforce"
     return out
 
 
@@ -407,6 +410,7 @@ def write_reports(report: dict, out_dir: Path) -> None:
 def baseline_from(report: dict) -> dict:
     return {
         "critical_rule_recall": {r: report["rules"].get(r, {}).get("recall") for r in CRITICAL_RULES},
+        "attack_stopped_rate": report["summary"]["attack_stopped_rate"],
         "benign_flagged_rate": report["summary"]["benign_flagged_rate"],
         "benign_blocked_rate": report["summary"]["benign_blocked_rate"],
     }
@@ -420,6 +424,9 @@ def compare(report: dict, baseline: dict) -> list[str]:
         is_ = now["critical_rule_recall"].get(rule)
         if was is not None and (is_ is None or is_ < was):
             problems.append(f"recall for {rule} dropped: {_pct(was)} -> {_pct(is_)}")
+    was, is_ = baseline.get("attack_stopped_rate"), now["attack_stopped_rate"]
+    if was is not None and (is_ is None or is_ < was):
+        problems.append(f"attack stopped rate dropped: {_pct(was)} -> {_pct(is_)}")
     for key in ("benign_flagged_rate", "benign_blocked_rate"):
         was, is_ = baseline.get(key), now[key]
         if was is not None and is_ is not None and is_ > was:
