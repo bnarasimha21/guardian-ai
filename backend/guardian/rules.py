@@ -525,6 +525,51 @@ def exfil_domain(host: str | None) -> str | None:
     return None
 
 
+_MD_IMAGE = re.compile(r"!\[[^\[\]]*\]\(\s*(https?://[^)\s]*)", re.IGNORECASE)
+_IMG_TAG = re.compile(r"<img\b[^<>]*", re.IGNORECASE)
+_IMG_SRC = re.compile(r"\bsrc\s*=\s*['\"]?(?=https?://)", re.IGNORECASE)
+_IMG_URL = re.compile(r"[^'\" >]*")
+
+
+def _has_query_value(url: str) -> bool:
+    q = url.find("?")
+    return q >= 0 and "=" in url[q + 1:]
+
+
+def _image_exfil(text: str) -> list[str]:
+    """Image URLs with a query string: a zero-click exfiltration channel when
+    the agent's output is rendered as markdown or HTML.
+
+    Written as a scan rather than one regex because "image, URL, then ? and =
+    somewhere in it" backtracks quadratically when many image openers share
+    one long URL-like run. Here each URL run is read once: a run that starts
+    inside one already read is a suffix of it, so it cannot match if that
+    one did not.
+    """
+    found: list[str] = []
+    for m in _MD_IMAGE.finditer(text):  # finditer resumes after each URL run
+        end = m.end(1)
+        if (end < len(text) and text[end] == ")") and _has_query_value(m.group(1)):
+            found.append("markdown image with query string (zero-click exfil channel)")
+            break
+    read_until = -1
+    for tag in _IMG_TAG.finditer(text):
+        hit = False
+        for src in _IMG_SRC.finditer(text, tag.start(), tag.end()):
+            start = src.end()
+            if start < read_until:
+                continue
+            url = _IMG_URL.match(text, start)
+            read_until = url.end()
+            if _has_query_value(url.group(0)):
+                hit = True
+                break
+        if hit:
+            found.append("HTML image with query string (zero-click exfil channel)")
+            break
+    return found
+
+
 class DataExfiltrationRule(ThreatRule):
     """Known exfiltration and callback hosts, raw-IP URLs, data uploads."""
 
@@ -535,8 +580,6 @@ class DataExfiltrationRule(ThreatRule):
         P(_after_first(r"\bcurl\b", r"[^\n|;]", "\n|;") + r"[^\n|;]*?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)(?=[\s=@'\"]|$)",
           "curl uploading data", H),
         P(_after_first(r"\bwget\b", r"[^\n|;]", "\n|;") + r"[^\n|;]*?--post-(?:data|file)\b", "wget posting data", H),
-        P(r"!\[[^\[\]]*\]\(\s*https?://[^)\s]*\?[^)\s]*=[^)\s]*\)", "markdown image with query string (zero-click exfil channel)", H),
-        P(r"<img\b[^<>]*\bsrc\s*=\s*['\"]?https?://[^'\" >]*\?[^'\" >]*=", "HTML image with query string (zero-click exfil channel)", H),
     ]
 
     def scan(self, scan: ScanInput) -> list[ThreatMatch]:
@@ -557,6 +600,8 @@ class DataExfiltrationRule(ThreatRule):
             for p in self.UPLOAD_PATTERNS:
                 if p.regex.search(f.value):
                     col.add(p.reason, p.level, f.path, p.regex.pattern)
+            for reason in _image_exfil(f.value):
+                col.add(reason, H, f.path, "image URL with a query string")
         return col.result()
 
 
