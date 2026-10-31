@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from backend.guardian.schema import ToolCall
 
-from .store import APPROVED, PENDING, ApprovalCapacityError, ApprovalStore, PendingApproval, arguments_sha256
+from .store import ApprovalCapacityError, ApprovalStore, PendingApproval, arguments_sha256
 
 GRANTED = "granted"
 WAITING = "waiting"
@@ -36,14 +36,12 @@ class QueueOutcome:
 async def queue_for_approval(store: ApprovalStore, decision, call: ToolCall, *, session: str,
                              agent: str) -> QueueOutcome:
     sha = arguments_sha256(call.name, call.server, call.arguments)
-    existing = await store.find(session=session, agent=agent, sha256=sha)
-    if existing is not None and existing.status == APPROVED and await store.use(existing.id):
-        return QueueOutcome(GRANTED, existing, sha)
-    if existing is not None and existing.status == PENDING:
-        return QueueOutcome(WAITING, existing, sha)
     settings_ = decision.approval
     try:
-        approval = await store.create(
+        # One atomic step in the store: checking for a grant or a waiting
+        # approval and opening a new one separately let two identical calls
+        # arriving together each open their own approval.
+        status, approval = await store.find_or_create(
             session=session, agent=agent, tool=call.name, server=call.server, arguments=call.arguments,
             decision=decision.to_dict(),
             timeout_seconds=settings_.timeout_seconds if settings_ else 120,
@@ -51,4 +49,4 @@ async def queue_for_approval(store: ApprovalStore, decision, call: ToolCall, *, 
         )
     except ApprovalCapacityError as exc:
         return QueueOutcome(REFUSED, None, sha, error=str(exc))
-    return QueueOutcome(CREATED, approval, sha)
+    return QueueOutcome({"granted": GRANTED, "waiting": WAITING, "created": CREATED}[status], approval, sha)

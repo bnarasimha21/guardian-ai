@@ -218,7 +218,7 @@ def test_page_and_static_files_carry_a_strict_csp(client):
 
 def test_stylesheet_and_script_urls_are_cache_busted():
     html = INDEX.read_text(encoding="utf-8")
-    assert 'static/style.css?v=3' in html and 'static/app.js?v=4' in html
+    assert 'static/style.css?v=3' in html and 'static/app.js?v=5' in html
 
 
 def test_card_shows_the_key_name_not_the_claimed_agent(client, monkeypatch):
@@ -261,3 +261,16 @@ def test_policy_endpoint_needs_a_key_when_keys_are_configured(client, monkeypatc
         assert body["file"] == "default.yaml"
         assert "path" not in body and "reload_error" not in body
         assert str(REPO) not in info.text
+
+
+def test_truncated_approval_offers_deny_only():
+    """When the arguments were cut for display, the dashboard cannot show the
+    whole call, so it must not offer Approve."""
+    base = {"type": "approval", "approval_id": "ap1", "status": "pending", "uses": 0,
+            "tool_name": "cloud.deploy", "agent": "a", "policy_rule_id": "r",
+            "arguments": {"x": "1"}, "diff": []}
+    full = "".join(_render(f"handleEvent({json.dumps(base)});"))
+    cut = "".join(_render(f"handleEvent({json.dumps({**base, 'preview_truncated': True})});"))
+    assert "btn-approve" in full and "btn-deny" in full
+    assert "btn-approve" not in cut and "btn-deny" in cut
+    assert "too large to show in full" in cut

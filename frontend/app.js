@@ -164,16 +164,22 @@ function renderApproval(a) {
     const diff = (a.diff || []).map(d => {
         if (d.change === 'added') return `<div class="diff-row diff-added">+ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.after))}</div>`;
         if (d.change === 'removed') return `<div class="diff-row diff-removed">- ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))}</div>`;
-        return `<div class="diff-row diff-changed">~ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))} &rarr; ${escapeHtml(fmtValue(d.after))}</div>`;
-    }).join('');
+        const beyond = d.beyond_preview ? ' (differs after the part shown)' : '';
+        return `<div class="diff-row diff-changed">~ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.before))} &rarr; ${escapeHtml(fmtValue(d.after))}${beyond}</div>`;
+    }).join('') + (a.diff_truncated ? '<div class="diff-row">more changes not listed</div>' : '');
     const diffHtml = a.diff_from
         ? `<div class="approval-section"><div class="expand-label">Changed since ${escapeHtml(a.diff_from)}</div>${diff || '<div class="diff-row">no argument changes</div>'}</div>`
         : '';
     const expires = a.status === 'pending' && a.expires_at
         ? `<span class="approval-expiry" data-expires="${Number(a.expires_at)}"></span>` : '';
+    // A preview cut short means the approver cannot see the whole call, so
+    // the dashboard offers Deny only; approving it is a deliberate API call.
+    const cut = a.preview_truncated
+        ? `<div class="approval-outcome approval-error">The arguments are too large to show in full. Approve is disabled here; review the full call and answer through POST /api/approvals/${escapeHtml(a.approval_id)}.</div>` : '';
     const buttons = a.status === 'pending' ? `
+        ${cut}
         <div class="approval-actions">
-            <button class="btn-approve" data-answer="true">Approve</button>
+            ${a.preview_truncated ? '' : '<button class="btn-approve" data-answer="true">Approve</button>'}
             <button class="btn-deny" data-answer="false">Deny</button>
         </div>` : '';
     const outcome = a.status !== 'pending'

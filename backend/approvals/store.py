@@ -76,10 +76,19 @@ def _display(value: Any) -> Any:
 
 
 def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
-    """{dotted.path: scalar} for display and diffing; long strings are cut."""
+    """{dotted.path: scalar} for display; long strings are cut."""
+    return preview(value, limit)[0]
+
+
+def preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any], bool]:
+    """``flatten`` plus whether anything was left out or cut short."""
     out: dict[str, Any] = {}
+    truncated = False
     stack: list[tuple[str, Any]] = [("", value)]
-    while stack and len(out) < limit:
+    while stack:
+        if len(out) >= limit:
+            truncated = True
+            break
         path, v = stack.pop()
         if isinstance(v, dict) and v:
             for k in reversed(list(v.keys())):
@@ -90,11 +99,15 @@ def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
         else:
             if isinstance(v, str) and len(v) > MAX_PREVIEW_CHARS:
                 v = v[:MAX_PREVIEW_CHARS] + "..."
+                truncated = True
             elif not isinstance(v, (str, int, float, bool, type(None))):
-                v = str(v)[:MAX_PREVIEW_CHARS]
+                text = str(v)
+                truncated = truncated or len(text) > MAX_PREVIEW_CHARS
+                v = text[:MAX_PREVIEW_CHARS]
             key = path or "$"
             if len(key) > MAX_PREVIEW_CHARS:
                 key = key[:MAX_PREVIEW_CHARS] + "..."
+                truncated = True
             key = _display(key)
             # Cutting, U+FFFD and dotted keys ({"a.b": 1} vs {"a": {"b": 1}})
             # can give two arguments the same label. Neither may hide the other
@@ -105,20 +118,85 @@ def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
                     n += 1
                 key = f"{key} [{n}]"
             out[key] = _display(v)
+    return out, truncated
+
+
+def _digest(value: Any) -> str:
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+
+
+def fingerprint(value: Any) -> dict[str, tuple[str, str]]:
+    """Every leaf of the full arguments: {exact path: (display path, value hash)}.
+
+    The preview is cut (MAX_PREVIEW_PATHS paths, MAX_PREVIEW_CHARS characters),
+    so diffing previews misses a change past the cut. The fingerprint has no
+    cut: the path key is the JSON list of keys and indexes (so {"a.b": 1} and
+    {"a": {"b": 1}} differ), and the value is hashed, so it stays small however
+    long the value. The scanner refuses arguments over its node limit before
+    any approval is opened, which bounds its size.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    stack: list[tuple[list, Any]] = [([], value)]
+    while stack:
+        path, v = stack.pop()
+        if isinstance(v, dict) and v:
+            for k in v:
+                stack.append((path + [str(k)], v[k]))
+        elif isinstance(v, list) and v:
+            for i, item in enumerate(v):
+                stack.append((path + [i], item))
+        else:
+            exact = json.dumps(path, ensure_ascii=False)
+            label = ".".join(str(p) for p in path) or "$"
+            if len(label) > MAX_PREVIEW_CHARS:
+                label = label[:MAX_PREVIEW_CHARS] + "..."
+            out[exact] = (_display(label), _digest(v))
     return out
 
 
-def diff(before: dict[str, Any], after: dict[str, Any]) -> list[dict]:
-    """Changed, added and removed paths between two flattened argument sets."""
-    changes = []
-    for path in sorted(set(before) | set(after)):
-        if path not in before:
-            changes.append({"path": path, "change": "added", "after": after[path]})
-        elif path not in after:
-            changes.append({"path": path, "change": "removed", "before": before[path]})
-        elif before[path] != after[path]:
-            changes.append({"path": path, "change": "changed", "before": before[path], "after": after[path]})
-    return changes
+def diff(before: dict[str, Any], after: dict[str, Any],
+         before_fp: dict[str, tuple[str, str]] | None = None,
+         after_fp: dict[str, tuple[str, str]] | None = None,
+         limit: int = MAX_PREVIEW_PATHS) -> tuple[list[dict], bool]:
+    """Changed, added and removed paths between two argument sets, and whether
+    the list was cut at ``limit`` rows.
+
+    With fingerprints, every path of the full arguments is compared, and the
+    values shown come from the previews. A row whose shown values look equal
+    (the difference is past the cut) carries ``"beyond_preview": true``.
+    Without them, the previews are compared (older callers).
+    """
+    changes: list[dict] = []
+    if before_fp is None or after_fp is None:
+        for path in sorted(set(before) | set(after)):
+            if path not in before:
+                changes.append({"path": path, "change": "added", "after": after[path]})
+            elif path not in after:
+                changes.append({"path": path, "change": "removed", "before": before[path]})
+            elif before[path] != after[path]:
+                changes.append({"path": path, "change": "changed", "before": before[path], "after": after[path]})
+        return changes[:limit], len(changes) > limit
+    cut = False
+    for exact in sorted(set(before_fp) | set(after_fp)):
+        b, a = before_fp.get(exact), after_fp.get(exact)
+        if b is not None and a is not None and b[1] == a[1]:
+            continue
+        if len(changes) >= limit:
+            cut = True
+            break
+        label = (a or b)[0]
+        if b is None:
+            row = {"path": label, "change": "added", "after": after.get(label, "(not in the preview)")}
+        elif a is None:
+            row = {"path": label, "change": "removed", "before": before.get(label, "(not in the preview)")}
+        else:
+            row = {"path": label, "change": "changed", "before": before.get(label, "(not in the preview)"),
+                   "after": after.get(label, "(not in the preview)")}
+            if row["before"] == row["after"]:
+                row["beyond_preview"] = True
+        changes.append(row)
+    return changes, cut
 
 
 @dataclass
@@ -143,6 +221,11 @@ class PendingApproval:
     uses: int = 0
     diff_from: str = ""
     diff: list[dict] = field(default_factory=list)
+    # The preview (or the diff) leaves part of the arguments out: the
+    # dashboard will not offer one-click approval for what it cannot show.
+    preview_truncated: bool = False
+    diff_truncated: bool = False
+    arguments_fingerprint: dict = field(default_factory=dict, repr=False)
 
     @property
     def rule_id(self) -> str:
@@ -183,6 +266,8 @@ class PendingApproval:
             "arguments": self.arguments_preview,
             "diff_from": self.diff_from,
             "diff": self.diff,
+            "preview_truncated": self.preview_truncated,
+            "diff_truncated": self.diff_truncated,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "resolved_at": self.resolved_at,
@@ -239,6 +324,16 @@ class ApprovalStore(ABC):
 
     @abstractmethod
     async def list(self, *, session: str, status: str | None = None) -> list[PendingApproval]: ...
+
+    @abstractmethod
+    async def find_or_create(self, *, session: str, agent: str, tool: str, server: str | None, arguments: Any,
+                             decision: dict, timeout_seconds: float,
+                             grant_ttl_seconds: float) -> tuple[str, PendingApproval]:
+        """In one step: consume a usable grant for this exact call ("granted"),
+        or report the one already waiting ("waiting"), or open one ("created").
+        Raises ApprovalCapacityError when a new one cannot be opened. Atomic, so
+        two identical calls arriving together open one approval, and a
+        single-use grant lets exactly one of them through."""
 
     async def close(self) -> None:
         """Cancel timers. Pending approvals stay pending."""
@@ -302,40 +397,77 @@ class InMemoryApprovalStore(ApprovalStore):
 
     # -- interface -----------------------------------------------------------
 
+    def _create_locked(self, *, session, agent, tool, server, arguments, decision,
+                       timeout_seconds, grant_ttl_seconds) -> PendingApproval:
+        now = self._clock()
+        self._prune(now)
+        if len(self._items) >= self.max_approvals:
+            raise ApprovalCapacityError("Too many approvals are waiting; refusing the call")
+        pending_here = sum(1 for a in self._items.values() if a.session == session and a.status == PENDING)
+        if pending_here >= self.max_pending_per_session:
+            raise ApprovalCapacityError(
+                f"This session already has {pending_here} approvals waiting; refusing the call")
+        shown, truncated = preview(arguments)
+        prints = fingerprint(arguments)
+        sha = arguments_sha256(tool, server, arguments)
+        # Diff against the most recent earlier approval for the same tool in
+        # this session (for example: A was approved, now B changes one field).
+        previous = max(
+            (a for a in self._items.values()
+             if a.session == session and a.tool == tool and a.server == server and a.arguments_sha256 != sha),
+            key=lambda a: a.created_at, default=None,
+        )
+        changes, diff_cut = (diff(previous.arguments_preview, shown, previous.arguments_fingerprint, prints)
+                             if previous else ([], False))
+        approval = PendingApproval(
+            id="apr_" + secrets.token_urlsafe(12),
+            session=session, agent=agent, tool=tool, server=server,
+            arguments_sha256=sha, arguments_preview=shown, decision=decision,
+            created_at=now, expires_at=now + timeout_seconds,
+            timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds,
+            diff_from=previous.id if previous else "",
+            diff=changes, preview_truncated=truncated, diff_truncated=diff_cut,
+            arguments_fingerprint=prints,
+        )
+        self._items[approval.id] = approval
+        self._events[approval.id] = asyncio.Event()
+        self._arm_timer(approval)
+        return approval
+
     async def create(self, *, session, agent, tool, server, arguments, decision,
                      timeout_seconds, grant_ttl_seconds) -> PendingApproval:
-        now = self._clock()
         async with self._lock:
-            self._prune(now)
-            if len(self._items) >= self.max_approvals:
-                raise ApprovalCapacityError("Too many approvals are waiting; refusing the call")
-            pending_here = sum(1 for a in self._items.values() if a.session == session and a.status == PENDING)
-            if pending_here >= self.max_pending_per_session:
-                raise ApprovalCapacityError(
-                    f"This session already has {pending_here} approvals waiting; refusing the call")
-            preview = flatten(arguments)
-            sha = arguments_sha256(tool, server, arguments)
-            # Diff against the most recent earlier approval for the same tool in
-            # this session (for example: A was approved, now B changes one field).
-            previous = max(
-                (a for a in self._items.values()
-                 if a.session == session and a.tool == tool and a.server == server and a.arguments_sha256 != sha),
-                key=lambda a: a.created_at, default=None,
-            )
-            approval = PendingApproval(
-                id="apr_" + secrets.token_urlsafe(12),
-                session=session, agent=agent, tool=tool, server=server,
-                arguments_sha256=sha, arguments_preview=preview, decision=decision,
-                created_at=now, expires_at=now + timeout_seconds,
-                timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds,
-                diff_from=previous.id if previous else "",
-                diff=diff(previous.arguments_preview, preview) if previous else [],
-            )
-            self._items[approval.id] = approval
-            self._events[approval.id] = asyncio.Event()
-            self._arm_timer(approval)
+            approval = self._create_locked(
+                session=session, agent=agent, tool=tool, server=server, arguments=arguments, decision=decision,
+                timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds)
         await self._notify(approval, PENDING)
         return approval
+
+    async def find_or_create(self, *, session, agent, tool, server, arguments, decision,
+                             timeout_seconds, grant_ttl_seconds):
+        sha = arguments_sha256(tool, server, arguments)
+        # Expiry resolves through resolve(), which takes the lock, so do it first.
+        for a in [a for a in self._items.values()
+                  if a.session == session and a.agent == agent and a.arguments_sha256 == sha]:
+            await self._expire_if_due(a)
+        async with self._lock:
+            now = self._clock()
+            mine = [a for a in self._items.values()
+                    if a.session == session and a.agent == agent and a.arguments_sha256 == sha]
+            waiting = next((a for a in mine if a.status == PENDING and now < a.expires_at), None)
+            granted = max((a for a in mine if a.usable(now)), key=lambda a: a.resolved_at or 0, default=None)
+            if waiting is not None:
+                return "waiting", waiting
+            if granted is not None:
+                granted.uses += 1
+                outcome, approval = "granted", granted
+            else:
+                approval = self._create_locked(
+                    session=session, agent=agent, tool=tool, server=server, arguments=arguments,
+                    decision=decision, timeout_seconds=timeout_seconds, grant_ttl_seconds=grant_ttl_seconds)
+                outcome = "created"
+        await self._notify(approval, "used" if outcome == "granted" else PENDING)
+        return outcome, approval
 
     async def get(self, approval_id: str) -> PendingApproval | None:
         approval = self._items.get(approval_id)

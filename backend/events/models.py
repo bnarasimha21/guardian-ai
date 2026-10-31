@@ -93,6 +93,8 @@ class ApprovalEvent(BaseModel):
     arguments: dict = Field(default_factory=dict)   # flattened, values truncated
     diff_from: str = ""
     diff: list = Field(default_factory=list)        # [{path, change, before?, after?}]
+    preview_truncated: bool = False   # arguments shown in part: no one-click approve
+    diff_truncated: bool = False
     created_at: float = 0
     expires_at: float = 0
     resolved_at: Optional[float] = None

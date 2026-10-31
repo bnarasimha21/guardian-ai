@@ -194,6 +194,8 @@ async def _on_approval_change(approval: PendingApproval, change: str) -> None:
         arguments=approval.arguments_preview,
         diff_from=approval.diff_from,
         diff=approval.diff,
+        preview_truncated=approval.preview_truncated,
+        diff_truncated=approval.diff_truncated,
         created_at=approval.created_at,
         expires_at=approval.expires_at,
         resolved_at=approval.resolved_at,
