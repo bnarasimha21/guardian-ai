@@ -75,7 +75,18 @@ class ScanInput:
 
 # Invisible characters used to split keywords: zero-width, joiners, word
 # joiner, invisible operators, BOM, soft hyphen, bidi embeddings and isolates.
-_INVISIBLE = re.compile("[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+# Variation selectors (U+FE00 to U+FE0F and U+E0100 to U+E01EF) and the tag
+# characters that are not printable ASCII (U+E0000 to U+E001F, U+E007F) go too.
+_INVISIBLE = re.compile("[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
+                        "\ufe00-\ufe0f\U000e0000-\U000e001f\U000e007f\U000e0100-\U000e01ef]")
+# Unicode tag characters U+E0020 to U+E007E shadow printable ASCII and render
+# as nothing, so a sentence can be hidden in them ("ASCII smuggling"). A run
+# of them is spelled out as the ASCII it shadows, set off by spaces.
+_TAG_RUN = re.compile("[\U000e0020-\U000e007e]+")
+
+
+def _untag(m: re.Match) -> str:
+    return " " + "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0)) + " "
 # Look-alike letters that NFKC leaves alone (Cyrillic and Greek), folded to Latin.
 _CONFUSABLES = str.maketrans({
     "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c", "\u0443": "y",
@@ -92,7 +103,8 @@ MAX_DECODES_PER_FIELD = 8
 
 
 def normalise_text(text: str) -> str:
-    """NFKC, invisible characters removed, look-alike letters folded to Latin."""
+    """Tag characters spelled out, NFKC, invisible characters removed, look-alike letters folded to Latin."""
+    text = _TAG_RUN.sub(_untag, text)
     return unicodedata.normalize("NFKC", _INVISIBLE.sub("", text)).translate(_CONFUSABLES)
 
 
@@ -111,12 +123,19 @@ def _readable(raw: bytes) -> str | None:
     return text if plain >= 0.7 * len(text) else None
 
 
+class TooManyDecodes(ValueError):
+    """A field hides more base64 text than the scanner decodes. The caller
+    reports scan_limit_exceeded rather than scan only the first few runs."""
+
+
 def decode_base64_runs(text: str) -> list[str]:
-    """Readable text hidden in base64 runs of ``text`` (one level, a few runs at most)."""
+    """Readable text hidden in base64 runs of ``text`` (one level).
+
+    Raises TooManyDecodes when more than MAX_DECODES_PER_FIELD runs decode to
+    readable text: stopping early would let the ninth run through unscanned.
+    """
     out: list[str] = []
     for m in _BASE64_RUN.finditer(text):
-        if len(out) >= MAX_DECODES_PER_FIELD:
-            break
         run = m.group(0)
         altchars = b"-_" if ("-" in run or "_" in run) else None
         padded = run + "=" * (-len(run) % 4)
@@ -126,6 +145,8 @@ def decode_base64_runs(text: str) -> list[str]:
             continue
         decoded = _readable(raw)
         if decoded is not None:
+            if len(out) >= MAX_DECODES_PER_FIELD:
+                raise TooManyDecodes(f"a value hides more than {MAX_DECODES_PER_FIELD} base64-encoded texts")
             out.append(decoded)
     return out
 
@@ -134,7 +155,10 @@ _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 def text_variants(text: str) -> list[str]:
-    """Other spellings of ``text`` worth scanning (empty when there are none)."""
+    """Other spellings of ``text`` worth scanning (empty when there are none).
+
+    Raises TooManyDecodes (see decode_base64_runs).
+    """
     variants: list[str] = []
     norm = normalise_text(text)
     if norm != text:
@@ -199,6 +223,29 @@ def build_scan_input(
     def is_untrusted(path: str) -> bool:
         return all_untrusted or (bool(untrusted_paths) and path_matches(path, untrusted_paths))
 
+    def add_text(path: str, key: str, text: str) -> bool:
+        """Add ``text`` and its variants as fields. False once a limit is hit."""
+        nonlocal chars, variant_chars
+        chars += len(text)
+        if chars > max_total_chars:
+            out.limit_exceeded = f"payload has more than {max_total_chars} characters of text"
+            return False
+        try:
+            texts = [text, *text_variants(text)]
+        except TooManyDecodes as exc:
+            out.limit_exceeded = str(exc)
+            return False
+        # Variants are bounded separately: NFKC can expand a string many times
+        # over, but ordinary normalised text must not halve the real limit.
+        variant_chars += sum(len(t) for t in texts[1:])
+        if variant_chars > VARIANT_ALLOWANCE * max_total_chars:
+            out.limit_exceeded = "payload expands to too much text when normalised or decoded"
+            return False
+        untrusted = is_untrusted(path)
+        for t in texts:
+            out.fields.append(ScanField(path=path, key=key, value=t, untrusted=untrusted))
+        return True
+
     stack: list[tuple[str, str, Any]] = [("", "", data)]
     while stack:
         path, key, value = stack.pop()
@@ -212,14 +259,21 @@ def build_scan_input(
             out.numbers[path] = float(value)
             continue
         if isinstance(value, dict):
-            for k, v in reversed(list(value.items())):
+            items = list(value.items())
+            # Keys are attacker-controlled text too (a schema property name, a
+            # structured-output key), so every key is scanned as a field of its
+            # own, with its variants. Its ScanField key is "" so a key named
+            # "url" is not read as a bare host under a URL key.
+            for k, _ in items:
+                k = str(k)
+                if not add_text(f"{path}.{k}" if path else k, "", k):
+                    break
+            if out.limit_exceeded:
+                break
+            for k, v in reversed(items):
                 k = str(k)
                 child = f"{path}.{k}" if path else k
                 stack.append((child, k.lower(), v))
-                # Keys are attacker-controlled text too; scan the ones that
-                # could carry a sentence.
-                if " " in k or len(k) > 64:
-                    stack.append((child, k.lower(), k))
             continue
         if isinstance(value, (list, tuple)):
             for i in range(len(value) - 1, -1, -1):
@@ -227,20 +281,8 @@ def build_scan_input(
                 stack.append((child, "", value[i]))
             continue
         text = value if isinstance(value, str) else str(value)
-        untrusted = is_untrusted(path)
-        chars += len(text)
-        if chars > max_total_chars:
-            out.limit_exceeded = f"payload has more than {max_total_chars} characters of text"
+        if not add_text(path, key, text):
             break
-        texts = [text, *text_variants(text)]
-        # Variants are bounded separately: NFKC can expand a string many times
-        # over, but ordinary normalised text must not halve the real limit.
-        variant_chars += sum(len(t) for t in texts[1:])
-        if variant_chars > VARIANT_ALLOWANCE * max_total_chars:
-            out.limit_exceeded = "payload expands to too much text when normalised or decoded"
-            break
-        for t in texts:
-            out.fields.append(ScanField(path=path, key=key, value=t, untrusted=untrusted))
     return out
 
 
@@ -376,6 +418,17 @@ class RegexRule(ThreatRule):
 C, H, M, L = ThreatLevel.CRITICAL, ThreatLevel.HIGH, ThreatLevel.MEDIUM, ThreatLevel.LOW
 
 
+# Files that hold credentials. A tool description or output that names one is
+# a tool-poisoning signal; together with a verb that reads or sends it, a strong one.
+_CREDENTIAL_PATH = (
+    r"(?:\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)\w*|authorized_keys|known_hosts|config)\b"
+    r"|\.aws/(?:credentials|config)\b|\.config/gcloud\b|\.azure/\w|\.kube/config\b"
+    r"|\.docker/config\.json|\.netrc\b|\.npmrc\b|\.pypirc\b|\.git-credentials\b"
+    r"|\.gnupg/|(?:\.cursor|\.claude|claude_desktop_config)[\w./-]*mcp\w*\.json|/etc/(?:shadow|sudoers)\b"
+    r"|\bid_(?:rsa|ed25519)\b)"
+)
+
+
 class PromptInjectionRule(RegexRule):
     """Instruction overrides, role hijacking, jailbreak phrasing.
 
@@ -414,6 +467,21 @@ class PromptInjectionRule(RegexRule):
         P(r"\bdeveloper\s+mode\b", "developer mode mention in untrusted content", M, untrusted_only=True),
         P(r"\b(?:assistant|AI|agent)\s*,?\s+(?:you\s+)?must\s+(?:now\s+)?(?:send|email|forward|post|upload|call)\b",
           "imperative aimed at the agent in untrusted content", M, untrusted_only=True),
+        # Tool poisoning (Invariant Labs style): a description that tells the
+        # model to read a credential file and keep quiet about it.
+        P(r"\b(?:do\s+not|don'?t|never|must\s+not)\s+(?:mention|tell|inform|notify|alert|warn|show|reveal|disclose)"
+          r"\s+(?:(?:this|that|it|anything|any\s+of\s+this)\s+)?(?:to\s+)?the\s+user\b",
+          "instruction to hide an action from the user", H, untrusted_only=True),
+        P(r"\bwithout\s+(?:telling|informing|notifying|alerting|asking)\s+the\s+user\b",
+          "instruction to hide an action from the user", H, untrusted_only=True),
+        P(r"\b(?:hide|conceal|keep)\s+(?:this|that|it)\s+(?:secret\s+|hidden\s+)?from\s+the\s+user\b",
+          "instruction to hide an action from the user", H, untrusted_only=True),
+        P(r"\bthe\s+user\s+(?:must|should)\s+(?:not|never)\s+(?:know|see|notice|find\s+out|be\s+told)\b",
+          "instruction to hide an action from the user", H, untrusted_only=True),
+        P(r"\b(?:read|cat|open|load|include|pass|send|attach|upload|copy|fetch|get)\b.{0,160}?" + _CREDENTIAL_PATH,
+          "instruction to read a credential file", H, untrusted_only=True, flags=re.IGNORECASE | re.DOTALL),
+        P(_CREDENTIAL_PATH, "credential file path in untrusted content", M, untrusted_only=True),
+        P(r"<\s*/?\s*important\s*>", "<IMPORTANT> tag in untrusted content", M, untrusted_only=True),
     ]
 
 
