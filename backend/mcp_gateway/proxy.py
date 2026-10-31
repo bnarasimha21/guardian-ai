@@ -37,8 +37,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import codecs
+import functools
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -75,6 +78,10 @@ META_KEY = "guardian-ai/decision"
 ELICIT_KEY = "guardian_approval"
 MAX_PAGES = 50
 MAX_PENDING_ELICITATIONS = 1000
+# Arguments longer than this (as JSON) are not shown in an elicitation prompt:
+# a prompt must show the whole call or not be used. The call goes to the
+# approval queue instead, where the dashboard shows the full arguments.
+ELICIT_ARGS_LIMIT = 1500
 APPROVE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -124,6 +131,13 @@ class _PendingElicitation:
 
 
 DEFINITION_FIELDS = ("name", "title", "description", "inputSchema", "outputSchema", "annotations")
+
+
+async def evaluate_off_loop(*args: Any, **kwargs: Any) -> Decision:
+    """policy_engine.evaluate in a worker thread. Detectors (and any model
+    detector) are CPU-bound and synchronous; on the event loop they would stall
+    every other session of the gateway while they run."""
+    return await anyio.to_thread.run_sync(functools.partial(policy_engine.evaluate, *args, **kwargs))
 
 
 def screen_definition(loaded, call: ToolCall, definition: dict, block_threshold: str) -> tuple[Decision, bool]:
@@ -217,15 +231,59 @@ def _blob_bytes(blob: str) -> bytes | None:
         return None
 
 
-def _blob_text(blob: str) -> str | None:
-    """A base64 blob's content as text, or None when it is binary."""
-    raw = _blob_bytes(blob)
-    if raw is None:
-        return blob  # not base64: scan the string as it is
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
+# MIME types whose bytes are text a client may hand to the model.
+_TEXTUAL_MIME = re.compile(
+    r"(?i)^\s*(?:text/|message/|application/(?:[\w.+-]*\+)?(?:json|xml|yaml|x-yaml|javascript|ecmascript|x-sh"
+    r"|x-www-form-urlencoded|sql|graphql|toml|csv|x-ndjson)\b)")
+_CHARSET = re.compile(r"(?i);\s*charset\s*=\s*\"?([\w.:-]+)")
+LOSSY = "lossy"
+RAW = "raw"
+
+
+def _charset(mime: str | None) -> str | None:
+    m = _CHARSET.search(mime or "")
+    if not m:
         return None
+    try:
+        return codecs.lookup(m.group(1)).name
+    except LookupError:
+        return None
+
+
+def _blob_text(res: types.BlobResourceContents) -> tuple[str, str] | None:
+    """A blob's content as text, and how it was read.
+
+    How: RAW (not base64, scanned as it is), a codec name (the mimeType's
+    charset, else UTF-8), or LOSSY (a textual or untyped blob that does not
+    decode cleanly: decoded with replacement characters so it is still
+    scanned, and withheld if it would need redacting, since it cannot be
+    re-encoded faithfully). None for a typed binary blob (image/png and the
+    like) that is not valid text.
+    """
+    raw = _blob_bytes(res.blob)
+    if raw is None:
+        return res.blob, RAW
+    mime = getattr(res, "mime_type", None) or ""
+    charset = _charset(mime)
+    for codec in dict.fromkeys(c for c in (charset, "utf-8") if c):
+        try:
+            return raw.decode(codec), codec
+        except UnicodeDecodeError:
+            continue
+    if not mime.strip() or _TEXTUAL_MIME.match(mime):
+        return raw.decode(charset or "utf-8", errors="replace"), LOSSY
+    return None
+
+
+# A file: uri names a local resource; it is not fetched by anyone, so it is
+# scanned without its scheme (no ssrf finding for every file:// uri), and the
+# scheme is put back if the rest is redacted.
+_FILE_SCHEME = re.compile(r"(?i)^file:(?://)?")
+
+
+def _uri_parts(uri: str) -> tuple[str, str]:
+    m = _FILE_SCHEME.match(uri)
+    return (m.group(0), uri[m.end():]) if m else ("", uri)
 
 
 def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
@@ -247,39 +305,53 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
             res = block.resource
             if isinstance(res.uri, str) and res.uri:
                 where.append((i, "uri"))
-                texts.append(str(res.uri))
+                texts.append(_uri_parts(res.uri)[1])
             if isinstance(res, types.TextResourceContents):
                 where.append((i, "resource"))
                 texts.append(res.text)
             elif isinstance(res, types.BlobResourceContents):
-                decoded = _blob_text(res.blob)
+                decoded = _blob_text(res)
                 if decoded is not None:
                     where.append((i, "blob"))
-                    texts.append(decoded)
+                    texts.append(decoded[0])
         elif isinstance(block, types.ResourceLink):
             for name in _LINK_FIELDS:
                 value = getattr(block, name, None)
                 if isinstance(value, str) and value:
                     where.append((i, f"link:{name}"))
-                    texts.append(value)
+                    texts.append(_uri_parts(value)[1] if name == "uri" else value)
     return where, texts
 
 
-def _replace_text(block: Any, kind: str, new_text: str) -> Any:
-    """``block`` with the text that ``kind`` names replaced by ``new_text``."""
+def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
+    """``block`` with the text that ``kind`` names replaced by ``new_text``.
+
+    None when the replacement cannot be written back faithfully (a blob read
+    with replacement characters, or redacted text its charset cannot encode).
+    """
     if kind == "text":
         return block.model_copy(update={"text": new_text})
     if kind == "resource":
         return block.model_copy(update={"resource": block.resource.model_copy(update={"text": new_text})})
     if kind == "blob":
-        if _blob_bytes(block.resource.blob) is None:
+        read = _blob_text(block.resource)
+        if read is None or read[1] == LOSSY:
+            return None
+        if read[1] == RAW:
             blob = new_text  # it was scanned as it is, so it is replaced as it is
         else:
-            blob = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
+            try:
+                blob = base64.b64encode(new_text.encode(read[1])).decode("ascii")
+            except UnicodeEncodeError:
+                return None
         return block.model_copy(update={"resource": block.resource.model_copy(update={"blob": blob})})
     if kind == "uri":
-        return block.model_copy(update={"resource": block.resource.model_copy(update={"uri": new_text})})
-    return block.model_copy(update={kind.split(":", 1)[1]: new_text})
+        prefix = _uri_parts(block.resource.uri)[0]
+        return block.model_copy(update={"resource": block.resource.model_copy(update={"uri": prefix + new_text})})
+    name = kind.split(":", 1)[1]
+    if name == "uri":
+        new_text = _uri_parts(block.uri)[0] + new_text
+    return block.model_copy(update={name: new_text})
 
 
 class Gateway:
@@ -427,9 +499,10 @@ class Gateway:
                 break
         return tools
 
-    def _screen(self, loaded, call: ToolCall, definition: dict) -> Decision | None:
+    async def _screen(self, loaded, call: ToolCall, definition: dict) -> Decision | None:
         """Scan a tool definition as untrusted content. Returns a poisoning decision or None."""
-        verdict, poisoned = screen_definition(loaded, call, definition, self.block_threshold)
+        verdict, poisoned = await anyio.to_thread.run_sync(
+            functools.partial(screen_definition, loaded, call, definition, self.block_threshold))
         if poisoned:
             reason = (f"The definition of {call.name} contains text aimed at the model "
                       f"({', '.join(sorted({m.rule_name for m in verdict.matches})) or verdict.rule_id}); "
@@ -479,7 +552,7 @@ class Gateway:
                                               f"{exposed_name} is already provided by another upstream tool")
             return
 
-        screened = self._screen(loaded, call, definition)
+        screened = await self._screen(loaded, call, definition)
         if screened is not None and screened.rule_id == "tool_poisoning":
             await self._report_once(screened, call, sha)
             if enforced:
@@ -563,7 +636,7 @@ class Gateway:
         up = self.upstreams[entry.namespace]
         call = self._call_for(entry.namespace, entry.upstream_name, arguments,
                               call_id=str(getattr(ctx, "request_id", "") or "") or None)
-        decision = policy_engine.evaluate(loaded, call, block_threshold=self.block_threshold)
+        decision = await evaluate_off_loop(loaded, call, block_threshold=self.block_threshold)
         outcome.decision = decision
 
         if decision.effect == "require_approval" and decision.enforced:
@@ -583,9 +656,12 @@ class Gateway:
             assert up.client is not None
             result = await up.client.call_tool(entry.upstream_name, arguments)
         except Exception as exc:
+            # The message is upstream-controlled text (it can carry an
+            # injection, a secret or an internal URL) and is not scanned, so
+            # the agent gets the exception type only; the log keeps the rest.
             logger.error("upstream %s failed on %s: %s", up.name, entry.upstream_name, exc)
-            return _text_result(f"GuardianAI: upstream {up.name} failed: {type(exc).__name__}: {str(exc)[:300]}",
-                                error=True, meta=_summary(decision))
+            return _text_result(f"GuardianAI: upstream {up.name} failed ({type(exc).__name__}); the error "
+                                "message is in the gateway log", error=True, meta=_summary(decision))
         return await self._screen_result(loaded, call, decision, result, outcome)
 
     # ---- approval ----
@@ -600,10 +676,12 @@ class Gateway:
         # An empty elicitation capability means form mode (pre-2025-11-25 clients).
         return el.form is not None or el.url is None
 
+    @staticmethod
+    def _args_json(call: ToolCall) -> str:
+        return json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)
+
     def _elicit_message(self, decision: Decision, call: ToolCall, exposed_name: str) -> str:
-        args = json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)
-        if len(args) > 1500:
-            args = args[:1500] + "...(truncated)"
+        args = self._args_json(call)  # never cut: _require_approval only elicits when it fits
         return (f"GuardianAI: {exposed_name} needs your approval.\n"
                 f"Policy rule {decision.rule_id}: {_reasons(decision, 2)}\n"
                 f"Arguments: {args}\n"
@@ -613,8 +691,14 @@ class Gateway:
                                 call: ToolCall, outcome: GatewayResult):
         """Returns None when the call may proceed, otherwise the result to send back."""
         timeout = decision.approval.timeout_seconds if decision.approval else 120
+        modern = getattr(ctx, "protocol_version", "") in MODERN_PROTOCOL_VERSIONS
+        if modern and (params.request_state is not None or params.input_responses):
+            return await self._elicit_modern(params, decision, call, timeout, outcome)
         if self._can_elicit(ctx):
-            modern = getattr(ctx, "protocol_version", "") in MODERN_PROTOCOL_VERSIONS
+            if len(self._args_json(call)) > ELICIT_ARGS_LIMIT:
+                # A prompt that shows part of the arguments invites approving
+                # the part that was not shown.
+                return await self._queue(decision, call, params.name, outcome, too_long=True)
             if modern:
                 return await self._elicit_modern(params, decision, call, timeout, outcome)
             return await self._elicit_legacy(ctx, params, decision, call, timeout, outcome)
@@ -698,12 +782,15 @@ class Gateway:
         ))
         return types.InputRequiredResult(input_requests={ELICIT_KEY: request}, request_state=state)
 
-    async def _queue(self, decision: Decision, call: ToolCall, name: str, outcome: GatewayResult):
+    async def _queue(self, decision: Decision, call: ToolCall, name: str, outcome: GatewayResult,
+                     too_long: bool = False):
         if self.approvals is None:
+            why = (f"its arguments are too long ({ELICIT_ARGS_LIMIT}+ characters) to show in full in an approval "
+                   "prompt" if too_long else "this client cannot show an approval prompt (MCP elicitation)")
             return await self._declined(
                 decision, call,
-                "approval is required, but this client cannot show an approval prompt (MCP elicitation) and no "
-                "approval queue is attached (enable `dashboard` in gateway.yaml)",
+                f"approval is required, but {why} and no approval queue is attached (enable `dashboard` in "
+                "gateway.yaml)",
                 name)
         result = await queue_for_approval(self.approvals, decision, call, session=self.session,
                                           agent=self.config.agent)
@@ -737,9 +824,15 @@ class Gateway:
         payload: dict[str, Any] = {"content": payload_content}
         if result.structured_content is not None:
             payload["structured"] = result.structured_content
+        # The upstream's _meta reaches the client too (and some clients show
+        # it or hand it to the model). Our own key is ours to set, never the upstream's.
+        upstream_meta = {k: v for k, v in (result.meta or {}).items() if k != META_KEY}
+        result = result.model_copy(update={"meta": upstream_meta or None})
+        if upstream_meta:
+            payload["meta"] = upstream_meta
 
-        verdict = policy_engine.evaluate(loaded, call, phase="result", result=payload,
-                                         block_threshold=self.block_threshold)
+        verdict = await evaluate_off_loop(loaded, call, phase="result", result=payload,
+                                          block_threshold=self.block_threshold)
         outcome.result_decision = verdict
         if verdict.effect == "allow" and not verdict.matches:
             return _with_meta(result, _summary(decision))
@@ -759,10 +852,18 @@ class Gateway:
             content = list(result.content)
             for (idx, kind), old_text, new_text in zip(texts, payload_content, red.get("content", [])):
                 if new_text != old_text:
-                    content[idx] = _replace_text(content[idx], kind, new_text)
+                    replaced = _replace_text(content[idx], kind, new_text)
+                    if replaced is None:
+                        return _text_result(
+                            f"GuardianAI withheld the output of {call.name}: {_reasons(verdict)} (rule "
+                            f"{verdict.rule_id}). Part of it is not clean text, so it could not be redacted "
+                            "in place, and it was not passed on.", error=True, meta=meta)
+                    content[idx] = replaced
             update: dict[str, Any] = {"content": content}
             if "structured" in red:
                 update["structured_content"] = red["structured"]
+            if "meta" in red:
+                update["meta"] = red["meta"]
             return _with_meta(result.model_copy(update=update), meta)
         if verdict.effect == "warn":
             warning = types.TextContent(
