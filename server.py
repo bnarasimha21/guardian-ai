@@ -7,7 +7,10 @@ import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse as _JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -33,6 +36,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 
+class JSONResponse(_JSONResponse):
+    """JSON with non-ASCII escaped. Responses echo caller text (agent names,
+    argument paths in evidence), and a lone surrogate in it cannot be encoded
+    as UTF-8: the stock renderer turned such a request into a 500."""
+
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=True, allow_nan=False, indent=None,
+                          separators=(",", ":")).encode("ascii")
+
+
 _TOKEN_IN_URL = re.compile(r"(?i)([?&]token=)[^&\s\"']*")
 
 
@@ -44,11 +57,20 @@ class _ScrubTokens(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        if "token=" in message.lower():
-            record.msg = _TOKEN_IN_URL.sub(r"\1[REDACTED]", message)
-            record.args = ()
+        # Scrub the format string and each argument in place. Formatters such
+        # as uvicorn's AccessFormatter unpack record.args themselves, so the
+        # arguments must keep their shape.
+        if isinstance(record.msg, str):
+            record.msg = _scrub(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_scrub(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: _scrub(v) if isinstance(v, str) else v for k, v in record.args.items()}
         return True
+
+
+def _scrub(text: str) -> str:
+    return _TOKEN_IN_URL.sub(r"\1[REDACTED]", text) if "token=" in text.lower() else text
 
 
 _SCRUB = _ScrubTokens()
@@ -87,7 +109,14 @@ async def lifespan(app: FastAPI):
         otel.force_flush()
 
 
-app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan)
+app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan,
+              default_response_class=JSONResponse)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's own handler echoes the input with the stock renderer.
+    return JSONResponse({"detail": jsonable_encoder(exc.errors())}, status_code=422)
 
 # Outbound hooks. Tests replace these to run offline: the resolver maps hostnames
 # to addresses, and the transport answers the verify health check.
@@ -778,6 +807,12 @@ async def index():
     return FileResponse("frontend/index.html")
 
 
+def _ws_frame(event) -> str:
+    # ensure_ascii: text is sent escaped, so nothing in an event can fail the
+    # UTF-8 encode of the frame (send_json does not escape).
+    return json.dumps(event.model_dump(), separators=(",", ":"))
+
+
 @app.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket):
     await websocket.accept()
@@ -810,15 +845,26 @@ async def websocket_events(websocket: WebSocket):
     queue = bus.subscribe()
 
     async def pump() -> None:
-        while True:
-            event = await queue.get()
-            await websocket.send_json(event.model_dump())
+        try:
+            while True:
+                event = await queue.get()
+                await websocket.send_text(_ws_frame(event))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Close rather than leave a live but silent socket: the dashboard
+            # reconnects on close. The client's close reply ends the loop below.
+            logger.warning("dashboard socket for %s closed after a failed send: %s", sid, type(exc).__name__)
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
 
     # Send from a task and listen here, so a closed tab (or a server shutdown)
     # ends the handler at once instead of on the next event that fails to send.
     sender = asyncio.create_task(pump())
     try:
-        while not sender.done():
+        while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 break
