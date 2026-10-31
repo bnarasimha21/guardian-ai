@@ -133,6 +133,9 @@ def untrusted_paths_for(policy, tool_name: str) -> list[str]:
     return paths
 
 
+SCAN_LIMIT_RULE_ID = "builtin-deny-unscanned"
+
+
 def evaluate(
     loaded: LoadedPolicy,
     call: ToolCall,
@@ -174,6 +177,16 @@ def evaluate(
         reasons = [
             f"No policy rule matched tool '{call.name}'; the default {'' if phase == 'call' else 'result '}effect is {effect}"
         ]
+    # Input too large to scan fully is never known to be clean, so it is
+    # refused whatever the rules and BLOCK_THRESHOLD say. Otherwise padding a
+    # payload past the limit would turn every detector off.
+    limit_hit = next((m for m in matches if m.rule_name == detectors.SCAN_LIMIT_RULE), None)
+    if limit_hit is not None and effect != "deny":
+        effect = "deny"
+        rule_id = SCAN_LIMIT_RULE_ID
+        chosen = None
+        deciding = [detectors.SCAN_LIMIT_RULE]
+        reasons = ["The input is too large to scan fully, so it is refused (fail closed)"]
     for m in matches:
         if m.rule_name in deciding:
             for r in m.reasons:

@@ -122,12 +122,18 @@ rules:
     owasp_llm: LLM06
     owasp_agentic: ASI02
 
-  # 5. Read-only tools.
+  # 5. Read-only tools, judged by name only. The policy cannot see what a
+  #    tool does, so a tool named read_and_delete would match a bare "read_*".
+  #    The `not` list refuses compound names and names that also carry a word
+  #    for changing something. It narrows the gap; it does not close it.
   - id: allow-read-only
     description: Read-only tools
     match:
       tool: ["*.read", "*.read_*", "read_*", "*.get", "*.get_*", "get_*", "*.list", "*.list_*", "list_*",
-             "*.search", "*.search_*", "search_*", "*.summarize", "*.summarize_*", "summarize*"]
+             "*.search", "*.search_*", "search_*", "*.summarize", "*.summarize_*", "summarize", "summarize_*"]
+      not:
+        tool: ["*_and_*", "*_then_*", "*_delete*", "*_remove*", "*_drop*", "*_write*", "*_update*", "*_create*",
+               "*_send*", "*_upload*", "*_exec*", "*_deploy*", "*_transfer*", "*_kill*", "*_purge*"]
     effect: allow
 
   # 6. Chat output is checked by the detectors in rule 1, then allowed.
@@ -158,6 +164,16 @@ rules:
     description: Tool output carrying an instruction override is withheld from the agent
     match:
       detectors: {rules: [prompt_injection], min_severity: high}
+    effect: deny
+
+  # Exfiltration channels in output, for example a markdown image whose URL
+  # carries data, fire the moment the client renders them, so they are
+  # withheld rather than passed on with a warning.
+  - id: deny-exfiltration-in-results
+    phase: result
+    description: Tool output carrying a data exfiltration channel is withheld from the agent
+    match:
+      detectors: {rules: [data_exfiltration], min_severity: high}
     effect: deny
 
   # Rules are first match, so the deny comes before the redact: output that
