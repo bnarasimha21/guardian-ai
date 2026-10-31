@@ -62,6 +62,7 @@ from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from backend.approvals import ApprovalStore, PendingApproval, arguments_sha256
 from backend.approvals.flow import CREATED, DENIED_RECENTLY, GRANTED, REFUSED, queue_for_approval
 from backend.events.models import SEVERITY_ORDER, ThreatLevel
+from backend.guardian import rules as detectors
 from backend.guardian.middleware import Guardian, is_blocking
 from backend.guardian.models import ThreatMatch
 from backend.guardian.schema import ToolCall
@@ -337,6 +338,37 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
     return where, texts
 
 
+def _block_metas(content: list) -> dict[str, Any]:
+    """The ``_meta`` of every content block (key ``"<index>"``) and of every
+    embedded resource's contents (key ``"<index>.resource"``)."""
+    metas: dict[str, Any] = {}
+    for i, block in enumerate(content):
+        if getattr(block, "meta", None):
+            metas[str(i)] = block.meta
+        res = getattr(block, "resource", None) if isinstance(block, types.EmbeddedResource) else None
+        if res is not None and getattr(res, "meta", None):
+            metas[f"{i}.resource"] = res.meta
+    return metas
+
+
+def _set_block_metas(content: list, old: dict[str, Any], new: Any) -> list:
+    """``content`` with each block's ``_meta`` replaced by its redacted copy."""
+    if not isinstance(new, dict):
+        return content
+    content = list(content)
+    for key, before in old.items():
+        after = new.get(key, before)
+        if after == before:
+            continue
+        idx, _, part = key.partition(".")
+        block = content[int(idx)]
+        if part == "resource":
+            content[int(idx)] = block.model_copy(update={"resource": block.resource.model_copy(update={"meta": after})})
+        else:
+            content[int(idx)] = block.model_copy(update={"meta": after})
+    return content
+
+
 def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
     """``block`` with the text that ``kind`` names replaced by ``new_text``.
 
@@ -348,7 +380,7 @@ def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
     if kind == "resource":
         return block.model_copy(update={"resource": block.resource.model_copy(update={"text": new_text})})
     if kind == BLOB_AS_UTF8:
-        return None  # a second reading of the same bytes: cannot be redacted in place
+        return None  # a second reading of the same bytes: cannot be redacted on its own
     if kind == "blob":
         read = _blob_text(block.resource)
         if read is None or read[1] == LOSSY:
@@ -846,6 +878,11 @@ class Gateway:
         result = result.model_copy(update={"meta": upstream_meta or None})
         if upstream_meta:
             payload["meta"] = upstream_meta
+        # Each content block, and an embedded resource's contents, can carry
+        # its own _meta, which reaches the client the same way.
+        block_meta = _block_metas(result.content)
+        if block_meta:
+            payload["block_meta"] = block_meta
 
         verdict = await evaluate_off_loop(loaded, call, phase="result", result=payload,
                                           block_threshold=self.block_threshold)
@@ -866,20 +903,35 @@ class Gateway:
         if verdict.effect == "redact" and isinstance(verdict.redacted, dict):
             red = verdict.redacted
             content = list(result.content)
+            withheld = _text_result(
+                f"GuardianAI withheld the output of {call.name}: {_reasons(verdict)} (rule "
+                f"{verdict.rule_id}). Part of it is not clean text, so it could not be redacted "
+                "in place, and it was not passed on.", error=True, meta=meta)
+            second_readings: set[int] = set()
             for (idx, kind), old_text, new_text in zip(texts, payload_content, red.get("content", [])):
+                if kind == BLOB_AS_UTF8:
+                    # Redacting the charset reading rewrites these bytes too;
+                    # whether that cleaned this reading is checked below.
+                    second_readings.add(idx)
+                    continue
                 if new_text != old_text:
                     replaced = _replace_text(content[idx], kind, new_text)
                     if replaced is None:
-                        return _text_result(
-                            f"GuardianAI withheld the output of {call.name}: {_reasons(verdict)} (rule "
-                            f"{verdict.rule_id}). Part of it is not clean text, so it could not be redacted "
-                            "in place, and it was not passed on.", error=True, meta=meta)
+                        return withheld
                     content[idx] = replaced
+            names = set(verdict.deciding_detectors or [m.rule_name for m in verdict.matches])
+            for idx in second_readings:
+                raw = _blob_bytes(content[idx].resource.blob)
+                left = detectors.detect({"blob": (raw or b"").decode("utf-8", errors="replace")}, all_untrusted=True)
+                if any(m.rule_name in names or m.rule_name == detectors.SCAN_LIMIT_RULE for m in left):
+                    return withheld
             update: dict[str, Any] = {"content": content}
             if "structured" in red:
                 update["structured_content"] = red["structured"]
             if "meta" in red:
                 update["meta"] = red["meta"]
+            if "block_meta" in red:
+                content = update["content"] = _set_block_metas(content, block_meta, red["block_meta"])
             return _with_meta(result.model_copy(update=update), meta)
         if verdict.effect == "warn":
             warning = types.TextContent(
