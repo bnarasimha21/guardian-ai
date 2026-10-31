@@ -44,6 +44,7 @@ import logging
 import re
 import secrets
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import AsyncExitStack
@@ -336,6 +337,28 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
                     where.append((i, f"link:{name}"))
                     texts.append(_uri_parts(value)[1] if name == "uri" else value)
     return where, texts
+
+
+def _visible_json(text: str) -> str:
+    """JSON text with every character a person cannot see escaped as ``\\uXXXX``.
+
+    The approval prompt shows the arguments to a person. Bidi controls can
+    reorder what they read (an ``rm -rf`` shown as something harmless), and tag
+    characters, zero-width and other format or private-use characters are
+    invisible. Escaping them keeps the text valid JSON with the same value.
+    """
+    out = []
+    for ch in text:
+        if unicodedata.category(ch) in ("Cf", "Co", "Cs", "Zl", "Zp") or detectors._INVISIBLE.match(ch):
+            code = ord(ch)
+            if code > 0xFFFF:
+                code -= 0x10000
+                out.append(f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}")
+            else:
+                out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _block_metas(content: list) -> dict[str, Any]:
@@ -726,7 +749,7 @@ class Gateway:
 
     @staticmethod
     def _args_json(call: ToolCall) -> str:
-        return json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)
+        return _visible_json(json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str))
 
     def _elicit_message(self, decision: Decision, call: ToolCall, exposed_name: str) -> str:
         args = self._args_json(call)  # never cut: _require_approval only elicits when it fits

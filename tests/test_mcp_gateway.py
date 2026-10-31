@@ -155,6 +155,22 @@ async def test_stdio_gateway_allows_denies_and_asks(tmp_path, mode):
     assert ("files.deploy", "deny") in kinds
 
 
+async def test_approval_prompt_shows_invisible_characters_escaped(tmp_path):
+    # A bidi override can make the arguments a person approves read as
+    # something else; tag and zero-width characters are not seen at all.
+    cfg = write_config(tmp_path, poisoned=False)
+    prompts = Prompts("decline")
+    version = "1.0\u202e\u2066 evil\U000e0041\u200b\u3164 caf\u00e9"
+    async with Client(gateway_process(cfg), mode="legacy", elicitation_callback=prompts) as client:
+        await client.call_tool("files.deploy", {"service": "api", "version": version})
+    message = prompts.seen[0].message
+    for ch in ("\u202e", "\u2066", "\U000e0041", "\u200b", "\u3164"):
+        assert ch not in message, repr(ch)
+    assert "\\u202e" in message and "\\udb40\\udc41" in message and "caf\u00e9" in message
+    shown = message.split("Arguments: ", 1)[1].split("\n", 1)[0]
+    assert json.loads(shown)["version"] == version  # same value, still valid JSON
+
+
 @pytest.mark.parametrize("mode", MODES)
 async def test_elicitation_accept_runs_the_call(tmp_path, mode):
     cfg = write_config(tmp_path, poisoned=False)
