@@ -201,7 +201,11 @@ def evaluate(
         # in a normalised or decoded spelling (split by zero-width characters,
         # fullwidth, base64) survives it, so check, and withhold the result
         # rather than pass on a "redacted" copy that still carries the secret.
-        left = [m for m in detectors.detect(redacted, all_untrusted=True) if m.rule_name in names]
+        # The placeholder is longer than most secrets, so redacting can push the
+        # copy over the scan limit; a copy that cannot be fully re-scanned is
+        # not known to be clean either.
+        left = [m for m in detectors.detect(redacted, all_untrusted=True)
+                if m.rule_name in names or m.rule_name == detectors.SCAN_LIMIT_RULE]
         if left:
             effect = "deny"
             redacted = None

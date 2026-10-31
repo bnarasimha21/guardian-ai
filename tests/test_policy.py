@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -466,3 +467,22 @@ def test_policy_endpoint(client):
     assert info["version"] == 1 and info["mode"] == "enforce"
     assert info["path"].endswith("policies/default.yaml")
     assert "deny-detector-threats" in [r["id"] for r in info["rules"]]
+
+
+def test_redaction_that_grows_past_the_scan_limit_is_withheld():
+    """Each 20-character key becomes a longer placeholder, so the redacted copy
+    is over the scan limit and its last field (an obfuscated key the masking
+    cannot find) would go unchecked. A copy that cannot be fully re-scanned is
+    withheld, not passed on."""
+    import json
+
+    from backend.guardian.schema import ToolCall
+    from backend.policy.engine import evaluate
+
+    loaded = PolicyStore(Path(__file__).resolve().parent.parent / "policies" / "default.yaml").get()
+    result = {"content": ["AKIAIOSFODNN7EXAMPLE " * 47_380, "hello AKIA​IOSFODNN7​EXAMPLF"]}
+    assert len(json.dumps(result)) < 1_000_000
+    decision = evaluate(loaded, ToolCall(name="files.read_file", server="files"), phase="result", result=result)
+    assert decision.effect == "deny"
+    assert decision.redacted is None
+    assert decision.rule_id == "redact-secrets-in-results"
