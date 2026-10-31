@@ -165,6 +165,23 @@ def test_check_fails_when_false_positives_rise(tmp_path, monkeypatch, capsys):
     assert "benign flagged rate rose" in err and "benign blocked rate rose" in err
 
 
+def test_check_fails_when_one_record_is_traded_for_another(tmp_path):
+    # A change that stops one more attack and one fewer leaves the rate level;
+    # the gate must still name the attack that got through.
+    assert run.main(["--out", str(tmp_path)]) == 0
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    baseline = run.baseline_from(report)
+    stopped = set(report["stopped_attacks"])
+    gained = sorted(stopped)[0]
+    lost = next(m["id"] for m in report["misses"] if m["id"] not in stopped)
+    traded = {**baseline, "stopped_attacks": sorted((stopped - {gained}) | {lost})}
+    assert traded["attack_stopped_rate"] == baseline["attack_stopped_rate"]
+    problems = run.compare(report, traded)
+    assert problems == [f"attacks no longer stopped: {lost}"], problems
+    benign = {**baseline, "benign_flagged": baseline["benign_flagged"][1:]}
+    assert run.compare(report, benign) == [f"benign records newly flagged: {baseline['benign_flagged'][0]}"]
+
+
 @pytest.mark.parametrize("policy", [
     "version: 1\nmode: enforce\ndefault_effect: allow\ndefault_result_effect: allow\n"
     "rules:\n  - id: everything\n    match: {}\n    effect: allow\n",

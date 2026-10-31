@@ -36,7 +36,10 @@ require_approval; result: deny or redact; definitions: hidden) AND the policy
 enforces it (a monitor-mode policy stops nothing). A benign record is
 "flagged" when any detector fired and "blocked" when it was stopped. The CI
 gate checks the stopped rate too, so a policy that allows everything, or runs
-in monitor mode, fails --check even though detection is unchanged.
+in monitor mode, fails --check even though detection is unchanged. It also
+checks record by record: an attack the baseline stopped (or detected) that is
+no longer stopped (or detected), or a benign record newly flagged or blocked,
+fails --check even when another record's change leaves the rate the same.
 """
 
 from __future__ import annotations
@@ -290,6 +293,8 @@ def score(outcomes: list[Outcome]) -> dict:
         "owasp_llm": dict(sorted(by_owasp.items())),
         "confusion_owasp_llm": confusion("owasp_llm", "top_owasp_llm"),
         "confusion_owasp_agentic": confusion("owasp_agentic", "top_owasp_agentic"),
+        "stopped_attacks": sorted(o.id for o in attacks if o.stopped),
+        "detected_attacks": sorted(o.id for o in attacks if o.detected),
         "misses": [o.to_dict() for o in attacks if not o.detected],
         "false_positives": [o.to_dict() for o in benign if o.fired or o.stopped],
         "phases": dict(sorted(Counter(o.phase for o in outcomes).items())),
@@ -413,7 +418,16 @@ def baseline_from(report: dict) -> dict:
         "attack_stopped_rate": report["summary"]["attack_stopped_rate"],
         "benign_flagged_rate": report["summary"]["benign_flagged_rate"],
         "benign_blocked_rate": report["summary"]["benign_blocked_rate"],
+        "stopped_attacks": report["stopped_attacks"],
+        "detected_attacks": report["detected_attacks"],
+        "benign_flagged": sorted(fp["id"] for fp in report["false_positives"] if fp["fired"]),
+        "benign_blocked": sorted(fp["id"] for fp in report["false_positives"] if fp["stopped"]),
     }
+
+
+def _ids(ids) -> str:
+    ids = sorted(ids)
+    return ", ".join(ids[:10]) + (f" and {len(ids) - 10} more" if len(ids) > 10 else "")
 
 
 def compare(report: dict, baseline: dict) -> list[str]:
@@ -431,6 +445,19 @@ def compare(report: dict, baseline: dict) -> list[str]:
         was, is_ = baseline.get(key), now[key]
         if was is not None and is_ is not None and is_ > was:
             problems.append(f"{key.replace('_', ' ')} rose: {_pct(was)} -> {_pct(is_)}")
+    # Record by record: a rate can stay level while one record is lost and another gained.
+    for key, what in (("stopped_attacks", "attacks no longer stopped"),
+                      ("detected_attacks", "attacks no longer detected")):
+        if key in baseline:
+            lost = set(baseline[key]) - set(now[key])
+            if lost:
+                problems.append(f"{what}: {_ids(lost)}")
+    for key, what in (("benign_flagged", "benign records newly flagged"),
+                      ("benign_blocked", "benign records newly blocked")):
+        if key in baseline:
+            gained = set(now[key]) - set(baseline[key])
+            if gained:
+                problems.append(f"{what}: {_ids(gained)}")
     return problems
 
 

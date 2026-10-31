@@ -43,7 +43,7 @@ python evals/run.py            # writes evals/report.md and evals/report.json, o
 python evals/run.py --check    # exit 1 if a critical rule's recall drops, fewer attacks are stopped, or benign flag/block rates rise
 ```
 
-CI (`.github/workflows/evals.yml`) runs `--check` against `evals/baseline.json` on every pull request. The critical rules are `prompt_injection`, `data_exfiltration` and `dangerous_code`. To accept a deliberate change, run `python evals/run.py --write-baseline` and commit the result.
+CI (`.github/workflows/evals.yml`) runs `--check` against `evals/baseline.json` on every pull request. The critical rules are `prompt_injection`, `data_exfiltration` and `dangerous_code`. The gate compares the rates and also each record: an attack the baseline stopped or detected that no longer is, or a benign record newly flagged or blocked, fails it even if the rate is unchanged. To accept a deliberate change, run `python evals/run.py --write-baseline` and commit the result.
 
 The corpus is small, and the same people wrote it and the detectors. Read the numbers as regression coverage for known patterns, not as an accuracy claim. At the time of writing, 84% of attacks fire their expected detector, 75% are stopped by the shipped policy (an attack only counts as stopped when the decision is enforced, so monitor mode scores zero), and 3% of benign records trip a detector.
 
