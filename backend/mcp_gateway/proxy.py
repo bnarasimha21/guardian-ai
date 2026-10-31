@@ -202,11 +202,29 @@ def _reasons(decision: Decision, limit: int = 3) -> str:
 _LINK_FIELDS = ("name", "title", "description", "uri")
 
 
-def _blob_text(blob: str) -> str | None:
-    """A base64 blob's content as text, or None when it is not UTF-8 text."""
+_URLSAFE = str.maketrans("-_", "+/")
+
+
+def _blob_bytes(blob: str) -> bytes | None:
+    """Decode base64 the way a lenient client would: line breaks and other
+    whitespace ignored, the URL-safe alphabet accepted, padding optional.
+    None when it is not base64 at all."""
+    compact = "".join(blob.split()).translate(_URLSAFE).rstrip("=")
+    compact += "=" * (-len(compact) % 4)
     try:
-        return base64.b64decode(blob, validate=True).decode("utf-8")
+        return base64.b64decode(compact, validate=True)
     except (binascii.Error, ValueError):
+        return None
+
+
+def _blob_text(blob: str) -> str | None:
+    """A base64 blob's content as text, or None when it is binary."""
+    raw = _blob_bytes(blob)
+    if raw is None:
+        return blob  # not base64: scan the string as it is
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
         return None
 
 
@@ -215,8 +233,9 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
 
     Returns ``[(content index, kind)]`` and the matching texts. Kinds: "text",
     "resource" (embedded text resource), "blob" (embedded blob that decodes to
-    UTF-8 text) and "link:<field>" (a resource_link's name, title, description
-    or uri). Images, audio and binary blobs carry no text to scan.
+    UTF-8 text, or is not base64 at all and is scanned as it is), "uri" (an
+    embedded resource's uri) and "link:<field>" (a resource_link's name, title,
+    description or uri). Images, audio and binary blobs carry no text to scan.
     """
     where: list[tuple[int, str]] = []
     texts: list[str] = []
@@ -226,6 +245,9 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
             texts.append(block.text)
         elif isinstance(block, types.EmbeddedResource):
             res = block.resource
+            if isinstance(res.uri, str) and res.uri:
+                where.append((i, "uri"))
+                texts.append(str(res.uri))
             if isinstance(res, types.TextResourceContents):
                 where.append((i, "resource"))
                 texts.append(res.text)
@@ -250,8 +272,13 @@ def _replace_text(block: Any, kind: str, new_text: str) -> Any:
     if kind == "resource":
         return block.model_copy(update={"resource": block.resource.model_copy(update={"text": new_text})})
     if kind == "blob":
-        blob = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
+        if _blob_bytes(block.resource.blob) is None:
+            blob = new_text  # it was scanned as it is, so it is replaced as it is
+        else:
+            blob = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
         return block.model_copy(update={"resource": block.resource.model_copy(update={"blob": blob})})
+    if kind == "uri":
+        return block.model_copy(update={"resource": block.resource.model_copy(update={"uri": new_text})})
     return block.model_copy(update={kind.split(":", 1)[1]: new_text})
 
 

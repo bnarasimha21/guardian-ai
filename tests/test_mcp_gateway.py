@@ -285,6 +285,24 @@ def secret_blob() -> types.CallToolResult:
     ])
 
 
+def blob_tool(name, data):
+    def make() -> types.CallToolResult:
+        return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.BlobResourceContents(
+            uri="file:///notes.txt", mime_type="text/plain", blob=data))])
+    server.tool(name=name)(make)
+
+
+blob_tool("wrapped_blob", base64.encodebytes(INJECTION.encode()).decode())  # line breaks every 76 chars
+blob_tool("urlsafe_blob", base64.urlsafe_b64encode(("??>>" + INJECTION).encode()).decode().rstrip("="))
+blob_tool("raw_blob", INJECTION)  # not base64 at all
+
+
+@server.tool(name="uri_injection")
+def uri_injection() -> types.CallToolResult:
+    return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
+        uri="file:///" + INJECTION, mime_type="text/plain", text="quarterly numbers"))])
+
+
 if __name__ == "__main__":
     server.run("stdio")
 """
@@ -324,6 +342,14 @@ async def test_secret_in_text_blob_is_redacted_in_the_blob(tmp_path):
         assert "AKIAIOSFODNN7EXAMPLE" not in decoded and "eu-west-1" in decoded
         # Images are passed through untouched.
         assert any(isinstance(b, types.ImageContent) for b in result.content)
+
+
+@pytest.mark.parametrize("tool", ["wrapped_blob", "urlsafe_blob", "raw_blob", "uri_injection"])
+async def test_injection_in_unusual_blob_encodings_and_uris_is_withheld(tmp_path, tool):
+    async with Client(gateway_process(rich_config(tmp_path)), mode="legacy") as client:
+        result = await client.call_tool(f"rich.{tool}", {})
+        assert result.is_error, result
+        assert result.meta["guardian-ai/decision"]["rule_id"] == "deny-injection-in-results"
 
 
 def _data_root(tmp_path: Path, files: dict[str, str]) -> Path:
