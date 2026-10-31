@@ -212,6 +212,48 @@ def test_model_detector_blocks_through_policy(client, registered):
     assert det.seen  # it really ran
 
 
+class SlowDetector(ModelDetector):
+    name = "slow_model"
+    description = "Waits until the test lets it go"
+    timeout_seconds = 3.0
+
+    def __init__(self) -> None:
+        import threading
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.released_in_time: list[bool] = []
+
+    def score(self, text: str) -> float:
+        self.started.set()
+        self.released_in_time.append(self.release.wait(2.0))
+        return 0.1
+
+
+@pytest.mark.anyio
+async def test_a_slow_model_detector_does_not_stall_other_requests(registered):
+    # The detector holds its check until another request has been answered.
+    # If the check ran on the event loop, no other request could be served
+    # meanwhile and the detector would wait out its 2 seconds unreleased.
+    import anyio
+    import httpx
+    det = registered(SlowDetector())
+    results = {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://test") as http:
+        async def slow_check():
+            results["check"] = await http.post("/api/check", json={
+                "tool": {"name": "chat.reply"}, "arguments": {"text": "a long enough sentence to score"}})
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(slow_check)
+            with anyio.fail_after(5):
+                while not det.started.is_set():
+                    await anyio.sleep(0.01)
+            assert (await http.get("/api/taxonomy")).status_code == 200
+            det.release.set()
+    assert results["check"].status_code == 200
+    assert det.released_in_time and all(det.released_in_time), det.released_in_time
+
+
 def test_model_detector_below_threshold_is_silent(registered):
     registered(BananaDetector())
     assert [m for m in detect({"t": "plain text"}) if m.rule_name == "banana_model"] == []

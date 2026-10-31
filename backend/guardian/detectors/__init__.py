@@ -136,7 +136,12 @@ class ModelRule(ThreatRule):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"no time left of {d.timeout_seconds}s")
-                s = float(_POOL.submit(d.score, f.value).result(timeout=remaining))
+                future = _POOL.submit(d.score, f.value)
+                try:
+                    s = float(future.result(timeout=remaining))
+                except TimeoutError:
+                    future.cancel()  # drops it if it never started; a running score cannot be stopped
+                    raise
                 if s != s:
                     raise ValueError("score is NaN")
             except TimeoutError as exc:

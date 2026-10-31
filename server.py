@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse as _JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from backend import auth, netguard
@@ -384,7 +385,9 @@ def _make_event_handler(session_id: str):
             logger.error("No policy available, observed event not evaluated: %s", exc)
             return
         for call in calls:
-            decision = policy_engine.evaluate(loaded, call, block_threshold=settings.block_threshold)
+            # Off the event loop: a model detector can take seconds to score.
+            decision = await run_in_threadpool(policy_engine.evaluate, loaded, call,
+                                               block_threshold=settings.block_threshold)
             # The tap cannot stop anything: record what the policy would have done.
             decision.enforced = False
             await guardian.record(decision, call, source=app_name, observed=True)
@@ -563,8 +566,10 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
 
     with _telemetry().check_span(call, headers=request.headers, trace_context=req.trace_context,
                                  principal=principal) as span:
-        decision = policy_engine.evaluate(
-            loaded, call, principal=principal, block_threshold=settings.block_threshold,
+        # Off the event loop: a model detector can take seconds to score, and
+        # the dashboard, other checks and approvals must keep moving meanwhile.
+        decision = await run_in_threadpool(
+            policy_engine.evaluate, loaded, call, principal=principal, block_threshold=settings.block_threshold,
         )
         source = principal or call.agent_name or req.source
         guardian = _get_session(sid)["guardian"]
