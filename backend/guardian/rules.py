@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import binascii
 import fnmatch
+import math
 import re
 import unicodedata
 from abc import ABC, abstractmethod
@@ -256,7 +257,15 @@ def build_scan_input(
         if isinstance(value, bool) or value is None:
             continue
         if isinstance(value, (int, float)):
-            out.numbers[path] = float(value)
+            # NaN, Infinity (Python's JSON parser accepts both) and integers too
+            # large for a float are not numbers any rule can compare; skip them
+            # rather than fail the whole check.
+            try:
+                number = float(value)
+            except OverflowError:
+                continue
+            if math.isfinite(number):
+                out.numbers[path] = number
             continue
         if isinstance(value, dict):
             items = list(value.items())

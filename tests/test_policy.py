@@ -572,6 +572,15 @@ def test_input_too_large_to_scan_is_denied_whatever_the_threshold_or_rules(clien
     assert resp.status_code == 403, resp.json()
 
 
+def test_input_too_large_to_scan_is_refused_by_the_endpoint_under_allow_all(client, policy_file):
+    from backend.policy.engine import SCAN_LIMIT_RULE_ID
+
+    policy_file(ALLOW_ALL)
+    assert check(client, "chat.reply", {"text": "hi"}).status_code == 200
+    resp = check(client, "chat.reply", {"items": list(range(20_000))})
+    assert resp.status_code == 403 and resp.json()["rule_id"] == SCAN_LIMIT_RULE_ID, resp.json()
+
+
 def test_markdown_image_exfiltration_in_tool_output_is_withheld():
     from backend.guardian.schema import ToolCall
     from backend.policy.engine import evaluate

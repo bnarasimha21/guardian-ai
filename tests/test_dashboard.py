@@ -274,3 +274,93 @@ def test_truncated_approval_offers_deny_only():
     assert "btn-approve" in full and "btn-deny" in full
     assert "btn-approve" not in cut and "btn-deny" in cut
     assert "too large to show in full" in cut
+
+
+def test_flood_of_watched_sessions_does_not_evict_the_operator(client, monkeypatch):
+    """Every session in the table is watched by a socket, so none is idle and
+    eviction used to fall back to the least recently used: the operator's
+    app: session. It must survive and keep receiving events."""
+
+    monkeypatch.setattr(server, "MAX_SESSIONS", 4)
+    monkeypatch.setattr(server.settings, "guardian_api_keys", f"billing={KEY_A}")
+    with client.websocket_connect(f"/ws/events?session=app:billing&token={KEY_A}") as op:
+        operator_bus = server._sessions["app:billing"]["bus"]
+        sockets = []
+        try:
+            for i in range(8):  # new ids, each kept watched by an authenticated socket
+                ws = client.websocket_connect(f"/ws/events?session=flood-{i}&token={KEY_A}")
+                ws.__enter__()
+                sockets.append(ws)
+            assert server._sessions.get("app:billing", {}).get("bus") is operator_bus
+            assert len(server._sessions) <= 4
+            resp = client.post("/api/check", json={"tool": {"name": "shell.exec"}, "arguments": {"cmd": "ls"}},
+                               headers={"Authorization": f"Bearer {KEY_A}"})
+            assert resp.status_code == 403
+            assert any(op.receive_json()["type"] == "decision" for _ in range(4))
+        finally:
+            for ws in sockets:
+                ws.__exit__(None, None, None)
+
+
+def test_unauthenticated_socket_cannot_create_sessions_when_keys_are_on(client, monkeypatch):
+    monkeypatch.setattr(server.settings, "guardian_api_keys", f"billing={KEY_A}")
+    from starlette.websockets import WebSocketDisconnect
+
+    for sid, url in (("new-1", "/ws/events?session=new-1"),
+                     ("new-2", "/ws/events?session=new-2&token=" + "z" * 24)):
+        # Look at the session table rather than read the socket: a socket that
+        # was wrongly let in would never send, and a read would wait forever.
+        created = None
+        try:
+            with client.websocket_connect(url):
+                created = sid in server._sessions
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+        assert not created and sid not in server._sessions
+    # A valid key may still open one.
+    with client.websocket_connect(f"/ws/events?session=new-3&token={KEY_A}"):
+        assert "new-3" in server._sessions
+
+
+def test_without_keys_any_socket_still_opens_a_session(client):
+    with client.websocket_connect("/ws/events?session=demo-1"):
+        assert "demo-1" in server._sessions
+
+
+def _strict(text: str):
+    def bad(token):
+        raise AssertionError(f"frame has a bare {token}, which JSON.parse rejects: {text[:200]}")
+    return json.loads(text, parse_constant=bad)
+
+
+def test_nan_in_arguments_reaches_the_dashboard_as_valid_json(client):
+    """Python's JSON parser accepts NaN in a request body. The decision card
+    copied it into details, and the WebSocket frame then held a bare NaN that
+    the browser cannot parse."""
+    body = '{"tool": {"name": "shell.exec"}, "arguments": {"cmd": "ls", "score": NaN, "iteration": Infinity}}'
+    with client.websocket_connect("/ws/events?session=s-nan") as ws:
+        resp = client.post("/api/check", content=body,
+                           headers={"X-Session-Id": "s-nan", "Content-Type": "application/json"})
+        assert resp.status_code in (200, 403)
+        frames = [_strict(ws.receive_text()) for _ in range(2)]
+    card = next(f for f in frames if f["type"] == "decision")
+    assert card["details"]["score"] == "nan" and card["details"]["iteration"] == "inf"
+
+
+def test_any_event_with_a_non_finite_number_is_sent_as_valid_json():
+    from backend.events.models import AgentActivityEvent
+
+    event = AgentActivityEvent(event_type="evaluation", agent="a", task_id="t", summary="s",
+                               data={"score": float("nan"), "nested": [{"x": float("-inf")}], "ok": 1.5})
+    frame = _strict(server._ws_frame(event))
+    assert frame["data"] == {"score": "nan", "nested": [{"x": "-inf"}], "ok": 1.5}
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1" + "0" * 400])
+def test_odd_numbers_in_arguments_do_not_fail_the_check(client, number):
+    """NaN and Infinity crashed the score rule (int(nan)); an integer too large
+    for a float crashed the scanner. Each was a 500."""
+    body = '{"tool": {"name": "eval.submit"}, "arguments": {"score": %s, "note": "ok"}}' % number
+    resp = client.post("/api/check", content=body, headers={"Content-Type": "application/json"})
+    assert resp.status_code in (200, 403), resp.text
+    assert resp.json()["rule_id"]

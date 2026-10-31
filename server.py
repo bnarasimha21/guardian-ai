@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -238,6 +239,7 @@ _sessions: dict[str, dict] = {}
 # Cap on live sessions (ids come from unauthenticated X-Session-Id / ?session= values:
 # without a cap, a client could grow memory by sending endless new ids). At the cap the
 # least recently used session is evicted, preferring one with no subscribers or observers.
+# A watched API-key session is never evicted (see _protected).
 MAX_SESSIONS = 1000
 
 SKIP_EVENTS = {
@@ -246,22 +248,37 @@ SKIP_EVENTS = {
 }
 
 
-def _evict_session() -> None:
-    """Drop one session to make room: the least recently used idle one, else the LRU."""
+def _protected(sid: str, sess: dict) -> bool:
+    """An API-key session someone is watching. Never evicted: a flood of new
+    unauthenticated ids must not cut the operator's dashboard off. There is at
+    most one per configured key, so this cannot hold the cap open forever."""
+    return sid.startswith(auth.APP_SESSION_PREFIX) and sess["bus"].subscriber_count > 0
+
+
+def _evict_session() -> bool:
+    """Drop one session to make room: the least recently used idle one, else the
+    least recently used unprotected one. False when every session is protected."""
     victim = None
+    fallback = None
     for sid, sess in _sessions.items():  # dict order is least to most recently used
+        if _protected(sid, sess):
+            continue
         idle = sess["bus"].subscriber_count == 0 and not any(
             not t.done() for t in sess["observers"].values()
         )
         if idle:
             victim = sid
             break
+        if fallback is None:
+            fallback = sid
+    victim = victim or fallback
     if victim is None:
-        victim = next(iter(_sessions))
+        return False
     for task in _sessions[victim]["observers"].values():
         task.cancel()
     del _sessions[victim]
     logger.info("Evicted session %s (cap %d)", victim[:8], MAX_SESSIONS)
+    return True
 
 
 def _get_session(session_id: str) -> dict:
@@ -273,8 +290,8 @@ def _get_session(session_id: str) -> dict:
     if session_id in _sessions:
         _sessions[session_id] = _sessions.pop(session_id)  # move to the MRU end
     else:
-        while len(_sessions) >= MAX_SESSIONS:
-            _evict_session()
+        while len(_sessions) >= MAX_SESSIONS and _evict_session():
+            pass
         bus = EventBus()
         _sessions[session_id] = {
             "bus": bus,
@@ -852,10 +869,27 @@ async def index():
     return FileResponse("frontend/index.html")
 
 
+def _finite(value):
+    """Copy of value with NaN and Infinity floats replaced by their names."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
 def _ws_frame(event) -> str:
     # ensure_ascii: text is sent escaped, so nothing in an event can fail the
-    # UTF-8 encode of the frame (send_json does not escape).
-    return json.dumps(event.model_dump(), separators=(",", ":"))
+    # UTF-8 encode of the frame (send_json does not escape). allow_nan=False:
+    # json.dumps would otherwise write a bare NaN, which JSON.parse rejects,
+    # so the dashboard would drop the event and every one after it in the frame.
+    data = event.model_dump()
+    try:
+        return json.dumps(data, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(data), separators=(",", ":"), allow_nan=False)
 
 
 @app.websocket("/ws/events")
@@ -872,6 +906,15 @@ async def websocket_events(websocket: WebSocket):
         ok = (app_key is not None and token is not None and auth.match_key(token, {owner: app_key}) == owner) \
             or auth.match_key(token, _approver_keys()) is not None
         if not ok:
+            await websocket.close(code=1008)
+            return
+    elif sid not in _sessions and (_api_keys() or _approver_keys()):
+        # With keys on, an unauthenticated socket may watch a session that
+        # exists but not create one: otherwise anyone could fill the session
+        # table with new ids and push real sessions out.
+        token = websocket.query_params.get("token")
+        if token is None or (auth.match_key(token, _api_keys()) is None
+                             and auth.match_key(token, _approver_keys()) is None):
             await websocket.close(code=1008)
             return
     session = _get_session(sid)

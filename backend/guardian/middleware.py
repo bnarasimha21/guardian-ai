@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from backend.events.bus import EventBus
 from backend.events.models import (
@@ -203,7 +204,9 @@ def _safe_details(data) -> dict:
     for key in ("agent", "task_id", "score", "passed", "services", "complexity",
                 "criteria_count", "iteration", "service_count", "coherence_score", "_source"):
         if key in data and isinstance(data[key], (str, int, float, bool)):
-            details[key] = data[key]
+            value = data[key]
+            # NaN and Infinity are not JSON; the dashboard would get a frame it cannot parse.
+            details[key] = str(value) if isinstance(value, float) and not math.isfinite(value) else value
     for key in ("specification", "content", "query", "output", "reasoning", "message",
                 "url", "path", "command", "text", "page"):
         if key in data and isinstance(data[key], str):
