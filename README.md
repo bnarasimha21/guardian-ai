@@ -131,7 +131,7 @@ What happens to each request:
 
   ```bash
   guardian-mcp --config gateway.yaml pins list
-  guardian-mcp --config gateway.yaml pins approve files.deploy
+  guardian-mcp --config gateway.yaml pins approve files.deploy 3f2a9c1d4e5b   # the new hash `pins list` shows
   ```
 
 - **Monitor mode** (`mode: monitor` in the policy): nothing is blocked or hidden; decisions are still recorded and attached to results.

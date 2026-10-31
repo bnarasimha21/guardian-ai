@@ -563,12 +563,12 @@ class Gateway:
 
         if screened is None or screened.rule_id != "tool_poisoning":
             pin = self.pins.get(policy_name)
-            status = self.pins.check(policy_name, sha, definition.get("description", "") or "")
+            status = self.pins.check(policy_name, sha, definition.get("description", "") or "", definition)
             if status == "changed":
                 old = (pin or {}).get("sha256", "")
                 reason = (f"The definition of {policy_name} changed since it was pinned "
                           f"({old[:12]} -> {sha[:12]}); hidden until an operator runs "
-                          f"`guardian-mcp pins approve {policy_name}`")
+                          f"`guardian-mcp pins approve {policy_name} {sha[:12]}`")
                 decision = self._synthetic(loaded, call, rule="tool_definition_changed", reason=reason,
                                            level=ThreatLevel.HIGH)
                 await self._report_once(decision, call, sha)

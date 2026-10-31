@@ -4,7 +4,12 @@ The first time the gateway sees a clean tool it records a SHA-256 of the
 definition (name, title, description, input and output schema, annotations).
 If a later listing returns a different hash, the tool is hidden and the new
 hash is kept as ``pending_sha256`` until an operator approves it with
-``guardian-mcp --config gateway.yaml pins approve <server.tool>``.
+``guardian-mcp --config gateway.yaml pins approve <server.tool> <sha-prefix>``.
+
+Approval names the hash being approved, so a definition that changes again
+between ``pins list`` (where the operator read the diff) and ``pins approve``
+is not accepted by mistake. The pinned and pending definitions are stored in
+full so ``pins list`` can show what changed.
 
 The file is plain JSON, written atomically (temp file and rename). Two gateway
 processes sharing one pins file can overwrite each other's new pins; give each
@@ -13,6 +18,7 @@ gateway its own file if that matters.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -22,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 FORMAT_VERSION = 1
+MIN_PREFIX = 8  # hex characters of the pending hash that `approve` must quote
 
 
 def definition_sha256(definition: dict[str, Any]) -> str:
@@ -75,43 +82,80 @@ class PinStore:
     def all(self) -> dict[str, dict[str, Any]]:
         return dict(self._pins)
 
-    def check(self, name: str, sha: str, description: str = "") -> str:
+    def check(self, name: str, sha: str, description: str = "",
+              definition: dict[str, Any] | None = None) -> str:
         """Compare a listed definition with its pin.
 
         Returns ``"pinned"`` (new tool, now pinned), ``"match"`` or ``"changed"``.
-        A changed definition records ``pending_sha256`` for ``approve``.
+        A changed definition records ``pending_sha256`` (and the definition
+        itself) for ``approve``.
         """
         pin = self._pins.get(name)
         now = time.time()
         if pin is None:
-            self._pins[name] = {"sha256": sha, "pinned_at": now, "description": description[:500]}
+            self._pins[name] = {"sha256": sha, "pinned_at": now, "description": description[:500],
+                                "definition": definition}
             self._save()
             return "pinned"
         if pin.get("sha256") == sha:
+            dirty = False
             if pin.get("pending_sha256"):
-                pin.pop("pending_sha256", None)
-                pin.pop("pending_description", None)
-                pin.pop("changed_at", None)
+                for key in ("pending_sha256", "pending_description", "pending_definition", "changed_at"):
+                    pin.pop(key, None)
+                dirty = True
+            if definition is not None and pin.get("definition") is None:
+                pin["definition"] = definition  # pinned before definitions were kept
+                dirty = True
+            if dirty:
                 self._save()
             return "match"
         if pin.get("pending_sha256") != sha:
             pin["pending_sha256"] = sha
             pin["pending_description"] = description[:500]
+            pin["pending_definition"] = definition
             pin["changed_at"] = now
             self._save()
         return "changed"
 
-    def approve(self, name: str) -> dict[str, Any]:
-        """Accept the pending definition of ``name`` as the new pin."""
+    def diff(self, name: str) -> str:
+        """Unified diff of the pinned and the pending definition of ``name``."""
+        pin = self._pins.get(name) or {}
+        if not pin.get("pending_sha256"):
+            return ""
+        old, new = pin.get("definition"), pin.get("pending_definition")
+        if old is None or new is None:
+            return "(the full definitions were not recorded; compare with the upstream before approving)"
+
+        def lines(d: Any) -> list[str]:
+            return json.dumps(d, indent=2, sort_keys=True, ensure_ascii=False, default=str).splitlines()
+
+        return "\n".join(difflib.unified_diff(lines(old), lines(new), f"pinned {pin['sha256'][:12]}",
+                                               f"now {pin['pending_sha256'][:12]}", lineterm=""))
+
+    def approve(self, name: str, sha_prefix: str) -> dict[str, Any]:
+        """Accept the pending definition of ``name`` as the new pin.
+
+        ``sha_prefix`` must be the start (at least MIN_PREFIX hex characters)
+        of the pending hash the operator reviewed; if the definition changed
+        again since, the pending hash differs and nothing is approved.
+        """
+        prefix = (sha_prefix or "").strip().lower()
+        if len(prefix) < MIN_PREFIX or any(c not in "0123456789abcdef" for c in prefix):
+            raise PinError(f"give at least {MIN_PREFIX} hex characters of the new hash shown by `pins list`")
         self.reload()
         pin = self._pins.get(name)
         if pin is None:
             raise PinError(f"no pin for {name!r}")
-        if not pin.get("pending_sha256"):
+        pending = pin.get("pending_sha256")
+        if not pending:
             raise PinError(f"{name!r} has no changed definition waiting for approval")
+        if not pending.startswith(prefix):
+            raise PinError(f"{name!r} is now waiting on {pending[:12]}, not {prefix}: the definition changed "
+                           "again; run `pins list` and review it before approving")
         pin["previous_sha256"] = pin["sha256"]
         pin["sha256"] = pin.pop("pending_sha256")
         pin["description"] = pin.pop("pending_description", "")
+        pin["definition"] = pin.pop("pending_definition", None)
         pin.pop("changed_at", None)
         pin["pinned_at"] = time.time()
         self._save()
