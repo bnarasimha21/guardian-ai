@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -111,6 +112,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GuardianAI - Real-Time Agent Defense Monitor", lifespan=lifespan,
               default_response_class=JSONResponse)
+
+
+# The dashboard renders text that agents and tools chose (agent names, tool
+# output, reasons). It escapes all of it, and this policy is the backstop: no
+# inline script, no script from anywhere but /static, no framing, no plugins.
+# Inline style attributes stay allowed (the cards colour badges with them).
+# Applied to the page and its static files only, so /docs keeps working.
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+])
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        response.headers["X-Frame-Options"] = "DENY"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # A dashboard URL may carry ?session=app:...; never send it to another site.
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 @app.exception_handler(RequestValidationError)
@@ -691,19 +724,29 @@ async def answer_approval(approval_id: str, answer: ApprovalAnswer, request: Req
 
 
 @app.get("/api/policy")
-async def policy_info():
-    """Which policy is in force: path, hash, mode, rule ids, and any reload error."""
+async def policy_info(request: Request):
+    """Which policy is in force: file name, hash, mode, rule ids, and whether a reload failed.
+
+    With API or approver keys configured, a valid key of either kind is
+    required: the rule ids and descriptions say what is allowed and how to
+    reach it. The absolute path and the parse error stay in the server log.
+    """
+    if _api_keys() or _approver_keys():
+        token = auth.bearer_token(request.headers.get("authorization"))
+        if auth.match_key(token, _api_keys()) is None and auth.match_key(token, _approver_keys()) is None:
+            raise HTTPException(status_code=401, detail="A valid API or approver key is required",
+                                headers={"WWW-Authenticate": "Bearer"})
     store = _policy_store()
     loaded = store.get()
     return {
-        "path": loaded.path,
+        "file": Path(loaded.path).name,
         "sha256": loaded.sha256,
         "version": loaded.policy.version,
         "mode": loaded.policy.mode,
         "default_effect": loaded.policy.default_effect,
         "rules": [{"id": r.id, "phase": r.phase, "effect": r.effect, "description": r.description}
                   for r in loaded.policy.rules],
-        "reload_error": store.last_error,
+        "reload_failed": store.last_error is not None,
     }
 
 

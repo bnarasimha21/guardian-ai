@@ -74,6 +74,9 @@ class Decision:
     owasp_agentic: str = ""
     rule_description: str = ""
     redacted: Any = None
+    # The API-key name the caller authenticated as, if any. Unlike the agent
+    # id in the request body, the caller cannot choose it.
+    principal: str = ""
 
     @property
     def matched_detectors(self) -> list[str]:
@@ -245,6 +248,7 @@ def evaluate(
         owasp_agentic=owasp_agentic,
         rule_description=chosen.description if chosen else "",
         redacted=redacted,
+        principal=principal or "",
     )
 
 

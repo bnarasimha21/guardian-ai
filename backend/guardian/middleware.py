@@ -159,7 +159,9 @@ class Guardian:
             safe["_source"] = source
         return DecisionEvent(
             event_type=call.event_type if call.legacy else "tool_call",
-            agent=call.agent_name or call.agent_id,
+            # With API keys the key name is the identity; the body's agent is
+            # self-reported and is shown only when there is no key.
+            agent=getattr(decision, "principal", "") or call.agent_name or call.agent_id,
             task_id="",
             action=action,
             rule_name=rule_name,

@@ -18,14 +18,21 @@ function getSessionId() {
     }
     return sid;
 }
-// ?session=app:<name>&token=<key> watches the session of an API-key caller.
-// The token is an approver key (or that app's key); it is kept for this tab only.
+// ?session=app:<name>#token=<key> watches the session of an API-key caller.
+// The token is an approver key (or that app's key); it is kept for this tab
+// only. The fragment is never sent to the server, so the key stays out of
+// access logs and proxies; ?token= is still read for old links. Either way it
+// is removed from the address bar and history as soon as it is read.
 const URL_PARAMS = new URLSearchParams(location.search);
-if (URL_PARAMS.get('token')) {
-    sessionStorage.setItem('guardian_token', URL_PARAMS.get('token'));
-    // Do not leave the key in the address bar or history.
+const HASH_PARAMS = new URLSearchParams(location.hash.replace(/^#/, ''));
+const URL_TOKEN = HASH_PARAMS.get('token') || URL_PARAMS.get('token');
+if (URL_TOKEN) sessionStorage.setItem('guardian_token', URL_TOKEN);
+if (URL_PARAMS.has('token') || HASH_PARAMS.has('token')) {
     URL_PARAMS.delete('token');
-    history.replaceState(null, '', location.pathname + (URL_PARAMS.toString() ? '?' + URL_PARAMS : ''));
+    HASH_PARAMS.delete('token');
+    history.replaceState(null, '', location.pathname
+        + (URL_PARAMS.toString() ? '?' + URL_PARAMS : '')
+        + (HASH_PARAMS.toString() ? '#' + HASH_PARAMS : ''));
 }
 const AUTH_TOKEN = sessionStorage.getItem('guardian_token') || '';
 const SESSION_ID = URL_PARAMS.get('session') || getSessionId();
@@ -125,7 +132,7 @@ function handleEvent(event) {
 
 function approvalStatusLabel(a) {
     if (a.status === 'pending') return 'WAITING';
-    if (a.status === 'approved') return a.uses > 0 ? `APPROVED, USED ${a.uses}x` : 'APPROVED';
+    if (a.status === 'approved') return Number(a.uses) > 0 ? `APPROVED, USED ${Number(a.uses)}x` : 'APPROVED';
     if (a.reason === 'timeout') return 'DENIED (TIMEOUT)';
     return 'DENIED';
 }
@@ -174,7 +181,7 @@ function renderApproval(a) {
 
     card.innerHTML = `
         <div class="approval-head">
-            <span class="approval-status status-${escapeHtml(a.status)}">${approvalStatusLabel(a)}</span>
+            <span class="approval-status status-${escapeAttr(a.status)}">${approvalStatusLabel(a)}</span>
             <span class="decision-tool">${escapeHtml(a.tool_name || '')}${a.agent ? ' (' + escapeHtml(a.agent) + ')' : ''}</span>
             ${expires}
         </div>
@@ -484,7 +491,7 @@ function renderDecisionCard(event) {
 
     const iconClass = isPending ? 'pending-icon' : (isBlocked ? 'flagged-icon' : 'allowed-icon');
     const actionClass = isPending ? 'pending-text' : (isBlocked ? 'flagged-text' : 'allowed-text');
-    const actionLabel = isPending ? 'NEEDS APPROVAL' : String(event.action || '').toUpperCase();
+    const actionLabel = isPending ? 'NEEDS APPROVAL' : escapeHtml(String(event.action || '').toUpperCase());
 
     // Where the decision was made: observed on the passive tap (cannot stop
     // anything), monitor mode (enforcement off) or enforced inline.
@@ -502,7 +509,8 @@ function renderDecisionCard(event) {
     // Threat level badge
     let threatHtml = '';
     if (event.threat_level && event.threat_level !== 'none') {
-        threatHtml = `<span class="threat-level ${event.threat_level}">${event.threat_level.toUpperCase()}</span>`;
+        const level = String(event.threat_level);
+        threatHtml = `<span class="threat-level ${escapeAttr(level)}">${escapeHtml(level.toUpperCase())}</span>`;
     } else if (!isBlocked) {
         threatHtml = '<span class="threat-level none">SAFE</span>';
     }
@@ -511,10 +519,10 @@ function renderDecisionCard(event) {
     let owaspHtml = '';
     const llmId = event.owasp_llm || event.owasp_id || '';
     if (llmId) {
-        owaspHtml += `<span class="owasp-badge" title="${escapeHtml(owaspLabel('owasp_llm', llmId))}">${escapeHtml(llmId)}</span>`;
+        owaspHtml += `<span class="owasp-badge" title="${escapeAttr(owaspLabel('owasp_llm', llmId))}">${escapeHtml(llmId)}</span>`;
     }
     if (event.owasp_agentic) {
-        owaspHtml += `<span class="owasp-badge" title="${escapeHtml(owaspLabel('owasp_agentic', event.owasp_agentic))}">${escapeHtml(event.owasp_agentic)}</span>`;
+        owaspHtml += `<span class="owasp-badge" title="${escapeAttr(owaspLabel('owasp_agentic', event.owasp_agentic))}">${escapeHtml(event.owasp_agentic)}</span>`;
     }
 
     // Rule name
@@ -542,7 +550,7 @@ function renderDecisionCard(event) {
 
     const eventLabel = event.tool_name && !String(event.tool_name).startsWith('guardian.')
         ? escapeHtml(event.tool_name) : formatEventType(event.event_type);
-    const agentLabel = event.agent ? ` (${event.agent})` : '';
+    const agentLabel = event.agent ? ` (${escapeHtml(event.agent)})` : '';
 
     // Details (exclude _source from display)
     let detailsHtml = '';
@@ -585,7 +593,7 @@ function renderDecisionCard(event) {
     }
 
     card.innerHTML = `
-        <div class="decision-header ${isBlocked ? 'clickable' : ''}" ${isBlocked ? 'onclick="toggleExpand(this)"' : ''}>
+        <div class="decision-header ${isBlocked ? 'clickable' : ''}">
             <div class="decision-icon ${iconClass}">${decisionIcon}</div>
             <span class="decision-action ${actionClass}">${actionLabel}</span>
             ${srcHtml}
@@ -600,6 +608,10 @@ function renderDecisionCard(event) {
         ${expandHtml}
     `;
 
+    if (isBlocked) {
+        const header = card.querySelector('.decision-header');
+        if (header) header.addEventListener('click', () => toggleExpand(header));
+    }
     list.appendChild(card);
     scrollToBottom(list);
 
@@ -664,17 +676,17 @@ function updateCounter(id, value) {
     setTimeout(() => { num.style.transform = 'scale(1)'; }, 200);
 }
 
+// Text from events, approvals and targets is untrusted (an agent names itself,
+// a tool returns any string). Escape it for both text and quoted attributes.
 function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(str ?? '').replace(/[&<>"']/g, c => map[c]);
 }
 
-// For attribute values: escapeHtml leaves quotes alone, so a name with a quote
-// would end the attribute. Names reach handlers through data-* attributes,
-// never through inline JS strings.
+// Kept as its own name for attribute contexts; values reach handlers through
+// data-* attributes, never through inline JS strings.
 function escapeAttr(str) {
-    return escapeHtml(String(str ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    return escapeHtml(str);
 }
 
 function scrollToBottom(el) {
@@ -778,7 +790,7 @@ function updateAppsList(targets) {
             <span class="app-status-dot ${escapeAttr(t.status)}"></span>
             <span class="app-item-name">${escapeHtml(t.name)}</span>
             <span class="app-item-url">${escapeHtml(t.ws_url)}</span>
-            <button class="app-remove-btn" data-name="${escapeAttr(t.name)}" onclick="removeApp(this.dataset.name)" title="Disconnect">&times;</button>
+            <button class="app-remove-btn" data-name="${escapeAttr(t.name)}" title="Disconnect">&times;</button>
         </div>
     `).join('');
 }
@@ -948,27 +960,27 @@ function renderSummary() {
     let checked, flagged, allowed, blocked, byRule, bySeverity;
     if (selectedApp !== '__all' && event.per_app && event.per_app[selectedApp]) {
         const appStats = event.per_app[selectedApp];
-        checked = appStats.checked || 0;
-        flagged = appStats.flagged || 0;
-        allowed = appStats.allowed || 0;
-        blocked = appStats.blocked || 0;
+        checked = Number(appStats.checked) || 0;
+        flagged = Number(appStats.flagged) || 0;
+        allowed = Number(appStats.allowed) || 0;
+        blocked = Number(appStats.blocked) || 0;
         byRule = appStats.by_rule || {};
         bySeverity = appStats.by_severity || {};
     } else {
-        checked = event.total_checked || 0;
-        flagged = event.total_flagged || 0;
-        allowed = event.total_allowed || 0;
-        blocked = event.total_blocked || 0;
+        checked = Number(event.total_checked) || 0;
+        flagged = Number(event.total_flagged) || 0;
+        allowed = Number(event.total_allowed) || 0;
+        blocked = Number(event.total_blocked) || 0;
         byRule = event.by_rule || {};
         bySeverity = event.by_severity || {};
     }
 
     const ruleChips = Object.entries(byRule).map(([rule, count]) =>
-        `<span class="summary-chip summary-chip-flagged">${escapeHtml(rule)}: ${count}</span>`
+        `<span class="summary-chip summary-chip-flagged">${escapeHtml(rule)}: ${Number(count) || 0}</span>`
     ).join('');
 
     const sevChips = Object.entries(bySeverity).map(([sev, count]) =>
-        `<span class="summary-chip severity-${sev}">${sev.toUpperCase()}: ${count}</span>`
+        `<span class="summary-chip severity-${escapeAttr(sev)}">${escapeHtml(String(sev).toUpperCase())}: ${Number(count) || 0}</span>`
     ).join('');
 
     const statusClass = flagged > 0 ? 'summary-warning' : 'summary-clean';
@@ -1059,7 +1071,7 @@ function filterActivity() {
 function switchStack(stack) {
     // Toggle tab active state
     document.querySelectorAll('.stack-tab').forEach(t => t.classList.remove('active'));
-    document.querySelector(`.stack-tab[onclick="switchStack('${stack}')"]`).classList.add('active');
+    document.querySelector(`.stack-tab[data-stack="${CSS.escape(stack)}"]`)?.classList.add('active');
 
     // Toggle content visibility
     document.getElementById('stack-python').style.display = stack === 'python' ? '' : 'none';
@@ -1068,7 +1080,33 @@ function switchStack(stack) {
     document.getElementById('code-node').style.display = stack === 'node' ? '' : 'none';
 }
 
+// ---- Wiring ----
+// No inline handlers: the page's Content-Security-Policy allows scripts from
+// static/ only, so every listener is attached here.
+
+function on(id, type, handler) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener(type, handler);
+}
+
+function wireUi() {
+    on('appSelect', 'change', onAppSelect);
+    on('activityFilter', 'change', filterActivity);
+    on('decisionFilter', 'change', filterDecisions);
+    on('connectBtn', 'click', connectApp);
+    on('addModal', 'click', closeAddModal);
+    document.querySelectorAll('[data-open-modal]').forEach(b => b.addEventListener('click', openAddModal));
+    document.querySelectorAll('.modal-close').forEach(b => b.addEventListener('click', () => closeAddModal()));
+    document.querySelectorAll('.stack-tab[data-stack]').forEach(b =>
+        b.addEventListener('click', () => switchStack(b.dataset.stack)));
+    on('appsList', 'click', e => {
+        const btn = e.target.closest('.app-remove-btn');
+        if (btn) removeApp(btn.dataset.name);
+    });
+}
+
 // ---- Init ----
+wireUi();
 loadTaxonomy();
 connectWebSocket();
 loadTargets();

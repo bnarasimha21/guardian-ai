@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GuardianAI | Real-Time Agent Defense Monitor</title>
-    <link rel="stylesheet" href="static/style.css?v=2">
+    <link rel="stylesheet" href="static/style.css?v=3">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
@@ -29,11 +29,11 @@
             </div>
             <!-- App selector -->
             <div class="app-selector">
-                <select id="appSelect" onchange="onAppSelect()">
+                <select id="appSelect">
                     <option value="__all">All Apps</option>
                 </select>
             </div>
-            <button class="add-app-btn" onclick="openAddModal()">
+            <button class="add-app-btn" data-open-modal>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                     <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
                 </svg>
@@ -58,7 +58,7 @@
                     </svg>
                 </div>
                 <h2>Agent Activity</h2>
-                <select class="activity-filter" id="activityFilter" onchange="filterActivity()">
+                <select class="activity-filter" id="activityFilter">
                     <option value="__all">All Events</option>
                     <option value="query">Queries</option>
                     <option value="agent">Agent Actions</option>
@@ -81,7 +81,7 @@
                     </div>
                     <h3 class="empty-title">No apps connected yet</h3>
                     <p class="empty-desc">Connect your first app to start monitoring agent activity in real-time.</p>
-                    <button class="empty-cta" onclick="openAddModal()">
+                    <button class="empty-cta" data-open-modal>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                             <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
                         </svg>
@@ -106,7 +106,7 @@
                     </svg>
                 </div>
                 <h2>Guardian Decisions</h2>
-                <select class="activity-filter" id="decisionFilter" onchange="filterDecisions()">
+                <select class="activity-filter" id="decisionFilter">
                     <option value="__all">All Decisions</option>
                     <option value="flagged">Flagged Only</option>
                     <option value="require_approval">Needs Approval</option>
@@ -138,11 +138,11 @@
     </main>
 
     <!-- Add App Modal -->
-    <div class="modal-overlay" id="addModal" style="display:none" onclick="closeAddModal(event)">
-        <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-overlay" id="addModal" style="display:none">
+        <div class="modal">
             <div class="modal-header">
                 <h3>Connect a New App</h3>
-                <button class="modal-close" onclick="closeAddModal()">&times;</button>
+                <button class="modal-close">&times;</button>
             </div>
 
             <!-- Step 1: Choose your stack -->
@@ -151,8 +151,8 @@
                 <div class="step-content">
                     <h4>Choose your stack</h4>
                     <div class="stack-tabs">
-                        <button class="stack-tab active" onclick="switchStack('python')">Python (FastAPI)</button>
-                        <button class="stack-tab" onclick="switchStack('node')">Node.js (Express)</button>
+                        <button class="stack-tab active" data-stack="python">Python (FastAPI)</button>
+                        <button class="stack-tab" data-stack="node">Node.js (Express)</button>
                     </div>
 
                     <div id="stack-python" class="stack-content">
@@ -202,7 +202,7 @@ attachObserver(app);</div>
                             <input type="text" id="appUrl" placeholder="e.g. https://myapp.com or https://example.com/my-app" autocomplete="off">
                             <p class="step-note">We'll automatically connect to /ws-observe on this URL</p>
                         </div>
-                        <button class="connect-btn" id="connectBtn" onclick="connectApp()">
+                        <button class="connect-btn" id="connectBtn">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
                                 <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
@@ -231,6 +231,6 @@ attachObserver(app);</div>
         <span>OWASP LLM Top 10 (2025) and Agentic Top 10 (2026)</span>
     </footer>
 
-    <script src="static/app.js?v=3"></script>
+    <script src="static/app.js?v=4"></script>
 </body>
 </html>

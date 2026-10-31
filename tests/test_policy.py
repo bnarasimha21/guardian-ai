@@ -245,7 +245,8 @@ def test_invalid_edit_keeps_last_good_policy(client, policy_file):
     assert resp.status_code == 200
     assert resp.json()["rule_id"] == "allow-x"
     info = client.get("/api/policy").json()
-    assert "effect" in info["reload_error"]
+    assert info["reload_failed"] is True
+    assert "reload_error" not in info  # the parse error is logged, not served
 
 
 def test_same_mtime_edit_is_picked_up(tmp_path):
@@ -432,8 +433,9 @@ def test_dashboard_token_is_not_written_to_server_logs(monkeypatch):
             logging.getLogger("uvicorn.access").addHandler(keep_access)
             with connect(f"ws://127.0.0.1:{srv.port}/ws/events?session=app:billing&token={KEY_A}", close_timeout=0.2) as ws:
                 ws.send("ping")
-            httpx.get(f"{srv.base_url}/api/policy?token={KEY_A}")
-            httpx.get(f"{srv.base_url}/api/policy?x_token=1")
+            auth_header = {"Authorization": f"Bearer {KEY_A}"}
+            httpx.get(f"{srv.base_url}/api/policy?token={KEY_A}", headers=auth_header)
+            httpx.get(f"{srv.base_url}/api/policy?x_token=1", headers=auth_header)
     finally:
         for name in ("uvicorn.access", "uvicorn.error"):
             logging.getLogger(name).removeHandler(keep)
@@ -486,7 +488,7 @@ def test_malformed_requests_rejected(client, body):
 def test_policy_endpoint(client):
     info = client.get("/api/policy").json()
     assert info["version"] == 1 and info["mode"] == "enforce"
-    assert info["path"].endswith("policies/default.yaml")
+    assert info["file"] == "default.yaml" and "path" not in info
     assert "deny-detector-threats" in [r["id"] for r in info["rules"]]
 
 
