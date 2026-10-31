@@ -368,3 +368,26 @@ def test_detector_cannot_take_a_reserved_name(name):
     impostor = type("Impostor", (BananaDetector,), {"name": name})()
     with pytest.raises(ValueError):
         register_model_detector(impostor)
+
+
+class HungDetector(BananaDetector):
+    name = "hung_model"
+    timeout_seconds = 0.2
+
+    def score(self, text):
+        import time
+        time.sleep(3)
+        return 0.0
+
+
+@pytest.mark.parametrize("fail_closed", [True, False])
+def test_model_detector_that_hangs_is_cut_off(registered, fail_closed):
+    import time
+    registered(type("Hung", (HungDetector,), {"fail_closed": fail_closed})())
+    started = time.perf_counter()
+    hits = [m for m in detect({"a": "one", "b": "two", "c": "three"}) if m.rule_name == "hung_model"]
+    assert time.perf_counter() - started < 1.0
+    if fail_closed:
+        assert len(hits) == 1 and "did not answer" in hits[0].reason
+    else:
+        assert hits == []

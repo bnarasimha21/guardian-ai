@@ -38,7 +38,9 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 
 from backend.events.models import ThreatLevel
 
@@ -48,6 +50,11 @@ from ..rules import ScanInput, ThreatRule, register_rule, unregister_rule
 logger = logging.getLogger(__name__)
 
 ENV_VAR = "GUARDIAN_MODEL_DETECTORS"
+
+# score() runs here so a hung model cannot hold a request past its timeout.
+# A score that never returns keeps its worker; once every worker is stuck,
+# later scores time out at once (and fail closed if the detector says so).
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="guardian-model-detector")
 
 
 class ModelDetector(ABC):
@@ -64,9 +71,13 @@ class ModelDetector(ABC):
       decides whether that level blocks).
     * ``untrusted_only``: only score fields the policy marks as untrusted
       content (fetched pages, tool results), not the agent's own arguments.
-    * ``fail_closed``: if ``score`` raises or returns NaN, report a match at ``level`` instead
-      of logging and skipping. Off by default so an unavailable model does not
-      block all traffic; turn it on when the detector is a required control.
+    * ``fail_closed``: if ``score`` raises, returns NaN or runs out of time,
+      report a match at ``level`` instead of logging and skipping. Off by
+      default so an unavailable model does not block all traffic; turn it on
+      when the detector is a required control.
+    * ``timeout_seconds``: time budget for all of one scan's ``score`` calls
+      together. When it runs out the remaining fields are not scored and the
+      detector fails open or closed as ``fail_closed`` says.
     """
 
     name: str = ""
@@ -77,6 +88,7 @@ class ModelDetector(ABC):
     level: ThreatLevel = ThreatLevel.HIGH
     untrusted_only: bool = False
     fail_closed: bool = False
+    timeout_seconds: float = 5.0
     min_chars: int = 1
 
     @abstractmethod
@@ -94,6 +106,8 @@ class ModelRule(ThreatRule):
             raise ValueError(f"{detector.name}: threshold must be between 0 and 1")
         if not isinstance(detector.level, ThreatLevel):
             raise ValueError(f"{detector.name}: level must be a ThreatLevel")
+        if not float(detector.timeout_seconds) > 0:
+            raise ValueError(f"{detector.name}: timeout_seconds must be above 0")
         self.detector = detector
         self.name = detector.name
         self.description = detector.description or detector.name
@@ -111,6 +125,7 @@ class ModelRule(ThreatRule):
         best: float | None = None
         evidence: list[str] = []
         scored: set[tuple[str, str]] = set()
+        deadline = time.monotonic() + float(d.timeout_seconds)
         for f in scan.fields:
             if d.untrusted_only and not f.untrusted:
                 continue
@@ -118,9 +133,18 @@ class ModelRule(ThreatRule):
                 continue
             scored.add((f.path, f.value))
             try:
-                s = float(d.score(f.value))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"no time left of {d.timeout_seconds}s")
+                s = float(_POOL.submit(d.score, f.value).result(timeout=remaining))
                 if s != s:
                     raise ValueError("score is NaN")
+            except TimeoutError as exc:
+                if d.fail_closed:
+                    return [self._match(f"{d.name} did not answer within {d.timeout_seconds}s; failing closed",
+                                        None, [f.path or "$"])]
+                logger.warning("model detector %s timed out (%s); the rest of this input is not scored", d.name, exc)
+                break
             except Exception as exc:  # a broken model must not crash the request
                 if d.fail_closed:
                     return [self._match(f"{d.name} could not score the input ({type(exc).__name__}); "
