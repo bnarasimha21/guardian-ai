@@ -60,7 +60,7 @@ from mcp.server.lowlevel import Server
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from backend.approvals import ApprovalStore, PendingApproval, arguments_sha256
-from backend.approvals.flow import CREATED, GRANTED, REFUSED, queue_for_approval
+from backend.approvals.flow import CREATED, DENIED_RECENTLY, GRANTED, REFUSED, queue_for_approval
 from backend.events.models import SEVERITY_ORDER, ThreatLevel
 from backend.guardian.middleware import Guardian, is_blocking
 from backend.guardian.models import ThreatMatch
@@ -800,7 +800,7 @@ class Gateway:
             await self._approved(decision, call, f"Approved by {approval.resolved_by or 'an approver'} "
                                                  f"(approval {approval.id})", approval_id=approval.id)
             return None
-        if result.status == REFUSED:
+        if result.status in (REFUSED, DENIED_RECENTLY):
             return await self._declined(decision, call, result.error, name)
         if result.status == CREATED:
             await self._record(decision, call, approval_id=approval.id)

@@ -13,6 +13,8 @@ MCP tool result).
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 
 from backend.guardian.schema import ToolCall
@@ -23,11 +25,12 @@ GRANTED = "granted"
 WAITING = "waiting"
 CREATED = "created"
 REFUSED = "refused"
+DENIED_RECENTLY = "denied_recently"
 
 
 @dataclass
 class QueueOutcome:
-    status: str                     # granted | waiting | created | refused
+    status: str                     # granted | waiting | created | refused | denied_recently
     approval: PendingApproval | None
     arguments_sha256: str
     error: str = ""
@@ -46,7 +49,13 @@ async def queue_for_approval(store: ApprovalStore, decision, call: ToolCall, *, 
             decision=decision.to_dict(),
             timeout_seconds=settings_.timeout_seconds if settings_ else 120,
             grant_ttl_seconds=settings_.grant_ttl_seconds if settings_ else 0,
+            deny_cooldown_seconds=settings_.deny_cooldown_seconds if settings_ else 0,
         )
     except ApprovalCapacityError as exc:
         return QueueOutcome(REFUSED, None, sha, error=str(exc))
+    if status == "denied_recently":
+        until = (approval.resolved_at or 0) + (settings_.deny_cooldown_seconds if settings_ else 0)
+        return QueueOutcome(DENIED_RECENTLY, approval, sha, error=(
+            f"{approval.resolved_by or 'An approver'} denied this exact call (approval {approval.id}); "
+            f"identical calls are refused for {max(1, int(until - time.time()))} more seconds"))
     return QueueOutcome({"granted": GRANTED, "waiting": WAITING, "created": CREATED}[status], approval, sha)

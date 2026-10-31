@@ -150,14 +150,71 @@ def test_retry_while_pending_joins_same_approval(client, policy_file):
     assert len(client.get("/api/approvals?status=pending", headers=h).json()["approvals"]) == 1
 
 
-def test_deny_then_retry_opens_new_approval(client, policy_file):
+def test_deny_then_retry_is_refused_during_the_cooldown(client, policy_file):
     policy_file(POLICY)
     h = {"X-Session-Id": "s-deny"}
     aid = client.post("/api/check", json=DEPLOY, headers=h).json()["approval_id"]
     r = client.post(f"/api/approvals/{aid}", json={"approve": False, "note": "not today"}, headers=h).json()
     assert r["status"] == "denied" and r["reason"] == "denied by approver"
+    # Within the cooldown (default 30 s) the identical call is refused outright,
+    # so an agent retrying in a loop cannot keep paging the approver.
+    for _ in range(3):
+        retry = client.post("/api/check", json=DEPLOY, headers=h)
+        assert retry.status_code == 403, retry.json()
+        assert retry.json()["status"] == "denied" and retry.json()["approval_id"] == aid
+    assert len(client.get("/api/approvals?status=pending", headers=h).json()["approvals"]) == 0
+    # A different call still asks.
+    other = client.post("/api/check", json={**DEPLOY, "arguments": {**DEPLOY["arguments"], "x": 1}}, headers=h)
+    assert other.status_code == 202
+
+
+def test_deny_then_retry_asks_again_when_the_cooldown_is_off(client, policy_file):
+    policy_file(POLICY.replace("approval: {timeout_seconds: 30}", "approval: {timeout_seconds: 30, deny_cooldown_seconds: 0}"))
+    h = {"X-Session-Id": "s-deny0"}
+    aid = client.post("/api/check", json=DEPLOY, headers=h).json()["approval_id"]
+    client.post(f"/api/approvals/{aid}", json={"approve": False}, headers=h)
     retry = client.post("/api/check", json=DEPLOY, headers=h)
     assert retry.status_code == 202 and retry.json()["approval_id"] != aid
+
+
+def test_a_timeout_does_not_start_the_cooldown(client, policy_file):
+    """Nobody said no, so the retry asks a person again."""
+    policy_file(POLICY)
+    h = {"X-Session-Id": "s-timeout"}
+    call = {"tool": {"name": "cloud.quick"}, "arguments": {"v": 1}}
+    aid = client.post("/api/check", json=call, headers=h).json()["approval_id"]
+    assert client.get(f"/api/approvals/{aid}?wait=5", headers=h).json()["reason"] == "timeout"
+    retry = client.post("/api/check", json=call, headers=h)
+    assert retry.status_code == 202 and retry.json()["approval_id"] != aid
+
+
+def test_the_cooldown_ends():
+    """Driven through the store with a clock, so the test does not sleep 30 s."""
+    from types import SimpleNamespace
+
+    from backend.approvals.flow import CREATED, DENIED_RECENTLY, queue_for_approval
+    from backend.guardian.schema import ToolCall
+    from backend.policy.models import ApprovalSettings
+
+    now = [1000.0]
+
+    async def go():
+        store = InMemoryApprovalStore(clock=lambda: now[0])
+        decision = SimpleNamespace(approval=ApprovalSettings(deny_cooldown_seconds=30),
+                                   to_dict=lambda: {"rule_id": "r"})
+        call = ToolCall(name="cloud.deploy", arguments={"v": 1})
+        first = await queue_for_approval(store, decision, call, session="s", agent="a")
+        await store.resolve(first.approval.id, approve=False, by="alice")
+        now[0] += 29
+        inside = await queue_for_approval(store, decision, call, session="s", agent="a")
+        now[0] += 2
+        after = await queue_for_approval(store, decision, call, session="s", agent="a")
+        await store.close()
+        return inside, after
+
+    inside, after = asyncio.run(go())
+    assert inside.status == DENIED_RECENTLY and "alice" in inside.error
+    assert after.status == CREATED
 
 
 def test_grant_ttl_allows_identical_calls_for_a_window(client, policy_file):

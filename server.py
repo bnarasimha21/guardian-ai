@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from backend import auth, netguard
 from backend.approvals import ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval
-from backend.approvals.flow import GRANTED, REFUSED, WAITING, queue_for_approval
+from backend.approvals.flow import DENIED_RECENTLY, GRANTED, REFUSED, WAITING, queue_for_approval
 from backend.config import settings
 from backend.events.bus import EventBus
 from backend.events.models import AgentActivityEvent, ApprovalEvent, StatusEvent
@@ -635,6 +635,15 @@ async def _approval_response(decision, call: ToolCall, *, sid: str, principal: s
         decision.reasons.append(outcome.error)
         await guardian.record(decision, call, source=source)
         return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=429)
+
+    if outcome.status == DENIED_RECENTLY:
+        # A person just said no to this exact call; retrying it does not ask again.
+        decision.effect = "deny"
+        decision.reasons.append(outcome.error)
+        await guardian.record(decision, call, source=source, approval_id=approval.id)
+        return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=403, extra={
+            "status": "denied", "approval_id": approval.id, "arguments_sha256": sha,
+        })
 
     await guardian.record(decision, call, source=source, approval_id=approval.id)
     return _decision_response(decision, sid=sid, source=source, guardian=guardian, status_code=202, extra={

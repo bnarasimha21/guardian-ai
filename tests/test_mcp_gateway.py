@@ -544,7 +544,10 @@ async def test_queue_fallback_denied_by_human(tmp_path):
             await store.resolve(aid, approve=False, by="alice")
             retry = await client.call_tool("files.deploy", {"service": "x", "version": "1"})
             assert retry.is_error and "pretend-deployed" not in text_of(retry)
-            assert retry.meta["guardian-ai/decision"]["approval_id"] != aid  # a fresh request, not a pass
+            # Within the deny cooldown the retry is refused, not queued again.
+            assert retry.meta["guardian-ai/decision"]["effect"] == "deny"
+            assert "alice denied this exact call" in text_of(retry)
+            assert len(await store.list(session=h.gateway.session, status="pending")) == 0
     finally:
         await store.close()
 

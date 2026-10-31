@@ -327,10 +327,12 @@ class ApprovalStore(ABC):
 
     @abstractmethod
     async def find_or_create(self, *, session: str, agent: str, tool: str, server: str | None, arguments: Any,
-                             decision: dict, timeout_seconds: float,
-                             grant_ttl_seconds: float) -> tuple[str, PendingApproval]:
+                             decision: dict, timeout_seconds: float, grant_ttl_seconds: float,
+                             deny_cooldown_seconds: float = 0) -> tuple[str, PendingApproval]:
         """In one step: consume a usable grant for this exact call ("granted"),
-        or report the one already waiting ("waiting"), or open one ("created").
+        or report the one already waiting ("waiting"), or report a person's
+        denial of it within deny_cooldown_seconds ("denied_recently"), or open
+        one ("created").
         Raises ApprovalCapacityError when a new one cannot be opened. Atomic, so
         two identical calls arriving together open one approval, and a
         single-use grant lets exactly one of them through."""
@@ -444,7 +446,7 @@ class InMemoryApprovalStore(ApprovalStore):
         return approval
 
     async def find_or_create(self, *, session, agent, tool, server, arguments, decision,
-                             timeout_seconds, grant_ttl_seconds):
+                             timeout_seconds, grant_ttl_seconds, deny_cooldown_seconds=0):
         sha = arguments_sha256(tool, server, arguments)
         # Expiry resolves through resolve(), which takes the lock, so do it first.
         for a in [a for a in self._items.values()
@@ -458,6 +460,11 @@ class InMemoryApprovalStore(ApprovalStore):
             granted = max((a for a in mine if a.usable(now)), key=lambda a: a.resolved_at or 0, default=None)
             if waiting is not None:
                 return "waiting", waiting
+            denied = max((a for a in mine if a.status == DENIED and a.reason != "timeout"
+                          and a.resolved_at is not None and now < a.resolved_at + deny_cooldown_seconds),
+                         key=lambda a: a.resolved_at, default=None)
+            if granted is None and denied is not None:
+                return "denied_recently", denied
             if granted is not None:
                 granted.uses += 1
                 outcome, approval = "granted", granted

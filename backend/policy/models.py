@@ -119,6 +119,11 @@ class ApprovalSettings(_Strict):
     # Once a call is approved, identical calls (same tool and arguments) are
     # allowed without a new approval for this many seconds. 0 = single use.
     grant_ttl_seconds: float = Field(default=0, ge=0, le=86_400)
+    # After a person denies a call, identical calls are refused for this many
+    # seconds instead of opening a new approval each retry. A timeout is not a
+    # denial by a person and does not start it. 0 = off. At most an hour, which
+    # is how long the approval store keeps a resolved approval.
+    deny_cooldown_seconds: float = Field(default=30, ge=0, le=3600)
 
 
 class Rule(_Strict):
