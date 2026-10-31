@@ -1,7 +1,7 @@
 """Pinned tool definitions (rug-pull protection).
 
 The first time the gateway sees a clean tool it records a SHA-256 of the
-definition (name, title, description, input and output schema, annotations, _meta).
+definition (name, title, description, input and output schema, annotations; not _meta).
 If a later listing returns a different hash, the tool is hidden and the new
 hash is kept as ``pending_sha256`` until an operator approves it with
 ``guardian-mcp --config gateway.yaml pins approve <server.tool> <sha256>``.
@@ -34,13 +34,14 @@ SHA256_HEX = 64  # `approve` must quote the whole pending hash
 
 
 def definition_sha256(definition: dict[str, Any]) -> str:
-    """Hash of a tool definition as the upstream sent it.
+    """Hash of a tool definition as the upstream sent it, minus ``_meta``.
 
-    The tool's ``_meta`` is part of it: clients read it (UI templates, hints)
-    and pass the tool on with it, so changing it is a change to the tool. A
-    definition without ``_meta`` hashes as it did before ``_meta`` counted.
+    ``_meta`` is left out because servers put per-listing data there, which
+    would hide the tool on every listing. It is still scanned on every
+    listing (``tool_poisoning``), just not pinned.
     """
-    blob = json.dumps(definition, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    material = {k: v for k, v in definition.items() if k not in ("_meta", "meta")}
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
