@@ -274,10 +274,13 @@ def _blob_text(res: types.BlobResourceContents) -> tuple[str, str] | None:
     for codec in dict.fromkeys(c for c in (charset, "utf-8") if c):
         try:
             return raw.decode(codec), codec
-        except (UnicodeDecodeError, LookupError):
+        except (UnicodeError, LookupError):  # punycode and idna raise plain UnicodeError
             continue
     if not mime.strip() or _TEXTUAL_MIME.match(mime):
-        return raw.decode(charset or "utf-8", errors="replace"), LOSSY
+        try:
+            return raw.decode(charset or "utf-8", errors="replace"), LOSSY
+        except (UnicodeError, LookupError):  # some codecs ignore errors="replace"
+            return raw.decode("utf-8", errors="replace"), LOSSY
     return None
 
 
@@ -285,13 +288,19 @@ def _blob_text(res: types.BlobResourceContents) -> tuple[str, str] | None:
 # anyone, so it is scanned without its scheme (no ssrf finding for every
 # file:/// uri), and the scheme is put back if the rest is redacted. One with
 # a host (file://169.254.169.254/x, file://attacker/share, which some clients
-# open over SMB) is scanned whole.
-_FILE_SCHEME = re.compile(r"(?i)^file:(?://(?=/))?(?!//)")
+# open over SMB) is scanned whole. Backslashes count as slashes, as they do
+# in WHATWG URL parsing, so two backslashes after file: also start a host.
+_FILE_SCHEME = re.compile(r"(?i)^file:(?:[/\\]{2}(?=[/\\]))?(?![/\\]{2})")
 
 
 def _uri_parts(uri: str) -> tuple[str, str]:
     m = _FILE_SCHEME.match(uri)
-    return (m.group(0), uri[m.end():]) if m else ("", uri)
+    if m:
+        return m.group(0), uri[m.end():]
+    if uri[:5].lower() == "file:":
+        # Scanned with slashes, so the host is found where a client finds it.
+        return "", uri.replace("\\", "/")
+    return "", uri
 
 
 def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
@@ -349,7 +358,7 @@ def _visible_json(text: str) -> str:
     """
     out = []
     for ch in text:
-        if unicodedata.category(ch) in ("Cf", "Co", "Cs", "Zl", "Zp") or detectors._INVISIBLE.match(ch):
+        if unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp") or detectors._INVISIBLE.match(ch):
             code = ord(ch)
             if code > 0xFFFF:
                 code -= 0x10000
@@ -413,7 +422,7 @@ def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
         else:
             try:
                 blob = base64.b64encode(new_text.encode(read[1])).decode("ascii")
-            except (UnicodeEncodeError, LookupError):
+            except (UnicodeError, LookupError):
                 return None
         return block.model_copy(update={"resource": block.resource.model_copy(update={"blob": blob})})
     if kind == "uri":
@@ -945,7 +954,8 @@ class Gateway:
             names = set(verdict.deciding_detectors or [m.rule_name for m in verdict.matches])
             for idx in second_readings:
                 raw = _blob_bytes(content[idx].resource.blob)
-                left = detectors.detect({"blob": (raw or b"").decode("utf-8", errors="replace")}, all_untrusted=True)
+                left = await anyio.to_thread.run_sync(functools.partial(
+                    detectors.detect, {"blob": (raw or b"").decode("utf-8", errors="replace")}, all_untrusted=True))
                 if any(m.rule_name in names or m.rule_name == detectors.SCAN_LIMIT_RULE for m in left):
                     return withheld
             update: dict[str, Any] = {"content": content}

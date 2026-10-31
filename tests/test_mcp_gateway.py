@@ -160,11 +160,11 @@ async def test_approval_prompt_shows_invisible_characters_escaped(tmp_path):
     # something else; tag and zero-width characters are not seen at all.
     cfg = write_config(tmp_path, poisoned=False)
     prompts = Prompts("decline")
-    version = "1.0\u202e\u2066 evil\U000e0041\u200b\u3164 caf\u00e9"
+    version = "1.0\u202e\u2066 evil\U000e0041\u200b\u3164\u009b31m\u0085\x7f caf\u00e9"
     async with Client(gateway_process(cfg), mode="legacy", elicitation_callback=prompts) as client:
         await client.call_tool("files.deploy", {"service": "api", "version": version})
     message = prompts.seen[0].message
-    for ch in ("\u202e", "\u2066", "\U000e0041", "\u200b", "\u3164"):
+    for ch in ("\u202e", "\u2066", "\U000e0041", "\u200b", "\u3164", "\u009b", "\u0085", "\x7f"):
         assert ch not in message, repr(ch)
     assert "\\u202e" in message and "\\udb40\\udc41" in message and "caf\u00e9" in message
     shown = message.split("Arguments: ", 1)[1].split("\n", 1)[0]
@@ -338,6 +338,7 @@ raw_blob_tool("utf16_labelled_blob", INJECTION.encode() + b" " * (len(INJECTION.
               "text/plain; charset=utf-16")
 raw_blob_tool("utf16_labelled_secret_blob", SECRET.encode() + b" " * (len(SECRET.encode()) % 2),
               "text/plain; charset=utf-16")
+raw_blob_tool("punycode_charset_blob", INJECTION.encode() + b"-%%%", "text/plain; charset=punycode")  # raises UnicodeError
 raw_blob_tool("hex_charset_blob", INJECTION.encode(), "text/plain; charset=hex")  # a codec, not a text encoding
 raw_blob_tool("latin1_secret_blob", ("caf\\xe9 " + SECRET).encode("latin-1"), "text/plain; charset=ISO-8859-1")
 
@@ -382,10 +383,16 @@ def resource_meta_secret() -> types.CallToolResult:
     ])
 
 
-@server.tool(name="file_host_uri")
-def file_host_uri() -> types.CallToolResult:
-    return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
-        uri="file://169.254.169.254/latest/meta-data", mime_type="text/plain", text="quarterly numbers"))])
+def file_uri_tool(name, uri):
+    def make() -> types.CallToolResult:
+        return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
+            uri=uri, mime_type="text/plain", text="quarterly numbers"))])
+    server.tool(name=name)(make)
+
+
+file_uri_tool("file_host_uri", "file://169.254.169.254/latest/meta-data")
+file_uri_tool("file_backslash_host_uri", "file:" + chr(92) * 2 + "169.254.169.254" + chr(92) + "latest")  # a WHATWG parser reads a host here
+file_uri_tool("file_mixed_slash_host_uri", "file:/" + chr(92) + "169.254.169.254/latest")
 
 
 if __name__ == "__main__":
@@ -438,7 +445,8 @@ async def test_injection_in_unusual_blob_encodings_and_uris_is_withheld(tmp_path
 
 
 @pytest.mark.parametrize("tool", ["latin1_blob", "bad_utf8_blob", "untyped_bad_utf8_blob", "meta_injection",
-                                  "utf16_labelled_blob", "hex_charset_blob", "block_meta_injection"])
+                                  "utf16_labelled_blob", "hex_charset_blob", "punycode_charset_blob",
+                                  "block_meta_injection"])
 async def test_injection_in_undecodable_blobs_and_result_meta_is_withheld(tmp_path, tool):
     async with Client(gateway_process(rich_config(tmp_path)), mode="legacy") as client:
         result = await client.call_tool(f"rich.{tool}", {})
@@ -456,9 +464,10 @@ async def test_secret_in_a_resource_meta_is_redacted_in_place(tmp_path):
         assert res.text == "quarterly numbers"
 
 
-async def test_file_uri_with_a_host_is_scanned_whole(tmp_path):
+@pytest.mark.parametrize("tool", ["file_host_uri", "file_backslash_host_uri", "file_mixed_slash_host_uri"])
+async def test_file_uri_with_a_host_is_scanned_whole(tmp_path, tool):
     async with Client(gateway_process(rich_config(tmp_path)), mode="legacy") as client:
-        result = await client.call_tool("rich.file_host_uri", {})
+        result = await client.call_tool(f"rich.{tool}", {})
         decision = result.meta["guardian-ai/decision"]
         assert decision["effect"] != "allow" and "ssrf" in decision["matched_detectors"], decision
 
