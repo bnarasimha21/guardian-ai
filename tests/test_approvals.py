@@ -470,3 +470,27 @@ def test_a_single_use_grant_lets_exactly_one_racing_call_through():
     # The other four share one new approval rather than opening four.
     assert len(pending) == 1
     assert {o.approval.id for o in outcomes if o.status != GRANTED} == {pending[0].id}
+
+
+# -- review fixes: what the approver is shown ----------------------------------
+
+def test_a_dotted_key_cannot_hide_a_nested_change():
+    """{"a.b": ...} and {"a": {"b": ...}} share the label a.b. The diff read
+    both rows' values by that label, so the change to a.b nested never showed."""
+    from backend.approvals.store import _preview, diff, fingerprint
+
+    before, after = {"a.b": "ls", "a": {"b": "ls"}}, {"a.b": "ls -l", "a": {"b": "rm -rf /"}}
+    (pb, _, lb), (pa, _, la) = _preview(before), _preview(after)
+    rows, _ = diff(pb, pa, fingerprint(before, lb), fingerprint(after, la))
+    assert sorted(r["after"] for r in rows) == ["ls -l", "rm -rf /"]
+
+
+def test_integers_a_browser_would_round_are_shown_as_text(client, policy_file):
+    policy_file(POLICY)
+    h = {"X-Session-Id": "s-bigint"}
+    body = '{"tool": {"name": "cloud.deploy"}, "arguments": {"amount": 9007199254740993, "huge": 1%s, "ok": 7}}' % ("0" * 400)
+    resp = client.post("/api/check", content=body, headers={**h, "Content-Type": "application/json"})
+    info = client.get(f"/api/approvals/{resp.json()['approval_id']}", headers=h).json()
+    assert info["arguments"]["amount"] == "9007199254740993"
+    assert info["arguments"]["huge"] == "1" + "0" * 400
+    assert info["arguments"]["ok"] == 7

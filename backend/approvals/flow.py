@@ -55,7 +55,8 @@ async def queue_for_approval(store: ApprovalStore, decision, call: ToolCall, *, 
         return QueueOutcome(REFUSED, None, sha, error=str(exc))
     if status == "denied_recently":
         until = (approval.resolved_at or 0) + (settings_.deny_cooldown_seconds if settings_ else 0)
+        now = getattr(store, "_clock", time.time)()  # the clock the store resolved it by
         return QueueOutcome(DENIED_RECENTLY, approval, sha, error=(
             f"{approval.resolved_by or 'An approver'} denied this exact call (approval {approval.id}); "
-            f"identical calls are refused for {max(1, int(until - time.time()))} more seconds"))
+            f"identical calls are refused for {max(1, int(until - now))} more seconds"))
     return QueueOutcome({"granted": GRANTED, "waiting": WAITING, "created": CREATED}[status], approval, sha)

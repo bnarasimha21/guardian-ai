@@ -150,7 +150,9 @@ async def _security_headers(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     # FastAPI's own handler echoes the input with the stock renderer.
-    return JSONResponse({"detail": jsonable_encoder(exc.errors())}, status_code=422)
+    # _finite: the echoed input may hold NaN or Infinity, which this
+    # renderer refuses (a 500 instead of the 422).
+    return JSONResponse({"detail": _finite(jsonable_encoder(exc.errors()))}, status_code=422)
 
 # Outbound hooks. Tests replace these to run offline: the resolver maps hostnames
 # to addresses, and the transport answers the verify health check.
@@ -222,6 +224,16 @@ def _api_keys() -> dict[str, str]:
 
 def _approver_keys() -> dict[str, str]:
     return auth.parse_keys(settings.guardian_approver_keys, env_name="GUARDIAN_APPROVER_KEYS")
+
+
+def _require_a_key(request: Request) -> None:
+    """With API or approver keys configured, a valid key of either kind is
+    required (401 otherwise). Without keys this is open demo behaviour."""
+    if _api_keys() or _approver_keys():
+        token = auth.bearer_token(request.headers.get("authorization"))
+        if auth.match_key(token, _api_keys()) is None and auth.match_key(token, _approver_keys()) is None:
+            raise HTTPException(status_code=401, detail="A valid API or approver key is required",
+                                headers={"WWW-Authenticate": "Bearer"})
 
 
 def _client_sid(value: str | None) -> str:
@@ -431,7 +443,9 @@ def _start_observer(session_id: str, name: str, ws_url: str) -> None:
 
 
 def _stop_observer(session_id: str, name: str) -> None:
-    session = _get_session(session_id)
+    session = _sessions.get(session_id)  # never create a session just to stop nothing
+    if session is None:
+        return
     observers = session["observers"]
     if name in observers:
         observers[name].cancel()
@@ -454,7 +468,10 @@ class AddTargetRequest(BaseModel):
 
 
 @app.post("/api/targets")
-async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(None)):
+async def add_target(req: AddTargetRequest, request: Request, x_session_id: str | None = Header(None)):
+    # With keys on, adding or removing targets needs a key: each new session id
+    # makes server state (and a targets file), and the table is capped.
+    _require_a_key(request)
     sid = _client_sid(x_session_id)
     if session_store.get(sid, req.name):
         return JSONResponse({"error": f"Target '{req.name}' already exists"}, status_code=409)
@@ -470,7 +487,8 @@ async def add_target(req: AddTargetRequest, x_session_id: str | None = Header(No
 
 
 @app.delete("/api/targets/{name}")
-async def remove_target(name: str, x_session_id: str | None = Header(None)):
+async def remove_target(name: str, request: Request, x_session_id: str | None = Header(None)):
+    _require_a_key(request)
     sid = _client_sid(x_session_id)
     _stop_observer(sid, name)
     if session_store.remove(sid, name):
@@ -759,11 +777,7 @@ async def policy_info(request: Request):
     required: the rule ids and descriptions say what is allowed and how to
     reach it. The absolute path and the parse error stay in the server log.
     """
-    if _api_keys() or _approver_keys():
-        token = auth.bearer_token(request.headers.get("authorization"))
-        if auth.match_key(token, _api_keys()) is None and auth.match_key(token, _approver_keys()) is None:
-            raise HTTPException(status_code=401, detail="A valid API or approver key is required",
-                                headers={"WWW-Authenticate": "Bearer"})
+    _require_a_key(request)
     store = _policy_store()
     loaded = store.get()
     return {
@@ -912,8 +926,12 @@ async def websocket_events(websocket: WebSocket):
         token = websocket.query_params.get("token")
         owner = sid[len(auth.APP_SESSION_PREFIX):]
         app_key = _api_keys().get(owner)
-        ok = (app_key is not None and token is not None and auth.match_key(token, {owner: app_key}) == owner) \
-            or auth.match_key(token, _approver_keys()) is not None
+        # Only sessions of configured keys exist; an approver key may watch any
+        # of them but cannot make up new app: ids (each would be a session
+        # that is never evicted while watched).
+        ok = app_key is not None and (
+            auth.match_key(token, {owner: app_key}) == owner
+            or auth.match_key(token, _approver_keys()) is not None)
         if not ok:
             await websocket.close(code=1008)
             return

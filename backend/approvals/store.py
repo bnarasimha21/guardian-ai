@@ -39,6 +39,7 @@ MAX_PENDING_PER_SESSION = 100
 RETAIN_SECONDS = 3600
 MAX_PREVIEW_PATHS = 200
 MAX_PREVIEW_CHARS = 500
+NOT_SHOWN = "(not in the preview)"
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -70,6 +71,10 @@ def _display(value: Any) -> Any:
     lone surrogates become U+FFFD. The preview is for people, not the hash."""
     if isinstance(value, float) and not math.isfinite(value):
         return str(value)
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2 ** 53:
+        # A browser parses JSON numbers as doubles: 9007199254740993 would show
+        # as ...992 and a 400-digit integer as null. As text it shows exactly.
+        return str(value)
     if isinstance(value, str):
         return _SURROGATE.sub("\ufffd", value)
     return value
@@ -82,20 +87,29 @@ def flatten(value: Any, limit: int = MAX_PREVIEW_PATHS) -> dict[str, Any]:
 
 def preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any], bool]:
     """``flatten`` plus whether anything was left out or cut short."""
+    out, truncated, _ = _preview(value, limit)
+    return out, truncated
+
+
+def _preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any], bool, dict[str, str]]:
+    """The preview, whether it was cut, and {exact path: label shown}. The
+    label map lets the diff read each path's own value even when two paths
+    got similar labels."""
     out: dict[str, Any] = {}
+    labels: dict[str, str] = {}
     truncated = False
-    stack: list[tuple[str, Any]] = [("", value)]
+    stack: list[tuple[str, list, Any]] = [("", [], value)]
     while stack:
         if len(out) >= limit:
             truncated = True
             break
-        path, v = stack.pop()
+        path, exact, v = stack.pop()
         if isinstance(v, dict) and v:
             for k in reversed(list(v.keys())):
-                stack.append((f"{path}.{k}" if path else str(k), v[k]))
+                stack.append((f"{path}.{k}" if path else str(k), exact + [str(k)], v[k]))
         elif isinstance(v, list) and v:
             for i in range(len(v) - 1, -1, -1):
-                stack.append((f"{path}.{i}" if path else str(i), v[i]))
+                stack.append((f"{path}.{i}" if path else str(i), exact + [i], v[i]))
         else:
             if isinstance(v, str) and len(v) > MAX_PREVIEW_CHARS:
                 v = v[:MAX_PREVIEW_CHARS] + "..."
@@ -118,7 +132,8 @@ def preview(value: Any, limit: int = MAX_PREVIEW_PATHS) -> tuple[dict[str, Any],
                     n += 1
                 key = f"{key} [{n}]"
             out[key] = _display(v)
-    return out, truncated
+            labels[json.dumps(exact, ensure_ascii=False)] = key
+    return out, truncated, labels
 
 
 def _digest(value: Any) -> str:
@@ -126,8 +141,11 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:24]
 
 
-def fingerprint(value: Any) -> dict[str, tuple[str, str]]:
-    """Every leaf of the full arguments: {exact path: (display path, value hash)}.
+def fingerprint(value: Any, labels: dict[str, str] | None = None) -> dict[str, tuple[str, str, bool]]:
+    """Every leaf of the full arguments: {exact path: (label, value hash, shown)}.
+
+    ``labels`` is the preview's {exact path: label}; a path in it is shown,
+    under that label. Any other path gets its dotted name and is not shown.
 
     The preview is cut (MAX_PREVIEW_PATHS paths, MAX_PREVIEW_CHARS characters),
     so diffing previews misses a change past the cut. The fingerprint has no
@@ -148,16 +166,19 @@ def fingerprint(value: Any) -> dict[str, tuple[str, str]]:
                 stack.append((path + [i], item))
         else:
             exact = json.dumps(path, ensure_ascii=False)
+            if labels is not None and exact in labels:
+                out[exact] = (labels[exact], _digest(v), True)
+                continue
             label = ".".join(str(p) for p in path) or "$"
             if len(label) > MAX_PREVIEW_CHARS:
                 label = label[:MAX_PREVIEW_CHARS] + "..."
-            out[exact] = (_display(label), _digest(v))
+            out[exact] = (_display(label), _digest(v), False)
     return out
 
 
 def diff(before: dict[str, Any], after: dict[str, Any],
-         before_fp: dict[str, tuple[str, str]] | None = None,
-         after_fp: dict[str, tuple[str, str]] | None = None,
+         before_fp: dict[str, tuple[str, str, bool]] | None = None,
+         after_fp: dict[str, tuple[str, str, bool]] | None = None,
          limit: int = MAX_PREVIEW_PATHS) -> tuple[list[dict], bool]:
     """Changed, added and removed paths between two argument sets, and whether
     the list was cut at ``limit`` rows.
@@ -186,13 +207,17 @@ def diff(before: dict[str, Any], after: dict[str, Any],
             cut = True
             break
         label = (a or b)[0]
+        # Each side's value is read by that side's own label for this exact
+        # path, and only if the path was shown: a dotted label can equal the
+        # label of a different path.
+        shown_before = before.get(b[0], NOT_SHOWN) if b is not None and b[2] else NOT_SHOWN
+        shown_after = after.get(a[0], NOT_SHOWN) if a is not None and a[2] else NOT_SHOWN
         if b is None:
-            row = {"path": label, "change": "added", "after": after.get(label, "(not in the preview)")}
+            row = {"path": label, "change": "added", "after": shown_after}
         elif a is None:
-            row = {"path": label, "change": "removed", "before": before.get(label, "(not in the preview)")}
+            row = {"path": label, "change": "removed", "before": shown_before}
         else:
-            row = {"path": label, "change": "changed", "before": before.get(label, "(not in the preview)"),
-                   "after": after.get(label, "(not in the preview)")}
+            row = {"path": label, "change": "changed", "before": shown_before, "after": shown_after}
             if row["before"] == row["after"]:
                 row["beyond_preview"] = True
         changes.append(row)
@@ -409,8 +434,8 @@ class InMemoryApprovalStore(ApprovalStore):
         if pending_here >= self.max_pending_per_session:
             raise ApprovalCapacityError(
                 f"This session already has {pending_here} approvals waiting; refusing the call")
-        shown, truncated = preview(arguments)
-        prints = fingerprint(arguments)
+        shown, truncated, labels = _preview(arguments)
+        prints = fingerprint(arguments, labels)
         sha = arguments_sha256(tool, server, arguments)
         # Diff against the most recent earlier approval for the same tool in
         # this session (for example: A was approved, now B changes one field).

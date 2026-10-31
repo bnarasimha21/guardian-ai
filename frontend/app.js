@@ -25,7 +25,18 @@ function getSessionId() {
 // is removed from the address bar and history as soon as it is read.
 const URL_PARAMS = new URLSearchParams(location.search);
 const HASH_PARAMS = new URLSearchParams(location.hash.replace(/^#/, ''));
-const URL_TOKEN = HASH_PARAMS.get('token') || URL_PARAMS.get('token');
+// Read the token raw: URLSearchParams turns '+' into a space, which breaks
+// base64 keys. Only %XX escapes are decoded.
+function rawParam(query, name) {
+    for (const part of query.replace(/^[?#]/, '').split('&')) {
+        const eq = part.indexOf('=');
+        if (eq > 0 && part.slice(0, eq) === name) {
+            try { return decodeURIComponent(part.slice(eq + 1)); } catch { return part.slice(eq + 1); }
+        }
+    }
+    return null;
+}
+const URL_TOKEN = rawParam(location.hash, 'token') || rawParam(location.search, 'token');
 if (URL_TOKEN) sessionStorage.setItem('guardian_token', URL_TOKEN);
 if (URL_PARAMS.has('token') || HASH_PARAMS.has('token')) {
     URL_PARAMS.delete('token');
@@ -159,7 +170,7 @@ function renderApproval(a) {
     card.dataset.status = a.status;
 
     const args = Object.entries(a.arguments || {})
-        .map(([k, v]) => `<div class="approval-arg"><span class="arg-path">${escapeHtml(k)}</span> ${escapeHtml(fmtValue(v).slice(0, 300))}</div>`)
+        .map(([k, v]) => `<div class="approval-arg"><span class="arg-path">${escapeHtml(k)}</span> ${escapeHtml(fmtValue(v))}</div>`)
         .join('');
     const diff = (a.diff || []).map(d => {
         if (d.change === 'added') return `<div class="diff-row diff-added">+ ${escapeHtml(d.path)}: ${escapeHtml(fmtValue(d.after))}</div>`;
@@ -172,14 +183,16 @@ function renderApproval(a) {
         : '';
     const expires = a.status === 'pending' && a.expires_at
         ? `<span class="approval-expiry" data-expires="${Number(a.expires_at)}"></span>` : '';
-    // A preview cut short means the approver cannot see the whole call, so
-    // the dashboard offers Deny only; approving it is a deliberate API call.
-    const cut = a.preview_truncated
-        ? `<div class="approval-outcome approval-error">The arguments are too large to show in full. Approve is disabled here; review the full call and answer through POST /api/approvals/${escapeHtml(a.approval_id)}.</div>` : '';
+    // A preview or change list cut short means the approver cannot see the
+    // whole call, so the dashboard offers Deny only; approving it is a
+    // deliberate API call.
+    const incomplete = a.preview_truncated || a.diff_truncated;
+    const cut = incomplete
+        ? `<div class="approval-outcome approval-error">${a.preview_truncated ? 'The arguments are too large to show in full.' : 'Too many arguments changed to list them all.'} Approve is disabled here; review the full call and answer through POST /api/approvals/${escapeHtml(a.approval_id)}.</div>` : '';
     const buttons = a.status === 'pending' ? `
         ${cut}
         <div class="approval-actions">
-            ${a.preview_truncated ? '' : '<button class="btn-approve" data-answer="true">Approve</button>'}
+            ${incomplete ? '' : '<button class="btn-approve" data-answer="true">Approve</button>'}
             <button class="btn-deny" data-answer="false">Deny</button>
         </div>` : '';
     const outcome = a.status !== 'pending'
