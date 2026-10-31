@@ -238,6 +238,7 @@ _TEXTUAL_MIME = re.compile(
 _CHARSET = re.compile(r"(?i);\s*charset\s*=\s*\"?([\w.:-]+)")
 LOSSY = "lossy"
 RAW = "raw"
+BLOB_AS_UTF8 = "blob:utf-8"
 
 
 def _charset(mime: str | None) -> str | None:
@@ -245,9 +246,12 @@ def _charset(mime: str | None) -> str | None:
     if not m:
         return None
     try:
-        return codecs.lookup(m.group(1)).name
+        info = codecs.lookup(m.group(1))
     except LookupError:
         return None
+    # hex, base64, rot13, zlib and the like are codecs too, but not text
+    # encodings: bytes.decode refuses them with LookupError.
+    return info.name if getattr(info, "_is_text_encoding", True) else None
 
 
 def _blob_text(res: types.BlobResourceContents) -> tuple[str, str] | None:
@@ -268,17 +272,19 @@ def _blob_text(res: types.BlobResourceContents) -> tuple[str, str] | None:
     for codec in dict.fromkeys(c for c in (charset, "utf-8") if c):
         try:
             return raw.decode(codec), codec
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, LookupError):
             continue
     if not mime.strip() or _TEXTUAL_MIME.match(mime):
         return raw.decode(charset or "utf-8", errors="replace"), LOSSY
     return None
 
 
-# A file: uri names a local resource; it is not fetched by anyone, so it is
-# scanned without its scheme (no ssrf finding for every file:// uri), and the
-# scheme is put back if the rest is redacted.
-_FILE_SCHEME = re.compile(r"(?i)^file:(?://)?")
+# A file: uri with no host names a local resource; it is not fetched by
+# anyone, so it is scanned without its scheme (no ssrf finding for every
+# file:/// uri), and the scheme is put back if the rest is redacted. One with
+# a host (file://169.254.169.254/x, file://attacker/share, which some clients
+# open over SMB) is scanned whole.
+_FILE_SCHEME = re.compile(r"(?i)^file:(?://(?=/))?(?!//)")
 
 
 def _uri_parts(uri: str) -> tuple[str, str]:
@@ -314,6 +320,14 @@ def _result_texts(content: list) -> tuple[list[tuple[int, str]], list[str]]:
                 if decoded is not None:
                     where.append((i, "blob"))
                     texts.append(decoded[0])
+                    # A declared charset decides how this gateway reads the
+                    # bytes, not how the client or model will. UTF-8 text
+                    # labelled utf-16 reads as noise here; scan it as UTF-8 too.
+                    if decoded[1] not in (RAW, "utf-8"):
+                        as_utf8 = _blob_bytes(res.blob).decode("utf-8", errors="replace")
+                        if as_utf8 != decoded[0]:
+                            where.append((i, BLOB_AS_UTF8))
+                            texts.append(as_utf8)
         elif isinstance(block, types.ResourceLink):
             for name in _LINK_FIELDS:
                 value = getattr(block, name, None)
@@ -333,6 +347,8 @@ def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
         return block.model_copy(update={"text": new_text})
     if kind == "resource":
         return block.model_copy(update={"resource": block.resource.model_copy(update={"text": new_text})})
+    if kind == BLOB_AS_UTF8:
+        return None  # a second reading of the same bytes: cannot be redacted in place
     if kind == "blob":
         read = _blob_text(block.resource)
         if read is None or read[1] == LOSSY:
@@ -342,7 +358,7 @@ def _replace_text(block: Any, kind: str, new_text: str) -> Any | None:
         else:
             try:
                 blob = base64.b64encode(new_text.encode(read[1])).decode("ascii")
-            except UnicodeEncodeError:
+            except (UnicodeEncodeError, LookupError):
                 return None
         return block.model_copy(update={"resource": block.resource.model_copy(update={"blob": blob})})
     if kind == "uri":

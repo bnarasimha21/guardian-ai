@@ -313,6 +313,11 @@ raw_blob_tool("latin1_blob", b"\\xff " + INJECTION.encode("latin-1"), "text/plai
 raw_blob_tool("bad_utf8_blob", b"\\xff\\xfe " + INJECTION.encode(), "text/plain")
 raw_blob_tool("untyped_bad_utf8_blob", b"\\xff\\xfe " + INJECTION.encode(), "")
 raw_blob_tool("bad_utf8_secret_blob", b"\\xff " + SECRET.encode(), "text/plain")
+# UTF-8 bytes labelled utf-16 read as noise to a strict reader; the client may
+# still read them as UTF-8. Padded to an even length so utf-16 decodes cleanly.
+raw_blob_tool("utf16_labelled_blob", INJECTION.encode() + b" " * (len(INJECTION.encode()) % 2),
+              "text/plain; charset=utf-16")
+raw_blob_tool("hex_charset_blob", INJECTION.encode(), "text/plain; charset=hex")  # a codec, not a text encoding
 raw_blob_tool("latin1_secret_blob", ("caf\\xe9 " + SECRET).encode("latin-1"), "text/plain; charset=ISO-8859-1")
 
 
@@ -340,6 +345,12 @@ def file_uri() -> types.CallToolResult:
 def uri_injection() -> types.CallToolResult:
     return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
         uri="file:///" + INJECTION, mime_type="text/plain", text="quarterly numbers"))])
+
+
+@server.tool(name="file_host_uri")
+def file_host_uri() -> types.CallToolResult:
+    return types.CallToolResult(content=[types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
+        uri="file://169.254.169.254/latest/meta-data", mime_type="text/plain", text="quarterly numbers"))])
 
 
 if __name__ == "__main__":
@@ -391,13 +402,21 @@ async def test_injection_in_unusual_blob_encodings_and_uris_is_withheld(tmp_path
         assert result.meta["guardian-ai/decision"]["rule_id"] == "deny-injection-in-results"
 
 
-@pytest.mark.parametrize("tool", ["latin1_blob", "bad_utf8_blob", "untyped_bad_utf8_blob", "meta_injection"])
+@pytest.mark.parametrize("tool", ["latin1_blob", "bad_utf8_blob", "untyped_bad_utf8_blob", "meta_injection",
+                                  "utf16_labelled_blob", "hex_charset_blob"])
 async def test_injection_in_undecodable_blobs_and_result_meta_is_withheld(tmp_path, tool):
     async with Client(gateway_process(rich_config(tmp_path)), mode="legacy") as client:
         result = await client.call_tool(f"rich.{tool}", {})
         assert result.is_error, result
         assert result.meta["guardian-ai/decision"]["rule_id"] == "deny-injection-in-results"
         assert "private key" not in json.dumps(result.model_dump(mode="json"))
+
+
+async def test_file_uri_with_a_host_is_scanned_whole(tmp_path):
+    async with Client(gateway_process(rich_config(tmp_path)), mode="legacy") as client:
+        result = await client.call_tool("rich.file_host_uri", {})
+        decision = result.meta["guardian-ai/decision"]
+        assert decision["effect"] != "allow" and "ssrf" in decision["matched_detectors"], decision
 
 
 async def test_blob_that_cannot_be_redacted_in_place_is_withheld(tmp_path):
