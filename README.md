@@ -2,6 +2,8 @@
 
 A policy decision point for AI agent tool calls, plus a live dashboard. Agents (or the apps that run them) ask `POST /api/check` "may this agent call this tool with these arguments?" and get an allow or deny decided by a YAML policy file and a set of built-in detectors mapped to the OWASP Top 10 for LLM Applications (2025) and the OWASP Top 10 for Agentic Applications (2026). Separately, GuardianAI can passively observe apps through a WebSocket tap and show what the same policy would have decided; the tap cannot stop anything. And it can run as an MCP gateway (`guardian-mcp`) in front of your MCP servers, where it does sit in the call path and enforces the policy itself.
 
+Why it is built this way, with the trade-offs, measured numbers and what changes at scale: [docs/DESIGN.md](docs/DESIGN.md).
+
 ## Screenshots
 
 ![GuardianAI Dashboard](screenshot.png)
@@ -41,6 +43,7 @@ Before matching, each string is also checked in normalised form: Unicode NFKC (s
 ```bash
 python evals/run.py            # writes evals/report.md and evals/report.json, offline
 python evals/run.py --check    # exit 1 if a critical rule's recall drops, fewer attacks are stopped, or benign flag/block rates rise
+python evals/latency.py        # time one policy decision over the call-phase corpus, in process
 ```
 
 CI (`.github/workflows/evals.yml`) runs `--check` against `evals/baseline.json` on every pull request. The critical rules are `prompt_injection`, `data_exfiltration` and `dangerous_code`. The gate compares the rates and also each record: an attack the baseline stopped or detected that no longer is, or a benign record newly flagged or blocked, fails it even if the rate is unchanged. To accept a deliberate change, run `python evals/run.py --write-baseline` and commit the result.
