@@ -242,31 +242,62 @@ That's it. Your app now exposes a `/ws-observe` endpoint that GuardianAI connect
 
 ## Architecture
 
+One policy engine, three ways to attach it. Only the MCP gateway is in the path of the call.
+
+```mermaid
+flowchart LR
+    subgraph Callers
+        A1[MCP client<br/>Claude Desktop, Claude Code, a framework]
+        A2[Agent runtime<br/>any framework]
+        A3[App with guardian-tap]
+    end
+
+    subgraph GuardianAI
+        GW[MCP gateway<br/>guardian-mcp]
+        API[POST /api/check]
+        TAP[Tap client]
+        DET[Detectors<br/>regex and URL checks,<br/>optional model detectors]
+        ENG[Policy engine<br/>evaluate]
+        POL[(YAML policy<br/>hot reloaded)]
+        APR[Approval store]
+        PIN[(Tool definition pins)]
+        OUT[Dashboard, audit log,<br/>OpenTelemetry spans]
+    end
+
+    UP[Upstream MCP servers]
+
+    A1 -- stdio --> GW
+    A2 -- HTTP --> API
+    A3 -- WebSocket --> TAP
+    GW --> ENG
+    API --> ENG
+    TAP --> ENG
+    ENG --> DET
+    POL --> ENG
+    ENG --> APR
+    GW --> PIN
+    GW -- only calls the policy allows --> UP
+    UP -- output, scanned before return --> GW
+    ENG --> OUT
 ```
-Your App (FastAPI/Express)
-    |
-    | guardian-tap package adds /ws-observe endpoint
-    | (intercepts WebSocket, SSE, and JSON responses)
-    |
-    v
-GuardianAI Server (FastAPI)
-    |
-    |-- WebSocket tap client (passive observer, decisions are observed only)
-    |-- Detectors (backend/guardian/rules.py, optional model detectors in backend/guardian/detectors)
-    |-- Policy engine + hot-reloaded YAML policy (backend/policy)
-    |-- POST /api/check (policy decision point: 200 allow, 403 deny, 202 approval)
-    |-- Approval queue (in memory) + /api/approvals
-    |-- guardian-mcp: MCP gateway (backend/mcp_gateway), same policy engine
-    |-- Per-session event bus
-    |-- OpenTelemetry spans for decisions and approvals (backend/telemetry.py)
-    |-- Supabase usage logging (optional, off by default)
-    |
-    v
-Browser Dashboard
-    |-- Agent Activity (left panel)
-    |-- Guardian Decisions (right panel)
-    |-- Summary card with stats
-```
+
+| Mode | In the call path? | What a deny means |
+|------|-------------------|-------------------|
+| MCP gateway (`backend/mcp_gateway`) | Yes | The call is never sent upstream |
+| `POST /api/check` (`server.py`) | No. The caller asks and must obey | Nothing, unless the caller honors it |
+| Tap (`backend/tap`) | No. The traffic already happened | Nothing. It is shown as observed or flagged |
+
+| Part | Where |
+|------|-------|
+| Detectors | `backend/guardian/rules.py`, optional model detectors in `backend/guardian/detectors` |
+| Policy engine and hot-reloaded YAML policy | `backend/policy`, `policies/default.yaml` |
+| Approval queue (in memory) and `/api/approvals` | `backend/approvals` |
+| Tool definition pins | `backend/mcp_gateway/pins.py` |
+| Per-session event bus and dashboard | `backend/events`, `frontend` |
+| OpenTelemetry spans for decisions and approvals | `backend/telemetry.py` |
+| Supabase usage logging (optional, off by default) | `backend/usage_logger.py` |
+
+The reasons behind these choices, the threat model and what changes at scale are in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Running Locally
 
