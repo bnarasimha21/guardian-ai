@@ -94,6 +94,19 @@ flowchart LR
 The three modes share the detectors, the policy file and the engine, so a policy tried out on the tap
 behaves the same way once it is enforced at the gateway.
 
+### One call through the gateway
+
+Eight steps, and the five places a call or its output can be stopped.
+
+![One tool call through the gateway, with every exit](images/decision-flow.svg)
+
+### Where it runs today
+
+Each mode is a single process with its state in memory and on local disk. Dashed lines are trust
+boundaries. Section 8 covers what changes to serve many teams.
+
+![The two deployments today, with trust boundaries](images/deployment.svg)
+
 ## 4. Decisions
 
 Each decision lists the choice, the option not taken, the reason, and the cost.
