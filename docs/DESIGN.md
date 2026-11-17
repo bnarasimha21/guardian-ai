@@ -300,10 +300,12 @@ and the calls are small (arguments have a median of 70 bytes as JSON, 338 at mos
    cannot reach. The MCP gateway still writes its own local JSONL file.
 7. **Bypass is possible** wherever an agent can reach an upstream directly.
 8. **The tap's `/ws-observe` endpoint has no authentication.**
-9. **Load has been tested on one machine only.** Section 9 has the figures: Docker, loopback, one
-   tenant, small calls. Not Kubernetes, not a real network, not many tenants at once.
-10. **The Helm chart has not been installed on a cluster.** It lints and renders to valid Kubernetes,
-    and its image runs as two replicas with Postgres in Docker.
+9. **Load has been tested at small scale only.** Section 9 has the figures: one machine with Docker,
+   and one two-node Kubernetes cluster. One tenant under load, small calls, the load generator next
+   to the server, one run of each. Not many tenants at once, not a managed database, not a long run.
+10. **The Helm chart has been installed once.** One cluster, one install and one upgrade, with the
+    bundled single-pod Postgres. No upgrade under load, no node failure, no backup or restore of the
+    audit log.
 
 ## 8. What changes at 100 times the scale
 
@@ -403,6 +405,15 @@ One thing the first attempt got wrong is worth keeping: with a general-purpose H
 generator used a full core while the server used half of one, so throughput appeared to fall as
 concurrency rose. The figures above use a minimal keep-alive client, with which the server is the
 limit.
+
+**On Kubernetes** (2026-11-17, DigitalOcean Kubernetes 1.37, two 4-vCPU nodes). `helm install` had
+two replicas and Postgres ready in 58 s, `deploy/smoke.py` passed 13 of 13 checks from a pod in the
+cluster, and `helm upgrade` to four replicas took 23 s. Under load through the Service, two replicas
+reached 664 decisions a second and four reached 998, with no failed request; a single caller saw
+6.9 ms at p50. The nodes are about half as fast as the machine above (0.44 ms per decision in
+process), and four replicas shared eight vCPUs with Postgres and the load generator, which is why
+four gave one and a half times two and not twice. The audit log ended with 105,001 rows in six chains
+and verified intact. The README has the full table.
 
 **Tests.** 60 more, 440 in all. The Postgres store and the audit log are tested against a real
 database, including two store objects racing on one call and tampering behind the append-only trigger.

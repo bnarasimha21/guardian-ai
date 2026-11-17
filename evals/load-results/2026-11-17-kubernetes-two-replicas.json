@@ -1,0 +1,115 @@
+{
+  "url": "http://guardian-guardian-ai:8000",
+  "records": 213,
+  "duration_s": 20.0,
+  "client": "Python 3.12.16, x86_64",
+  "arguments_json_bytes": {
+    "median": 70,
+    "max": 338
+  },
+  "readyz": {
+    "status": "ok",
+    "checks": {
+      "policy": true,
+      "approvals": true,
+      "audit": true
+    },
+    "shared_state": true
+  },
+  "note": "DOKS 1.37 in blr1, 2 nodes of s-4vcpu-8gb, chart defaults: 2 replicas and the bundled Postgres pod with a block storage volume, audit required; load generator in a pod in the same cluster, through the ClusterIP Service",
+  "in_process": {
+    "count": 2130,
+    "p50_ms": 0.441,
+    "p95_ms": 0.961,
+    "p99_ms": 1.26,
+    "max_ms": 2.265,
+    "mean_ms": 0.505
+  },
+  "levels": [
+    {
+      "count": 2794,
+      "p50_ms": 6.939,
+      "p95_ms": 8.797,
+      "p99_ms": 11.296,
+      "max_ms": 59.779,
+      "mean_ms": 7.15,
+      "concurrency": 1,
+      "wall_s": 20.0,
+      "requests_per_s": 139.7,
+      "statuses": {
+        "200": 1553,
+        "202": 26,
+        "403": 1215
+      },
+      "errors": {}
+    },
+    {
+      "count": 8408,
+      "p50_ms": 20.148,
+      "p95_ms": 33.399,
+      "p99_ms": 42.052,
+      "max_ms": 96.649,
+      "mean_ms": 19.026,
+      "concurrency": 8,
+      "wall_s": 20.01,
+      "requests_per_s": 420.2,
+      "statuses": {
+        "200": 4570,
+        "202": 83,
+        "403": 3755
+      },
+      "errors": {}
+    },
+    {
+      "count": 11691,
+      "p50_ms": 52.512,
+      "p95_ms": 83.393,
+      "p99_ms": 106.224,
+      "max_ms": 151.952,
+      "mean_ms": 54.764,
+      "concurrency": 32,
+      "wall_s": 20.02,
+      "requests_per_s": 584.0,
+      "statuses": {
+        "200": 6515,
+        "202": 110,
+        "403": 5066
+      },
+      "errors": {}
+    },
+    {
+      "count": 12849,
+      "p50_ms": 96.533,
+      "p95_ms": 140.995,
+      "p99_ms": 169.906,
+      "max_ms": 228.478,
+      "mean_ms": 99.707,
+      "concurrency": 64,
+      "wall_s": 20.03,
+      "requests_per_s": 641.3,
+      "statuses": {
+        "200": 7170,
+        "202": 122,
+        "403": 5557
+      },
+      "errors": {}
+    },
+    {
+      "count": 13379,
+      "p50_ms": 193.219,
+      "p95_ms": 274.637,
+      "p99_ms": 308.639,
+      "max_ms": 444.016,
+      "mean_ms": 192.232,
+      "concurrency": 128,
+      "wall_s": 20.15,
+      "requests_per_s": 664.0,
+      "statuses": {
+        "200": 7269,
+        "202": 137,
+        "403": 5973
+      },
+      "errors": {}
+    }
+  ]
+}

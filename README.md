@@ -343,8 +343,8 @@ It creates a single Postgres pod by default, which is for trying it out; set `da
 and `database.url` to use a managed one. It refuses several replicas without a database.
 
 **Status of the chart.** It lints, and what it renders is valid against the Kubernetes 1.34 schemas
-(both checked in CI). The image it deploys was run as two replicas with Postgres in Docker, which is
-where the numbers below come from. It has not yet been installed on a Kubernetes cluster.
+(both checked in CI). It was installed once on a real cluster, described under *On Kubernetes* below.
+For a private registry, set `image.pullSecrets`.
 
 ### Overhead under load
 
@@ -378,6 +378,48 @@ Limits of these numbers: one machine shared by client, server and database, loop
 small calls (median 70 bytes of arguments), one tenant, Docker and not Kubernetes, one run of each.
 After the runs the audit log held 79,610 rows in two chains and verified intact. The raw results are
 in `evals/load-results/`.
+
+### On Kubernetes
+
+The chart was installed on a DigitalOcean Kubernetes 1.37 cluster (two 4-vCPU nodes, `blr1`) on
+2026-11-17, with the image built in the cluster from this repository's Dockerfile.
+
+| Step | Result |
+|------|-------:|
+| `helm install --wait` to two replicas and Postgres ready, volume bound | 58 s |
+| `deploy/smoke.py` from a pod in the cluster | 13 of 13 checks |
+| `helm upgrade` from two replicas to four | 23 s |
+| Audit log after all runs | 105,001 rows in 6 chains, intact |
+
+The smoke check covers both tenants' rules, the policy endpoint, a refund that needs approval, twelve
+retries across replicas joining one approval, another tenant's approver and the agent's own key being
+refused, and a single-use grant letting exactly one of six calls through.
+
+Load, from a pod in the same cluster through the Service, 20 seconds per level, audit required:
+
+| Setup | Concurrent callers | Requests/s | p50 | p95 | p99 |
+|-------|-------------------:|-----------:|----:|----:|----:|
+| Two replicas | 1 | 140 | 7 ms | 9 ms | 11 ms |
+| Two replicas | 8 | 420 | 20 ms | 33 ms | 42 ms |
+| Two replicas | 32 | 584 | 53 ms | 83 ms | 106 ms |
+| Two replicas | 64 | 641 | 97 ms | 141 ms | 170 ms |
+| Two replicas | 128 | 664 | 193 ms | 275 ms | 309 ms |
+| Four replicas | 32 | 802 | 37 ms | 64 ms | 90 ms |
+| Four replicas | 64 | 961 | 62 ms | 107 ms | 148 ms |
+| Four replicas | 128 | 998 | 133 ms | 203 ms | 256 ms |
+
+- These nodes are slower than the machine in the table above: the same decision takes 0.44 ms in
+  process here against 0.22 ms. One caller sees 6.9 ms at p50, of which the network between pods and
+  an audit write to block storage are most.
+- Two replicas saturate near 660 decisions a second, about 330 each. Four reached 998, one and a half
+  times as much and not twice, because four replicas, Postgres and the load generator were sharing
+  eight vCPUs.
+- No request failed in any run.
+- One replica restarted once at install: it started before Postgres was accepting connections, gave up
+  after 30 seconds and was restarted by Kubernetes.
+
+Limits: one small cluster, the bundled single-pod Postgres, one tenant under load, small calls, one
+run of each, no load during the upgrade, and the load generator inside the cluster.
 
 ## Running Locally
 
