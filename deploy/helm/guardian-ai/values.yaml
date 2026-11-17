@@ -4,6 +4,8 @@ image:
   repository: guardian-ai
   tag: "0.4.0"
   pullPolicy: IfNotPresent
+  # Names of Secrets (type kubernetes.io/dockerconfigjson) for a private registry.
+  pullSecrets: []
 
 # Several replicas share approvals and the audit log through Postgres. With
 # database.enabled false and no database.url, run exactly one replica: approvals
