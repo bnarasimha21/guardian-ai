@@ -1,0 +1,82 @@
+# GuardianAI Helm values. Everything an operator is expected to set is here.
+
+image:
+  repository: guardian-ai
+  tag: "0.4.0"
+  pullPolicy: IfNotPresent
+  # Names of Secrets (type kubernetes.io/dockerconfigjson) for a private registry.
+  pullSecrets: []
+
+# Several replicas share approvals and the audit log through Postgres. With
+# database.enabled false and no database.url, run exactly one replica: approvals
+# would live in each process's memory and replicas would not see each other's.
+replicaCount: 2
+
+# API keys, "name=key,name2=key2". The name up to its first dot is the tenant:
+# "payments.checkout-agent" is tenant "payments" and gets policies.tenants.payments.
+# Keys must be at least 16 characters. Set them at install time or point
+# existingSecret at a Secret with the keys GUARDIAN_API_KEYS and
+# GUARDIAN_APPROVER_KEYS (and GUARDIAN_DATABASE_URL when you bring your own database).
+apiKeys: ""
+# Keys that may approve or deny. With tenant policies, "payments.alice" answers
+# for tenant "payments" only.
+approverKeys: ""
+existingSecret: ""
+
+# Lowest detector severity that /api/check refuses: low, medium, high or critical.
+blockThreshold: high
+# Refuse to decide (503) when a decision cannot be written to the audit log.
+auditRequired: true
+
+policies:
+  # The base policy, checked first for every caller. Empty: the default policy
+  # shipped in the image (policies/default.yaml).
+  base: ""
+  # One entry per tenant: rules checked after the base policy's. A tenant file
+  # may hold only "version" and "rules". Example:
+  #
+  # tenants:
+  #   payments: |
+  #     version: 1
+  #     rules:
+  #       - id: payments-refund
+  #         match: {tool: "payments.refund"}
+  #         effect: require_approval
+  tenants: {}
+
+database:
+  # A single Postgres pod with a volume, created by this chart. Good for a
+  # trial. For anything else set enabled false and give url (or put
+  # GUARDIAN_DATABASE_URL in existingSecret): a managed, backed-up Postgres.
+  enabled: true
+  url: ""
+  image: postgres:16-alpine
+  # Generated at install when empty, and kept across upgrades.
+  password: ""
+  storage: 2Gi
+  storageClassName: ""
+  poolSize: 10
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests: {cpu: 250m, memory: 256Mi}
+  limits: {memory: 512Mi}
+
+# Only pods with this label, in this namespace, may reach the decision API.
+# Empty: no NetworkPolicy is created. A NetworkPolicy needs a CNI that enforces it.
+networkPolicy:
+  enabled: false
+  clientLabels:
+    guardian-ai/client: "true"
+
+# Traces (one execute_tool span per decision) go to this OTLP endpoint when set.
+otlpEndpoint: ""
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1

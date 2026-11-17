@@ -1,0 +1,98 @@
+{
+  "url": "http://127.0.0.1:8101",
+  "records": 213,
+  "duration_s": 15.0,
+  "client": "Python 3.12.3, x86_64",
+  "arguments_json_bytes": {
+    "median": 70,
+    "max": 338
+  },
+  "readyz": {
+    "status": "ok",
+    "checks": {
+      "policy": true,
+      "approvals": true,
+      "audit": true
+    },
+    "shared_state": true
+  },
+  "note": "one replica in Docker with Postgres 16 in a container on the same machine, audit required; client on the same 4-core machine",
+  "in_process": {
+    "count": 2130,
+    "p50_ms": 0.219,
+    "p95_ms": 0.377,
+    "p99_ms": 0.515,
+    "max_ms": 0.812,
+    "mean_ms": 0.233
+  },
+  "levels": [
+    {
+      "count": 4454,
+      "p50_ms": 3.235,
+      "p95_ms": 4.16,
+      "p99_ms": 6.147,
+      "max_ms": 46.057,
+      "mean_ms": 3.365,
+      "concurrency": 1,
+      "wall_s": 15.0,
+      "requests_per_s": 296.9,
+      "statuses": {
+        "200": 2480,
+        "202": 42,
+        "403": 1932
+      },
+      "errors": {}
+    },
+    {
+      "count": 7464,
+      "p50_ms": 15.661,
+      "p95_ms": 21.252,
+      "p99_ms": 25.876,
+      "max_ms": 64.7,
+      "mean_ms": 16.08,
+      "concurrency": 8,
+      "wall_s": 15.01,
+      "requests_per_s": 497.3,
+      "statuses": {
+        "200": 4011,
+        "202": 72,
+        "403": 3381
+      },
+      "errors": {}
+    },
+    {
+      "count": 8575,
+      "p50_ms": 54.005,
+      "p95_ms": 76.323,
+      "p99_ms": 97.331,
+      "max_ms": 124.95,
+      "mean_ms": 55.994,
+      "concurrency": 32,
+      "wall_s": 15.01,
+      "requests_per_s": 571.3,
+      "statuses": {
+        "200": 4761,
+        "202": 82,
+        "403": 3732
+      },
+      "errors": {}
+    },
+    {
+      "count": 8757,
+      "p50_ms": 107.889,
+      "p95_ms": 140.909,
+      "p99_ms": 173.239,
+      "max_ms": 243.061,
+      "mean_ms": 109.98,
+      "concurrency": 64,
+      "wall_s": 15.07,
+      "requests_per_s": 581.2,
+      "statuses": {
+        "200": 4815,
+        "202": 86,
+        "403": 3856
+      },
+      "errors": {}
+    }
+  ]
+}

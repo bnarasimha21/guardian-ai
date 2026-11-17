@@ -1,0 +1,96 @@
+{
+  "url": "http://127.0.0.1:8103",
+  "records": 213,
+  "duration_s": 15.0,
+  "client": "Python 3.12.3, x86_64",
+  "arguments_json_bytes": {
+    "median": 70,
+    "max": 338
+  },
+  "readyz": {
+    "status": "ok",
+    "checks": {
+      "policy": true
+    },
+    "shared_state": false
+  },
+  "note": "one replica in Docker, no database (approvals in memory, no audit log); client on the same 4-core machine",
+  "in_process": {
+    "count": 2130,
+    "p50_ms": 0.24,
+    "p95_ms": 0.435,
+    "p99_ms": 0.56,
+    "max_ms": 1.441,
+    "mean_ms": 0.26
+  },
+  "levels": [
+    {
+      "count": 7347,
+      "p50_ms": 1.977,
+      "p95_ms": 2.561,
+      "p99_ms": 3.215,
+      "max_ms": 26.471,
+      "mean_ms": 2.038,
+      "concurrency": 1,
+      "wall_s": 15.0,
+      "requests_per_s": 489.7,
+      "statuses": {
+        "200": 4076,
+        "202": 69,
+        "403": 3202
+      },
+      "errors": {}
+    },
+    {
+      "count": 9496,
+      "p50_ms": 12.126,
+      "p95_ms": 17.375,
+      "p99_ms": 22.362,
+      "max_ms": 47.849,
+      "mean_ms": 12.637,
+      "concurrency": 8,
+      "wall_s": 15.0,
+      "requests_per_s": 632.9,
+      "statuses": {
+        "200": 5154,
+        "202": 94,
+        "403": 4248
+      },
+      "errors": {}
+    },
+    {
+      "count": 10195,
+      "p50_ms": 45.362,
+      "p95_ms": 64.393,
+      "p99_ms": 78.419,
+      "max_ms": 101.561,
+      "mean_ms": 47.13,
+      "concurrency": 32,
+      "wall_s": 15.03,
+      "requests_per_s": 678.5,
+      "statuses": {
+        "200": 5655,
+        "202": 96,
+        "403": 4444
+      },
+      "errors": {}
+    },
+    {
+      "count": 9342,
+      "p50_ms": 100.187,
+      "p95_ms": 137.925,
+      "p99_ms": 154.304,
+      "max_ms": 179.821,
+      "mean_ms": 103.209,
+      "concurrency": 64,
+      "wall_s": 15.08,
+      "requests_per_s": 619.6,
+      "statuses": {
+        "200": 5158,
+        "202": 90,
+        "403": 4094
+      },
+      "errors": {}
+    }
+  ]
+}

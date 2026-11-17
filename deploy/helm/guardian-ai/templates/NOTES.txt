@@ -1,0 +1,17 @@
+GuardianAI is installed as {{ include "guardian.name" . }} with {{ .Values.replicaCount }} replica(s).
+
+Check it:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "guardian.name" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "guardian.name" . }} 8000:{{ .Values.service.port }}
+  curl -s localhost:8000/readyz
+
+{{- if not (or .Values.apiKeys .Values.existingSecret) }}
+
+WARNING: no API keys are set. The server is in open demo mode: anyone who can
+reach it can ask and approve, and there are no tenants. Set apiKeys and approverKeys.
+{{- end }}
+{{- if .Values.database.enabled }}
+
+The bundled Postgres is one pod with one volume. Approvals and the audit log
+are only as durable as that volume. For real use set database.enabled=false and database.url.
+{{- end }}

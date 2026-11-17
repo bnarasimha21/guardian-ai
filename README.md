@@ -299,6 +299,131 @@ flowchart LR
 
 The reasons behind these choices, the threat model and what changes at scale are in [docs/DESIGN.md](docs/DESIGN.md).
 
+## Running it for several teams
+
+One process with its state in memory is enough for a demo. For several teams the server takes three
+more settings, and a Helm chart puts them together.
+
+**A policy per tenant.** With `GUARDIAN_TENANT_POLICIES_DIR` set, the tenant `payments` gets the base
+policy followed by the rules in `<dir>/payments.yaml`. The base rules are checked first, so a base
+`deny` or `require_approval` cannot be overridden, and a tenant decides only what the base leaves
+undecided. A tenant file may hold `version` and `rules` and nothing else. The tenant comes from the
+API key name, up to its first dot: `payments.checkout-agent` is tenant `payments`. With tenants on, an
+approver key answers for its own tenant only (`payments.alice` for `app:payments.*` sessions).
+
+**Shared approvals.** With `GUARDIAN_DATABASE_URL` set, approvals are stored in Postgres. Every
+replica sees them, a restart keeps them, and two identical calls arriving on different replicas still
+open one approval.
+
+**A persistent audit log.** With a database, every decision and every approval change is appended to
+the `guardian_audit` table: who asked (the key name), which tool, the rule that decided, the policy
+hash, and a hash of the arguments, never the arguments themselves. The table refuses UPDATE and
+DELETE, and the rows are hash-chained per writer process, so an edited or removed row is found by:
+
+```bash
+python -m backend.audit verify --dsn postgresql://...
+```
+
+By default a decision that cannot be recorded is not given: `/api/check` answers 503 and the caller
+must not run the tool (`GUARDIAN_AUDIT_REQUIRED=false` turns that off).
+
+**Helm.**
+
+```bash
+docker build -t guardian-ai:0.4.0 .
+helm install guardian deploy/helm/guardian-ai \
+  --set apiKeys="payments.checkout-agent=<key of 16+ characters>" \
+  --set approverKeys="payments.alice=<key of 16+ characters>" \
+  --set-file policies.tenants.payments=payments.yaml
+```
+
+The chart runs two replicas behind a Service, with readiness on `/readyz` (the policy loads and the
+database answers) and liveness on `/healthz`, a read-only root filesystem and no added capabilities.
+It creates a single Postgres pod by default, which is for trying it out; set `database.enabled=false`
+and `database.url` to use a managed one. It refuses several replicas without a database.
+
+**Status of the chart.** It lints, and what it renders is valid against the Kubernetes 1.34 schemas
+(both checked in CI). It was installed once on a real cluster, described under *On Kubernetes* below.
+For a private registry, set `image.pullSecrets`.
+
+### Overhead under load
+
+`python evals/load.py` replays the 213 call-phase records of the eval corpus against `POST /api/check`
+over keep-alive connections. One 4-core 2.1 GHz Xeon ran the server containers, Postgres and the load
+generator together, 15 seconds per level, 2026-11-17.
+
+| Setup | Concurrent callers | Requests/s | p50 | p95 | p99 |
+|-------|-------------------:|-----------:|----:|----:|----:|
+| One replica, no database | 1 | 490 | 2.0 ms | 2.6 ms | 3.2 ms |
+| One replica, no database | 32 | 679 | 45 ms | 64 ms | 78 ms |
+| One replica, Postgres, audit required | 1 | 297 | 3.2 ms | 4.2 ms | 6.2 ms |
+| One replica, Postgres, audit required | 8 | 497 | 16 ms | 21 ms | 26 ms |
+| One replica, Postgres, audit required | 32 | 571 | 54 ms | 76 ms | 97 ms |
+| One replica, Postgres, audit required | 64 | 581 | 108 ms | 141 ms | 173 ms |
+| Two replicas, Postgres, audit required | 32 each | 1,126 | 55 ms | 80 ms | 101 ms |
+
+How to read it:
+
+- **The decision itself takes 0.22 ms** at p50 for the same records in process. One caller sees 2.0 ms
+  through HTTP, so request parsing, authentication, the thread hop, telemetry and the response add about
+  1.8 ms. The audit write adds about 1.2 ms more.
+- **One replica is one process on one core** and tops out near 600 decisions a second. Past that,
+  latency is queueing: at 32 callers each waits behind the others. More callers need more replicas, not
+  a bigger one.
+- **Two replicas gave twice the throughput** at the same latency. Postgres was not the limit at this
+  rate, because audit rows that arrive together are written in one insert.
+- No request failed in any run. The 202s are calls the default policy sends to a human.
+
+Limits of these numbers: one machine shared by client, server and database, loopback networking,
+small calls (median 70 bytes of arguments), one tenant, Docker and not Kubernetes, one run of each.
+After the runs the audit log held 79,610 rows in two chains and verified intact. The raw results are
+in `evals/load-results/`.
+
+### On Kubernetes
+
+The chart was installed on a DigitalOcean Kubernetes 1.37 cluster (two 4-vCPU nodes, `blr1`) on
+2026-11-17, with the image built in the cluster from this repository's Dockerfile.
+
+| Step | Result |
+|------|-------:|
+| `helm install --wait` to two replicas and Postgres ready, volume bound | 58 s |
+| Functional checks from a pod in the cluster | 12 of 13 as first written; see below |
+| `helm upgrade` from two replicas to four | 23 s |
+| Audit log after all runs | 105,001 rows in 6 chains, intact |
+
+The checks cover both tenants' rules, the policy endpoint, a refund that needs approval, twelve
+retries across replicas joining one approval, another tenant's approver and the agent's own key being
+refused, and a single-use grant letting exactly one of six calls through. The one that failed was the
+check, not the server: it expected a tenant's `web.search` rule to decide a call that the base
+policy's read-only rule allows first, which is the documented order. The call returned 200 from the
+base rule. `deploy/smoke.py` has the corrected check; it has not been re-run on a cluster.
+
+Load, from a pod in the same cluster through the Service, 20 seconds per level, audit required:
+
+| Setup | Concurrent callers | Requests/s | p50 | p95 | p99 |
+|-------|-------------------:|-----------:|----:|----:|----:|
+| Two replicas | 1 | 140 | 7 ms | 9 ms | 11 ms |
+| Two replicas | 8 | 420 | 20 ms | 33 ms | 42 ms |
+| Two replicas | 32 | 584 | 53 ms | 83 ms | 106 ms |
+| Two replicas | 64 | 641 | 97 ms | 141 ms | 170 ms |
+| Two replicas | 128 | 664 | 193 ms | 275 ms | 309 ms |
+| Four replicas | 32 | 802 | 37 ms | 64 ms | 90 ms |
+| Four replicas | 64 | 961 | 62 ms | 107 ms | 148 ms |
+| Four replicas | 128 | 998 | 133 ms | 203 ms | 256 ms |
+
+- These nodes are slower than the machine in the table above: the same decision takes 0.44 ms in
+  process here against 0.22 ms. One caller sees 6.9 ms at p50, of which the network between pods and
+  an audit write to block storage are most.
+- Two replicas saturate near 660 decisions a second, about 330 each. Four reached 998, one and a half
+  times as much and not twice, because four replicas, Postgres and the load generator were sharing
+  eight vCPUs.
+- No request failed in any run.
+- One replica restarted once at install: it started before Postgres was accepting connections, gave up
+  after 30 seconds and was restarted by Kubernetes.
+
+Limits: one small cluster, the bundled single-pod Postgres, one tenant under load, small calls, one
+run of each, no load during the upgrade, and the load generator inside the cluster.
+
 ## Running Locally
 
 ```bash
@@ -319,7 +444,16 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite runs offline: DNS, outbound HTTP and Supabase are replaced in
+The shared approval store and the audit log are tested against a real Postgres; those tests are
+skipped unless `GUARDIAN_TEST_DATABASE_URL` points at one:
+
+```bash
+docker run -d --name guardian-test-pg -e POSTGRES_USER=guardian -e POSTGRES_PASSWORD=guardian \
+  -e POSTGRES_DB=guardian -p 127.0.0.1:55432:5432 postgres:16-alpine
+GUARDIAN_TEST_DATABASE_URL=postgresql://guardian:guardian@127.0.0.1:55432/guardian python -m pytest
+```
+
+Everything else runs offline: DNS, outbound HTTP and Supabase are replaced in
 `tests/conftest.py`, and tracing tests use an in-memory span exporter and a fake OTLP collector on 127.0.0.1. The detection scorecard is separate: `python evals/run.py`.
 
 ## Environment Variables
@@ -334,6 +468,10 @@ ALLOW_PRIVATE_TARGETS=false                       # let targets point at loopbac
 GUARDIAN_POLICY_FILE=                             # policy YAML path (default policies/default.yaml)
 GUARDIAN_API_KEYS=                                # name=key,name=key; when set, /api/check needs a Bearer key (16+ chars)
 GUARDIAN_APPROVER_KEYS=                           # name=key; may watch every app:* dashboard session
+GUARDIAN_TENANT_POLICIES_DIR=                     # directory of <tenant>.yaml rule files, checked after the base policy
+GUARDIAN_DATABASE_URL=                            # Postgres; when set, approvals are shared and every decision is audited
+GUARDIAN_DATABASE_POOL_SIZE=10                    # connections per process
+GUARDIAN_AUDIT_REQUIRED=true                      # answer 503 when a decision cannot be written to the audit log
 GUARDIAN_MODEL_DETECTORS=                         # module:Attr,...; optional ModelDetector classes (none by default)
 OTEL_EXPORTER_OTLP_ENDPOINT=                      # e.g. http://localhost:4318; tracing is off when empty
 OTEL_SERVICE_NAME=                               # default guardian-ai

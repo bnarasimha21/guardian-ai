@@ -23,4 +23,55 @@ jobs:
       - name: Install
         run: pip install -r requirements-dev.txt
       - name: Test
+        # The shared approval store and the audit log are tested against a real
+        # Postgres. Without this variable those tests are skipped.
+        env:
+          GUARDIAN_TEST_DATABASE_URL: postgresql://guardian:guardian@127.0.0.1:5432/guardian
         run: python -m pytest -q
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guardian
+          POSTGRES_PASSWORD: guardian
+          POSTGRES_DB: guardian
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U guardian" --health-interval 5s --health-timeout 5s --health-retries 10
+
+  chart:
+    # The Helm chart renders, and what it renders is valid Kubernetes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Lint
+        run: helm lint deploy/helm/guardian-ai
+      - name: Render and validate
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+          helm template demo deploy/helm/guardian-ai \
+            --set apiKeys=payments.agent=payments-agent-key-0001 \
+            --set networkPolicy.enabled=true \
+            --set-string policies.tenants.payments='version: 1' \
+            | "$(go env GOPATH)/bin/kubeconform" -strict -summary -kubernetes-version 1.34.0
+      - name: Several replicas without a database are refused
+        run: |
+          ! helm template demo deploy/helm/guardian-ai --set database.enabled=false
+
+  image:
+    # The image builds and the server in it starts and reports ready.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t guardian-ai:ci .
+      - name: Start and probe
+        run: |
+          docker run -d --name guardian --read-only --tmpfs /tmp --tmpfs /app/sessions:uid=10001 -p 8000:8000 guardian-ai:ci
+          for i in $(seq 1 30); do curl -sf localhost:8000/readyz && break; sleep 1; done
+          curl -sf localhost:8000/readyz | grep -q '"status":"ok"'

@@ -1,0 +1,95 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.database.enabled) (not .Values.database.url) (not .Values.existingSecret) }}
+{{- fail "replicaCount above 1 needs a database (database.enabled, database.url, or GUARDIAN_DATABASE_URL in existingSecret): without one each replica keeps its own approvals" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "guardian.name" . }}
+  labels: {{- include "guardian.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "guardian.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "guardian.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+      annotations:
+        # Keys and the database URL are read at startup: a change rolls the pods.
+        # Policies are files and are picked up without a restart.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "guardian.selector" . | nindent 14 }}
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8000}
+          envFrom:
+            - secretRef:
+                name: {{ include "guardian.secretName" . }}
+          env:
+            - {name: BLOCK_THRESHOLD, value: {{ .Values.blockThreshold | quote }}}
+            - {name: GUARDIAN_AUDIT_REQUIRED, value: {{ .Values.auditRequired | quote }}}
+            - {name: GUARDIAN_DATABASE_POOL_SIZE, value: {{ .Values.database.poolSize | quote }}}
+            - {name: GUARDIAN_TENANT_POLICIES_DIR, value: /etc/guardian/tenants}
+            {{- if .Values.policies.base }}
+            - {name: GUARDIAN_POLICY_FILE, value: /etc/guardian/policy/policy.yaml}
+            {{- end }}
+            {{- if .Values.otlpEndpoint }}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ .Values.otlpEndpoint | quote }}}
+            {{- end }}
+          # Up, and able to decide: the policy loads and the database answers.
+          # A pod that cannot write the audit log is taken out of the Service.
+          startupProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tenants, mountPath: /etc/guardian/tenants, readOnly: true}
+            {{- if .Values.policies.base }}
+            - {name: policy, mountPath: /etc/guardian/policy, readOnly: true}
+            {{- end }}
+            - {name: sessions, mountPath: /app/sessions}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tenants
+          configMap: {name: {{ include "guardian.name" . }}-tenants}
+        {{- if .Values.policies.base }}
+        - name: policy
+          configMap: {name: {{ include "guardian.name" . }}-policy}
+        {{- end }}
+        - {name: sessions, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}

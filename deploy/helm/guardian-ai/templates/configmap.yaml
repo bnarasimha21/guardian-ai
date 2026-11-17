@@ -1,0 +1,24 @@
+{{- if .Values.policies.base }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "guardian.name" . }}-policy
+  labels: {{- include "guardian.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+    {{- .Values.policies.base | nindent 4 }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "guardian.name" . }}-tenants
+  labels: {{- include "guardian.labels" . | nindent 4 }}
+data:
+  {{- range $tenant, $rules := .Values.policies.tenants }}
+  {{- if not (regexMatch "^[A-Za-z0-9_-]{1,64}$" $tenant) }}
+  {{- fail (printf "policies.tenants: '%s' is not a valid tenant name (letters, digits, _ and -)" $tenant) }}
+  {{- end }}
+  {{ $tenant }}.yaml: |
+    {{- $rules | nindent 4 }}
+  {{- end }}

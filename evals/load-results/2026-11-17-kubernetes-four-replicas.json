@@ -1,0 +1,81 @@
+{
+  "url": "http://guardian-guardian-ai:8000",
+  "records": 213,
+  "duration_s": 20.0,
+  "client": "Python 3.12.16, x86_64",
+  "arguments_json_bytes": {
+    "median": 70,
+    "max": 338
+  },
+  "readyz": {
+    "status": "ok",
+    "checks": {
+      "policy": true,
+      "approvals": true,
+      "audit": true
+    },
+    "shared_state": true
+  },
+  "note": "DOKS 1.37 in blr1, 2 nodes of s-4vcpu-8gb, 4 replicas after helm upgrade, bundled Postgres pod with a block storage volume, audit required; load generator in a pod in the same cluster, through the ClusterIP Service",
+  "in_process": {
+    "count": 2130,
+    "p50_ms": 0.577,
+    "p95_ms": 1.004,
+    "p99_ms": 1.304,
+    "max_ms": 3.759,
+    "mean_ms": 0.617
+  },
+  "levels": [
+    {
+      "count": 16066,
+      "p50_ms": 37.282,
+      "p95_ms": 64.286,
+      "p99_ms": 89.855,
+      "max_ms": 186.645,
+      "mean_ms": 39.845,
+      "concurrency": 32,
+      "wall_s": 20.02,
+      "requests_per_s": 802.4,
+      "statuses": {
+        "200": 8961,
+        "202": 152,
+        "403": 6953
+      },
+      "errors": {}
+    },
+    {
+      "count": 19265,
+      "p50_ms": 62.029,
+      "p95_ms": 106.784,
+      "p99_ms": 147.727,
+      "max_ms": 228.345,
+      "mean_ms": 66.499,
+      "concurrency": 64,
+      "wall_s": 20.05,
+      "requests_per_s": 960.8,
+      "statuses": {
+        "200": 10602,
+        "202": 181,
+        "403": 8482
+      },
+      "errors": {}
+    },
+    {
+      "count": 20055,
+      "p50_ms": 132.733,
+      "p95_ms": 202.972,
+      "p99_ms": 255.695,
+      "max_ms": 414.936,
+      "mean_ms": 127.818,
+      "concurrency": 128,
+      "wall_s": 20.1,
+      "requests_per_s": 997.7,
+      "statuses": {
+        "200": 10989,
+        "202": 197,
+        "403": 8869
+      },
+      "errors": {}
+    }
+  ]
+}

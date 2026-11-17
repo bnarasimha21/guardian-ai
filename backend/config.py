@@ -31,6 +31,20 @@ class Settings(BaseSettings):
     # agent) to Supabase. Off by default; also needs SUPABASE_URL and
     # SUPABASE_ANON_KEY. Traces (OTEL_EXPORTER_OTLP_ENDPOINT) are the audit path.
     guardian_usage_logging: bool = False
+    # Directory of per-tenant policy files, <tenant>.yaml. A tenant's rules are
+    # checked after the base policy's. The tenant is the API key name up to
+    # its first dot. Empty: every caller gets the base policy.
+    guardian_tenant_policies_dir: str = ""
+    # Postgres connection string. When set, approvals are stored there (shared
+    # by every replica, kept across restarts) and every decision and approval
+    # change is appended to the audit log. Empty: approvals live in this
+    # process's memory and there is no audit log.
+    guardian_database_url: str = ""
+    guardian_database_pool_size: int = 10
+    # With a database: refuse to answer /api/check (503) when the audit row
+    # cannot be written. Turning this off lets decisions go unrecorded while
+    # the database is down.
+    guardian_audit_required: bool = True
 
     @field_validator("block_threshold", mode="before")
     @classmethod

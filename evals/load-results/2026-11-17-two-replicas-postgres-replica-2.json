@@ -1,0 +1,47 @@
+{
+  "url": "http://127.0.0.1:8102",
+  "records": 213,
+  "duration_s": 15.0,
+  "client": "Python 3.12.3, x86_64",
+  "arguments_json_bytes": {
+    "median": 70,
+    "max": 338
+  },
+  "readyz": {
+    "status": "ok",
+    "checks": {
+      "policy": true,
+      "approvals": true,
+      "audit": true
+    },
+    "shared_state": true
+  },
+  "note": "replica 2 of 2, both loaded at once",
+  "in_process": {
+    "count": 2130,
+    "p50_ms": 0.218,
+    "p95_ms": 0.351,
+    "p99_ms": 0.444,
+    "max_ms": 1.754,
+    "mean_ms": 0.227
+  },
+  "levels": [
+    {
+      "count": 8436,
+      "p50_ms": 55.547,
+      "p95_ms": 78.238,
+      "p99_ms": 97.032,
+      "max_ms": 132.585,
+      "mean_ms": 57.01,
+      "concurrency": 32,
+      "wall_s": 15.03,
+      "requests_per_s": 561.1,
+      "statuses": {
+        "200": 4687,
+        "202": 80,
+        "403": 3669
+      },
+      "errors": {}
+    }
+  ]
+}
