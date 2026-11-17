@@ -222,3 +222,40 @@ def policy_file(tmp_path, monkeypatch):
         return path
 
     return write
+
+
+# ---- Postgres (phase 4) ----
+#
+# Tests that need a database are skipped unless GUARDIAN_TEST_DATABASE_URL is
+# set (CI sets it to a service container). Each test gets its own schema, so
+# tests cannot see each other's rows and nothing is left behind.
+
+import os  # noqa: E402
+import secrets as _secrets  # noqa: E402
+
+import pytest_asyncio  # noqa: E402
+
+TEST_DATABASE_URL = os.environ.get("GUARDIAN_TEST_DATABASE_URL", "")
+
+
+@pytest_asyncio.fixture
+async def pg_dsn():
+    if not TEST_DATABASE_URL:
+        pytest.skip("GUARDIAN_TEST_DATABASE_URL is not set")
+    import psycopg
+
+    schema = "t_" + _secrets.token_hex(6)
+    async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True) as conn:
+        await conn.execute(f'CREATE SCHEMA "{schema}"')
+    sep = "&" if "?" in TEST_DATABASE_URL else "?"
+    yield f"{TEST_DATABASE_URL}{sep}options=-csearch_path%3D{schema}"
+    async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL, autocommit=True) as conn:
+        await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+@pytest_asyncio.fixture
+async def pg_pool(pg_dsn):
+    from psycopg_pool import AsyncConnectionPool
+
+    async with AsyncConnectionPool(pg_dsn, min_size=1, max_size=4, open=False) as pool:
+        yield pool
