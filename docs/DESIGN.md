@@ -407,8 +407,9 @@ concurrency rose. The figures above use a minimal keep-alive client, with which 
 limit.
 
 **On Kubernetes** (2026-11-17, DigitalOcean Kubernetes 1.37, two 4-vCPU nodes). `helm install` had
-two replicas and Postgres ready in 58 s, `deploy/smoke.py` passed 13 of 13 checks from a pod in the
-cluster, and `helm upgrade` to four replicas took 23 s. Under load through the Service, two replicas
+two replicas and Postgres ready in 58 s, 12 of 13 functional checks passed from a pod in the cluster
+(the thirteenth was a wrong expectation in the check, since corrected in `deploy/smoke.py`), and
+`helm upgrade` to four replicas took 23 s. Under load through the Service, two replicas
 reached 664 decisions a second and four reached 998, with no failed request; a single caller saw
 6.9 ms at p50. The nodes are about half as fast as the machine above (0.44 ms per decision in
 process), and four replicas shared eight vCPUs with Postgres and the load generator, which is why

@@ -387,13 +387,16 @@ The chart was installed on a DigitalOcean Kubernetes 1.37 cluster (two 4-vCPU no
 | Step | Result |
 |------|-------:|
 | `helm install --wait` to two replicas and Postgres ready, volume bound | 58 s |
-| `deploy/smoke.py` from a pod in the cluster | 13 of 13 checks |
+| Functional checks from a pod in the cluster | 12 of 13 as first written; see below |
 | `helm upgrade` from two replicas to four | 23 s |
 | Audit log after all runs | 105,001 rows in 6 chains, intact |
 
-The smoke check covers both tenants' rules, the policy endpoint, a refund that needs approval, twelve
+The checks cover both tenants' rules, the policy endpoint, a refund that needs approval, twelve
 retries across replicas joining one approval, another tenant's approver and the agent's own key being
-refused, and a single-use grant letting exactly one of six calls through.
+refused, and a single-use grant letting exactly one of six calls through. The one that failed was the
+check, not the server: it expected a tenant's `web.search` rule to decide a call that the base
+policy's read-only rule allows first, which is the documented order. The call returned 200 from the
+base rule. `deploy/smoke.py` has the corrected check; it has not been re-run on a cluster.
 
 Load, from a pod in the same cluster through the Service, 20 seconds per level, audit required:
 
