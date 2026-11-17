@@ -39,6 +39,11 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(server.settings, "block_threshold", "high")
     monkeypatch.setattr(server.settings, "allow_private_targets", False)
     monkeypatch.setattr(server.settings, "guardian_usage_logging", False)
+    monkeypatch.setattr(server.settings, "guardian_tenant_policies_dir", "")
+    monkeypatch.setattr(server.settings, "guardian_database_url", "")
+    monkeypatch.setattr(server.settings, "guardian_audit_required", True)
+    server.app.state.tenant_policies = None
+    server.app.state.audit = None
     # No real OTLP export from tests; tracing tests use an in-memory exporter.
     for name in ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL",
                  "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "GUARDIAN_OTEL_CAPTURE_ARGUMENTS",

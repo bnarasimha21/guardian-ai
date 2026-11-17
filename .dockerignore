@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+sessions
+.env
+.guardian
+docs
+tests
+deploy
+screenshot.png

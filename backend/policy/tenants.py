@@ -48,7 +48,7 @@ import yaml
 from pydantic import Field, ValidationError
 
 from .loader import MAX_POLICY_BYTES, LoadedPolicy, PolicyError, PolicyStore
-from .models import Policy, Rule, _Strict
+from .models import Rule, _Strict
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +93,15 @@ def combine(base: LoadedPolicy, tenant: TenantRules, tenant_sha256: str, path: s
     clash = sorted(rule.id for rule in tenant.rules if rule.id in base_ids)
     if clash:
         raise PolicyError(f"{path}: rule id(s) already used by the base policy: {', '.join(clash)}")
-    try:
-        policy = Policy.model_validate({
-            **base.policy.model_dump(by_alias=True, exclude={"rules"}),
-            "rules": [r.model_dump(by_alias=True) for r in [*base.policy.rules, *tenant.rules]],
-        })
-    except ValidationError as exc:  # duplicate ids inside the tenant file, for one
-        raise PolicyError(f"{path}: {exc.errors()[0]['msg']}") from exc
+    seen: set[str] = set()
+    for rule in tenant.rules:
+        if rule.id in seen:
+            raise PolicyError(f"{path}: duplicate rule id '{rule.id}'")
+        seen.add(rule.id)
+    # Both halves are already validated models. They are joined as they are:
+    # dumping and re-validating would turn every unset predicate operator
+    # into an explicit null and fail the "exactly one operator" check.
+    policy = base.policy.model_copy(update={"rules": [*base.policy.rules, *tenant.rules]})
     digest = hashlib.sha256(f"{base.sha256}:{tenant_sha256}".encode()).hexdigest()
     return LoadedPolicy(policy=policy, path=path, sha256=digest, loaded_at=time.time())
 
@@ -118,17 +120,24 @@ class TenantPolicies:
     """The policy in force for each tenant. ``get()`` is called on every decision."""
 
     def __init__(self, base: PolicyStore, directory: str | os.PathLike | None = None, *,
-                 recheck_seconds: float = 1.0) -> None:
+                 recheck_seconds: float = 1.0, validate: bool = True) -> None:
         self.base = base
         self.directory = Path(directory).expanduser() if directory else None
         self.recheck_seconds = recheck_seconds
         self._lock = threading.Lock()
         self._entries: dict[str, _Entry] = {}
-        if self.directory is not None:
-            if not self.directory.is_dir():
-                raise PolicyError(f"tenant policy directory {self.directory} does not exist")
-            # Every tenant file must load at startup: a typo should stop the
-            # server, not sit there until that tenant's first call.
+        if self.directory is not None and not self.directory.is_dir():
+            raise PolicyError(f"tenant policy directory {self.directory} does not exist")
+        if validate:
+            self.validate()
+
+    def validate(self) -> None:
+        """Load every tenant file now and raise PolicyError for the first that fails.
+
+        The server calls this at startup: a typo should stop it from starting,
+        not sit there until that tenant's first call.
+        """
+        with self._lock:
             for name in self.tenants():
                 self._load(name, self.base.get(), initial=True)
 

@@ -159,3 +159,26 @@ def test_without_a_directory_everyone_gets_the_base(setup):
     base, _, _ = setup
     policies = TenantPolicies(PolicyStore(base))
     assert policies.get("payments").sha256 == policies.get(None).sha256 and policies.tenants() == []
+
+
+def test_tenant_rules_combine_with_the_shipped_default_policy(tmp_path):
+    """The default policy uses argument predicates, detectors and nested matches."""
+    from backend.guardian.schema import ToolCall
+    from backend.policy import evaluate
+
+    (tmp_path / "payments.yaml").write_text(PAYMENTS.replace("payments-shell", "payments-extra"))
+    policies = TenantPolicies(PolicyStore(), tmp_path)
+    base, mine = policies.get(None), policies.get("payments")
+    assert _ids(mine)[: len(_ids(base))] == _ids(base) and _ids(mine)[-2:] == ["payments-refund", "payments-extra"]
+    assert mine.policy.untrusted_inputs == base.policy.untrusted_inputs and mine.policy.mode == base.policy.mode
+    call = ToolCall(name="payments.refund", arguments={"amount": 5})
+    assert evaluate(base, call).rule_id != "payments-refund"
+    assert evaluate(mine, call, principal="payments.agent").rule_id == "payments-refund"
+
+
+def test_duplicate_rule_ids_inside_a_tenant_file_are_refused(setup):
+    _, tenants, make = setup
+    (tenants / "search.yaml").write_text(
+        "version: 1\nrules:\n  - {id: a, match: {tool: x}, effect: allow}\n  - {id: a, match: {tool: y}, effect: deny}\n")
+    with pytest.raises(PolicyError, match="duplicate rule id 'a'"):
+        make()

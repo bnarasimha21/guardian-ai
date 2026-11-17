@@ -284,20 +284,32 @@ and the calls are small (arguments have a median of 70 bytes as JSON, 338 at mos
 
 ## 7. What stands between this and production
 
-1. **Approvals live in process memory.** A restart drops every pending approval, and two processes
-   do not share them.
+1. **Approvals are shared only with a database.** With `GUARDIAN_DATABASE_URL` they live in Postgres,
+   survive a restart and are shared by replicas (section 9). Without it they are in process memory,
+   as before. A dashboard connected to one replica does not get live events for changes made on
+   another.
 2. **The gateway speaks stdio to its client.** One gateway serves one client on one machine.
 3. **Pins are a local file.** Two gateways sharing it can overwrite each other.
 4. **Identity is static keys.** No SSO, no rotation, no per-user approver identity in the audit trail.
-5. **One policy file for everyone.** No per-team or per-tenant policy.
-6. **The audit log is a local JSONL file.** Nothing stops it being edited.
+5. **Tenant policies are files on disk.** A tenant gets the base rules and then its own (section 9),
+   but there is no review workflow, no signing and no policy tests, and the tenant is read from the
+   API key's name.
+6. **The audit log's chain heads are not exported.** With a database every decision is in an
+   append-only, hash-chained table (section 9). Editing or removing a row is found; deleting a whole
+   chain, or its newest rows, is not, until the chain heads are copied somewhere the database owner
+   cannot reach. The MCP gateway still writes its own local JSONL file.
 7. **Bypass is possible** wherever an agent can reach an upstream directly.
 8. **The tap's `/ws-observe` endpoint has no authentication.**
-9. **Load has not been tested.**
+9. **Load has been tested on one machine only.** Section 9 has the figures: Docker, loopback, one
+   tenant, small calls. Not Kubernetes, not a real network, not many tenants at once.
+10. **The Helm chart has not been installed on a cluster.** It lints and renders to valid Kubernetes,
+    and its image runs as two replicas with Postgres in Docker.
 
 ## 8. What changes at 100 times the scale
 
-Nothing in this section is built. It is where the current seams are and what goes behind them.
+When this section was written nothing in it was built. Since then the approvals, policy and audit
+rows have been built in a first form, described in section 9. The rest is still where the seams are
+and what goes behind them.
 
 | Area | Today | At scale | Seam that already exists |
 |------|-------|----------|--------------------------|
@@ -314,3 +326,84 @@ Nothing in this section is built. It is where the current seams are and what goe
 
 The order to do them in: shared approvals and HTTP transport first, since nothing else can be
 deployed for more than one user without them. Then identity, then per-tenant policy, then the rest.
+
+## 9. What was built for several teams (phase 4)
+
+Three rows of the table in section 8 are now built, behind the seams named there: approvals, policy
+per tenant and audit. Each decision below lists the choice, the option not taken, the reason and the
+cost, as in section 4.
+
+### D11. Tenant rules come after the base rules
+
+- **Choice.** A tenant's policy is the base policy's rules followed by the tenant file's rules, first
+  match decides. A tenant file may hold `version` and `rules` only.
+- **Not taken.** A separate full policy per tenant. Or "tenant rules first, base as fallback".
+- **Why.** The base is what the organisation insists on. Put first, a base `deny` or
+  `require_approval` cannot be undone by a tenant, with no new concept: it is the same first-match
+  rule as one file. Mode and defaults stay in the base, so a tenant cannot switch itself to monitor.
+- **Cost.** A tenant cannot be stricter than a base `allow`: a base allow for `fs.read` applies to
+  everyone. So the base has to be written as "what is forbidden or needs a person", with allows left
+  to tenants.
+
+### D12. The tenant is read from the key name
+
+- **Choice.** `payments.checkout-agent` is tenant `payments`. An approver key answers for its own
+  tenant only.
+- **Not taken.** A tenant field in the request. A separate key-to-tenant mapping.
+- **Why.** D7 already made the key name the identity because the caller cannot choose it. The tenant
+  inherits that. No second mapping can drift from the first.
+- **Cost.** A naming convention carries a security boundary, and renaming a key changes its tenant.
+  Workload identity (section 8) would replace it.
+
+### D13. Approvals in Postgres reuse the in-memory logic
+
+- **Choice.** Each operation takes an advisory lock on the session, loads that session's approvals
+  into the in-memory store, runs the same code a single process runs, and writes back what changed in
+  one transaction.
+- **Not taken.** Rewriting the rules (same call, grant validity, cooldown, limits, diff) as SQL. Or
+  Redis.
+- **Why.** Those rules are where the security properties are (D6), and two copies of them would
+  diverge. This way "two identical calls arriving together open one approval" holds across replicas
+  by construction, and Postgres is already needed for the audit log.
+- **Cost.** Every approval operation is a database round trip that reads the whole session. Timeouts
+  are applied on read and by a sweep, not by a timer. `wait` polls. Listeners (the dashboard) run only
+  on the replica that made the change. Replica clocks must agree to about a second.
+
+### D14. One audit chain per writer, written in groups
+
+- **Choice.** Each server process has its own hash chain in one append-only table. Rows that arrive
+  while an insert is in flight go out together in the next one. By default a decision that cannot be
+  recorded is refused with 503.
+- **Not taken.** One global chain. Writing audit rows in the background after the response.
+- **Why.** A global chain makes every replica wait for one lock on every decision. Background writes
+  mean a crash loses decisions that were already acted on. Refusing when the log is down is N1 applied
+  to the record: a control whose decisions can go unrecorded is not auditable.
+- **Cost.** About 1.2 ms per decision. No single total order across replicas. Deleting a whole chain
+  is not detectable from inside the database. And the audit log's availability is now the service's
+  availability, unless `GUARDIAN_AUDIT_REQUIRED=false`.
+
+### Measured
+
+`python evals/load.py`, 2026-11-17: one 4-core 2.1 GHz Xeon running the server containers, Postgres 16
+and the load generator together, the 213 call-phase corpus records, 15 seconds per level.
+
+| Setup | Concurrent callers | Requests/s | p50 | p95 | p99 |
+|-------|-------------------:|-----------:|----:|----:|----:|
+| One replica, no database | 1 | 490 | 2.0 ms | 2.6 ms | 3.2 ms |
+| One replica, no database | 32 | 679 | 45 ms | 64 ms | 78 ms |
+| One replica, Postgres, audit required | 1 | 297 | 3.2 ms | 4.2 ms | 6.2 ms |
+| One replica, Postgres, audit required | 32 | 571 | 54 ms | 76 ms | 97 ms |
+| Two replicas, Postgres, audit required | 32 each | 1,126 | 55 ms | 80 ms | 101 ms |
+
+The decision takes 0.22 ms in process (section 5). The HTTP path adds about 1.8 ms and the audit write
+about 1.2 ms. One replica is one process on one core and saturates near 600 decisions a second; two
+replicas doubled that. No request failed. The limits are in section 7, item 9.
+
+One thing the first attempt got wrong is worth keeping: with a general-purpose HTTP client the load
+generator used a full core while the server used half of one, so throughput appeared to fall as
+concurrency rose. The figures above use a minimal keep-alive client, with which the server is the
+limit.
+
+**Tests.** 60 more, 440 in all. The Postgres store and the audit log are tested against a real
+database, including two store objects racing on one call and tampering behind the append-only trigger.
+

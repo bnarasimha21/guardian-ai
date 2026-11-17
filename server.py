@@ -17,8 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from backend import audit as audit_log
 from backend import auth, netguard
-from backend.approvals import ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval
+from backend.approvals import (
+    ApprovalNotPending, ApprovalStore, InMemoryApprovalStore, PendingApproval, arguments_sha256,
+)
 from backend.approvals.flow import DENIED_RECENTLY, GRANTED, REFUSED, WAITING, queue_for_approval
 from backend.config import settings
 from backend.events.bus import EventBus
@@ -29,6 +32,7 @@ from backend.guardian.rules import default_rules
 from backend.guardian.taxonomy import taxonomy_payload
 from backend.policy import engine as policy_engine
 from backend.policy.loader import PolicyError, PolicyStore, resolve_policy_path
+from backend.policy.tenants import TenantPolicies, tenant_of
 from backend.targets import session_store
 from backend import telemetry as otel
 from backend.tap.client import observe_agent, ACTIONABLE_EVENTS
@@ -97,18 +101,40 @@ async def lifespan(app: FastAPI):
     # configuration is broken, or a GUARDIAN_MODEL_DETECTORS entry cannot load.
     _install_log_scrub()
     default_rules()
-    _policy_store()
+    _tenant_policies().validate()  # the base policy and every tenant file must load
     _api_keys()
     _approver_keys()
     otel.setup_from_env()  # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
-    store = InMemoryApprovalStore()
+    pool = audit = None
+    if settings.guardian_database_url:
+        # Shared state for several replicas: approvals and the audit log. A
+        # database that cannot be reached stops the server from starting.
+        from psycopg_pool import AsyncConnectionPool
+
+        from backend.approvals.postgres import PostgresApprovalStore
+
+        pool = AsyncConnectionPool(settings.guardian_database_url, min_size=1,
+                                   max_size=settings.guardian_database_pool_size, open=False)
+        await pool.open(wait=True, timeout=30)
+        store = await PostgresApprovalStore.open(pool)
+        store.start_sweeper()
+        audit = await audit_log.PostgresAuditLog.create(pool)
+    else:
+        store = InMemoryApprovalStore()
     store.add_listener(_on_approval_change)
+    store.add_listener(_audit_approval)
     _telemetry().watch_approvals(store)
     app.state.approvals = store
+    app.state.audit = audit
     try:
         yield
     finally:
         await store.close()
+        if audit is not None:
+            await audit.close()
+        if pool is not None:
+            await pool.close()
+        app.state.audit = None
         otel.force_flush()
 
 
@@ -217,6 +243,67 @@ def _policy_store() -> PolicyStore:
         store = PolicyStore(wanted)
         app.state.policy_store = store
     return store
+
+
+def _tenant_policies() -> TenantPolicies:
+    """The base policy plus each tenant's rules (recreated if either setting changes)."""
+    base = _policy_store()
+    wanted = Path(settings.guardian_tenant_policies_dir).expanduser() if settings.guardian_tenant_policies_dir else None
+    current = getattr(app.state, "tenant_policies", None)
+    if current is None or current.base is not base or current.directory != wanted:
+        # Startup validates every tenant file (lifespan). Here a broken file
+        # must not take the other tenants down with it.
+        current = TenantPolicies(base, wanted, validate=False)
+        app.state.tenant_policies = current
+    return current
+
+
+def _session_tenant(session: str) -> str | None:
+    """The tenant an API-key session belongs to; None for a demo session."""
+    if not session.startswith(auth.APP_SESSION_PREFIX):
+        return None
+    return tenant_of(session[len(auth.APP_SESSION_PREFIX):])
+
+
+def _audit() -> audit_log.AuditLog | None:
+    return getattr(app.state, "audit", None)
+
+
+async def _audit_approval(approval: PendingApproval, change: str) -> None:
+    """Every approval change goes to the audit log, whichever replica made it."""
+    log = _audit()
+    if log is None:
+        return
+    try:
+        await log.write("approval", audit_log.approval_payload(approval, change),
+                        tenant=_session_tenant(approval.session) or "")
+    except audit_log.AuditError as exc:
+        logger.error("Approval %s (%s) was not written to the audit log: %s", approval.id, change, exc)
+
+
+async def _audited(response: JSONResponse, decision, call: ToolCall, *, sid: str,
+                   principal: str | None) -> JSONResponse:
+    """Write the decision to the audit log before it is returned.
+
+    With GUARDIAN_AUDIT_REQUIRED (the default) a decision that cannot be
+    recorded is not given: the caller gets 503 and must not run the tool.
+    """
+    log = _audit()
+    if log is None:
+        return response
+    extra = getattr(response, "audit_extra", None) or {}
+    payload = audit_log.decision_payload(
+        decision, call, session=sid, principal=principal, status_code=response.status_code,
+        arguments_sha256=extra.get("arguments_sha256") or arguments_sha256(call.name, call.server, call.arguments),
+        approval_id=extra.get("approval_id", ""), approval_status=extra.get("status", ""))
+    try:
+        await log.write("decision", payload, tenant=tenant_of(principal) or "")
+    except audit_log.AuditError as exc:
+        logger.error("Decision %s was not written to the audit log: %s", decision.decision_id, exc)
+        if settings.guardian_audit_required:
+            return JSONResponse({"error": "Audit log unavailable; refusing to decide", "blocked": True},
+                                status_code=503)
+    return response
 
 
 def _api_keys() -> dict[str, str]:
@@ -559,7 +646,7 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
     except RequestError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     try:
-        loaded = _policy_store().get()
+        loaded = _tenant_policies().get(tenant_of(principal))
     except PolicyError as exc:
         logger.error("Policy unavailable: %s", exc)
         return JSONResponse({"error": "Policy unavailable; refusing to decide", "blocked": True}, status_code=503)
@@ -575,13 +662,14 @@ async def check_content(req: CheckRequest, request: Request, x_session_id: str |
         guardian = _get_session(sid)["guardian"]
 
         if decision.effect == "require_approval" and decision.enforced:
-            return await _approval_flow(decision, call, sid=sid, principal=principal, source=source,
-                                        guardian=guardian, span=span)
+            response = await _approval_flow(decision, call, sid=sid, principal=principal, source=source,
+                                            guardian=guardian, span=span)
+            return await _audited(response, decision, call, sid=sid, principal=principal)
 
         await guardian.record(decision, call, source=source)
         response = _decision_response(decision, sid=sid, source=source, guardian=guardian)
         span.decided(decision, call=call, status_code=response.status_code)
-        return response
+        return await _audited(response, decision, call, sid=sid, principal=principal)
 
 
 def _decision_body(decision) -> dict:
@@ -613,7 +701,9 @@ def _decision_response(decision, *, sid: str, source: str, guardian: Guardian, e
         ))
     if status_code is None:
         status_code = 403 if decision.blocked else 200
-    return JSONResponse(body, status_code=status_code)
+    response = JSONResponse(body, status_code=status_code)
+    response.audit_extra = extra  # approval id and status, for the audit row
+    return response
 
 
 def _agent_key(call: ToolCall, principal: str | None) -> str:
@@ -696,6 +786,20 @@ def _approver(request: Request) -> str | None:
     return auth.match_key(auth.bearer_token(request.headers.get("authorization")), keys)
 
 
+def _approver_may(approver: str, session: str) -> bool:
+    """With per-tenant policies, an approver key answers for its own tenant only.
+
+    The approver's tenant is its key name up to the first dot, as for API keys:
+    ``payments.alice`` may see and answer approvals of ``app:payments.*``
+    sessions and nothing else. Without a tenant directory any approver key may
+    answer any approval, as before.
+    """
+    if not settings.guardian_tenant_policies_dir:
+        return True
+    tenant = _session_tenant(session)
+    return tenant is None or tenant == tenant_of(approver)
+
+
 def _requester_session(request: Request) -> str | None:
     """The session the caller speaks for: its API key's app session, or X-Session-Id."""
     token = auth.bearer_token(request.headers.get("authorization"))
@@ -723,6 +827,8 @@ async def _load_approval(approval_id: str, request: Request, *, write: bool) -> 
             if approver is None:
                 raise HTTPException(status_code=401, detail="An approver key is required",
                                     headers={"WWW-Authenticate": "Bearer"})
+            if not _approver_may(approver, approval.session):
+                raise not_found  # another tenant's approval: not even its existence is shown
             return approval, approver
         if approval.session.startswith(auth.APP_SESSION_PREFIX):
             raise HTTPException(status_code=403,
@@ -730,7 +836,7 @@ async def _load_approval(approval_id: str, request: Request, *, write: bool) -> 
         if _requester_session(request) != approval.session:
             raise not_found
         return approval, "session"
-    if approver is not None:
+    if approver is not None and _approver_may(approver, approval.session):
         return approval, approver
     if _requester_session(request) != approval.session:
         raise not_found
@@ -745,8 +851,11 @@ class ApprovalAnswer(BaseModel):
 @app.get("/api/approvals")
 async def list_approvals(request: Request, status: str | None = None, session: str | None = None):
     """Approvals of the caller's session (newest last). Approver keys may name any ``session``."""
-    if session is not None and _approver(request) is not None:
+    approver = _approver(request)
+    if session is not None and approver is not None:
         sid = session[:200]
+        if not _approver_may(approver, sid):
+            return {"approvals": []}
     else:
         sid = _requester_session(request)
     if sid is None:
@@ -783,9 +892,17 @@ async def policy_info(request: Request):
     reach it. The absolute path and the parse error stay in the server log.
     """
     _require_a_key(request)
-    store = _policy_store()
-    loaded = store.get()
+    # A key sees the policy of its own tenant: the base rules plus that tenant's.
+    token = auth.bearer_token(request.headers.get("authorization"))
+    name = auth.match_key(token, _api_keys()) or auth.match_key(token, _approver_keys())
+    tenant = tenant_of(name) if settings.guardian_tenant_policies_dir else None
+    store = _tenant_policies()
+    try:
+        loaded = store.get(tenant)
+    except PolicyError:
+        raise HTTPException(status_code=503, detail="Policy unavailable")
     return {
+        "tenant": tenant,
         "file": Path(loaded.path).name,
         "sha256": loaded.sha256,
         "version": loaded.policy.version,
@@ -793,8 +910,33 @@ async def policy_info(request: Request):
         "default_effect": loaded.policy.default_effect,
         "rules": [{"id": r.id, "phase": r.phase, "effect": r.effect, "description": r.description}
                   for r in loaded.policy.rules],
-        "reload_failed": store.last_error is not None,
+        "reload_failed": store.last_error(tenant) is not None,
     }
+
+
+@app.get("/healthz")
+async def healthz():
+    """The process is up. Kubernetes liveness probe."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Ready to decide: the policy loads and, with a database, it answers. Readiness probe."""
+    checks: dict[str, bool] = {}
+    try:
+        _tenant_policies().get(None)
+        checks["policy"] = True
+    except PolicyError:
+        checks["policy"] = False
+    store, log = _approvals(), _audit()
+    if hasattr(store, "ready"):
+        checks["approvals"] = await store.ready()
+    if log is not None:
+        checks["audit"] = await log.ready()
+    ok = all(checks.values())
+    return JSONResponse({"status": "ok" if ok else "unavailable", "checks": checks,
+                         "shared_state": bool(settings.guardian_database_url)}, status_code=200 if ok else 503)
 
 
 @app.get("/api/taxonomy")

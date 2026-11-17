@@ -1,0 +1,6 @@
+apiVersion: v2
+name: guardian-ai
+description: GuardianAI policy decision service for agent tool calls, with shared approvals and an audit log in Postgres.
+type: application
+version: 0.1.0
+appVersion: "0.4.0"

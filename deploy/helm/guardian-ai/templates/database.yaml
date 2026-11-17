@@ -1,0 +1,72 @@
+{{- if .Values.database.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "guardian.name" . }}-db
+  labels: {{- include "guardian.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: guardian-ai
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: database
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "guardian.name" . }}-db
+  labels: {{- include "guardian.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "guardian.name" . }}-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: guardian-ai
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        {{- include "guardian.labels" . | nindent 8 }}
+        app.kubernetes.io/component: database
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        fsGroup: 70
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: {{ .Values.database.image | quote }}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            - {name: POSTGRES_USER, value: guardian}
+            - {name: POSTGRES_DB, value: guardian}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ include "guardian.name" . }}-db, key: POSTGRES_PASSWORD}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "guardian", "-d", "guardian"]}
+            periodSeconds: 5
+          resources: {{- toYaml .Values.database.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.database.storageClassName }}
+        storageClassName: {{ .Values.database.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ .Values.database.storage }}}
+{{- end }}
