@@ -331,6 +331,8 @@ deployed for more than one user without them. Then identity, then per-tenant pol
 
 ## 9. What was built for several teams (phase 4)
 
+![Several teams on Kubernetes: replicas, tenant policies, Postgres](images/deployment-kubernetes.svg)
+
 Three rows of the table in section 8 are now built, behind the seams named there: approvals, policy
 per tenant and audit. Each decision below lists the choice, the option not taken, the reason and the
 cost, as in section 4.

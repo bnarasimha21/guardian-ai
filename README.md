@@ -304,6 +304,8 @@ The reasons behind these choices, the threat model and what changes at scale are
 One process with its state in memory is enough for a demo. For several teams the server takes three
 more settings, and a Helm chart puts them together.
 
+![Several teams on Kubernetes: replicas, tenant policies, Postgres](docs/images/deployment-kubernetes.svg)
+
 **A policy per tenant.** With `GUARDIAN_TENANT_POLICIES_DIR` set, the tenant `payments` gets the base
 policy followed by the rules in `<dir>/payments.yaml`. The base rules are checked first, so a base
 `deny` or `require_approval` cannot be overridden, and a tenant decides only what the base leaves
